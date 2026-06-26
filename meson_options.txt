@@ -109,6 +109,20 @@ option(
 )
 
 option(
+  'external-egl-without-gbm',
+  type : 'boolean',
+  value : 'false',
+  description : 'allow external EGL-only builds without GBM/libdrm'
+)
+
+option(
+  'vtest',
+  type : 'boolean',
+  value : 'true',
+  description : 'build vtest helper binaries'
+)
+
+option(
   'tests',
   type : 'boolean',
   value : 'false',

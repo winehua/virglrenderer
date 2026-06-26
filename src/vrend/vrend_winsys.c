@@ -55,6 +55,7 @@ static struct virgl_glx *glx_info = NULL;
 int vrend_winsys_init(uint32_t flags, int preferred_fd)
 {
    if (flags & VIRGL_RENDERER_USE_EGL) {
+#ifdef HAVE_EPOXY_EGL_H
 #ifdef ENABLE_GBM
       /*
        * If the user specifies a preferred DRM fd and we can't use it, fail. If the user doesn't
@@ -77,6 +78,18 @@ int vrend_winsys_init(uint32_t flags, int preferred_fd)
 
       use_context = CONTEXT_EGL;
 #else
+      if (preferred_fd > 0)
+         virgl_error("Ignoring preferred DRM fd without GBM support; trying surfaceless/default EGL display\n");
+
+      egl = virgl_egl_init((EGLNativeDisplayType)EGL_DEFAULT_DISPLAY,
+                           flags & VIRGL_RENDERER_USE_SURFACELESS,
+                           flags & VIRGL_RENDERER_USE_GLES);
+      if (!egl)
+         return -1;
+
+      use_context = CONTEXT_EGL;
+#endif
+#else
       (void)preferred_fd;
       virgl_error("EGL is not supported on this platform\n");
       return -1;
@@ -98,15 +111,17 @@ int vrend_winsys_init(uint32_t flags, int preferred_fd)
 
 void vrend_winsys_cleanup(void)
 {
-#ifdef ENABLE_GBM
+#ifdef HAVE_EPOXY_EGL_H
    if (use_context == CONTEXT_EGL) {
       virgl_egl_destroy(egl);
       egl = NULL;
       use_context = CONTEXT_NONE;
+#ifdef ENABLE_GBM
       if (gbm) {
          virgl_gbm_fini(gbm);
          gbm = NULL;
       }
+#endif
    } else if (use_context == CONTEXT_EGL_EXTERNAL) {
       free(egl);
       egl = NULL;

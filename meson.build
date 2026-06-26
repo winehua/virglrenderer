@@ -289,6 +289,7 @@ auto_egl_glx = platforms.contains('auto')
 
 with_egl = require_egl or auto_egl_glx
 with_glx = require_glx or auto_egl_glx
+allow_external_egl_without_gbm = get_option('external-egl-without-gbm')
 
 have_egl = false
 have_glx = false
@@ -300,11 +301,17 @@ if with_egl
       else
          if libdrm_dep.found()
             gbm_dep = dependency('gbm', version: '>= 18.0.0', required: require_egl)
+         elif allow_external_egl_without_gbm
+            message('Building virglrenderer with external EGL only (GBM disabled)')
          endif
-         have_egl = gbm_dep.found() and cc.has_header('sys/mman.h', required: require_egl)
-         conf_data.set('ENABLE_GBM', have_egl)
+         if gbm_dep.found()
+            have_egl = cc.has_header('sys/mman.h', required: require_egl)
+         else
+            have_egl = allow_external_egl_without_gbm
+         endif
+         conf_data.set('ENABLE_GBM', gbm_dep.found() and have_egl)
 
-         if have_egl
+         if gbm_dep.found() and have_egl
             conf_data.set('ENABLE_GBM_ALLOCATION', 1)
          endif
       endif
@@ -464,7 +471,7 @@ if with_unstable_apis
 endif
 
 subdir('src')
-if not with_host_windows
+if not with_host_windows and get_option('vtest')
    subdir('vtest')
 endif
 
