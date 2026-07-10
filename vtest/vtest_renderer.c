@@ -157,6 +157,8 @@ struct vtest_context {
    unsigned capset_id;
    bool context_initialized;
 
+   uint32_t implicit_fence_submitted;
+
    struct util_hash_table *resource_table;
    struct util_hash_table *sync_table;
 
@@ -201,9 +203,11 @@ struct vtest_renderer {
  * VCMD_RESOURCE_BUSY_WAIT is used to wait GPU works (VCMD_SUBMIT_CMD) or CPU
  * works (VCMD_TRANSFER_GET2).  A fence is needed only for GPU works.
  */
-static void vtest_create_implicit_fence(struct vtest_renderer *renderer)
+static void vtest_create_implicit_fence(struct vtest_renderer *renderer,
+                                        struct vtest_context *ctx)
 {
-   virgl_renderer_create_fence(++renderer->implicit_fence_submitted, 0);
+   ctx->implicit_fence_submitted = ++renderer->implicit_fence_submitted;
+   virgl_renderer_create_fence(ctx->implicit_fence_submitted, 0);
 }
 
 static void vtest_write_implicit_fence(UNUSED void *cookie, uint32_t fence_id_in)
@@ -726,6 +730,7 @@ static struct vtest_context *vtest_new_context(struct vtest_input *input,
    ctx->protocol_version = 0;
    ctx->capset_id = 0;
    ctx->context_initialized = false;
+   ctx->implicit_fence_submitted = renderer.implicit_fence_completed;
 
    return ctx;
 }
@@ -1493,7 +1498,7 @@ int vtest_submit_cmd(uint32_t length_dw)
    if (ret)
       return -1;
 
-   vtest_create_implicit_fence(&renderer);
+   vtest_create_implicit_fence(&renderer, ctx);
    return 0;
 }
 
@@ -1813,12 +1818,11 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
    flags = bw_buf[VCMD_BUSY_WAIT_FLAGS];
 
    do {
-      busy = renderer.implicit_fence_completed !=
-             renderer.implicit_fence_submitted;
+      busy = (int32_t)(ctx->implicit_fence_submitted -
+                       renderer.implicit_fence_completed) > 0;
       if (!busy || !(flags & VCMD_BUSY_WAIT_FLAG_WAIT))
          break;
 
-      /* TODO this is bad when there are multiple clients */
       fd = virgl_renderer_get_poll_fd();
       if (fd != -1) {
          vtest_wait_for_fd_read(fd);
