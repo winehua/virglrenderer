@@ -952,6 +952,9 @@ static bool client_wait_fence(struct virgl_egl *egl, EGLSyncKHR fence, bool bloc
 bool virgl_egl_client_wait_fence(struct virgl_egl *egl, EGLSyncKHR fence, bool blocking)
 {
 #ifndef _WIN32
+   if (getenv("VIRGL_DISABLE_NATIVE_FENCE_FD"))
+      return client_wait_fence(egl, fence, blocking);
+
    /* attempt to poll the native fence fd instead of eglClientWaitSyncKHR() to
     * avoid Mesa's eglapi global-display-lock synchronizing vrend's sync_thread.
     */
