@@ -74,6 +74,14 @@ virgl_test_server = executable(
    install : true
 )
 
+winehua_vtest_server = shared_library(
+   'winehua_vtest_server',
+   'winehua_vtest_server.c',
+   link_with: [libvtest],
+   dependencies : [libvirglrenderer_dep, gallium_dep],
+   install : true
+)
+
 if with_fuzzer
    assert(cc.has_argument('-fsanitize=fuzzer'),
           'Fuzzer enabled but compiler does not support "-fsanitize=fuzzer"')
