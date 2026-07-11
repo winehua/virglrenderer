@@ -38,7 +38,10 @@
 #else
 #include <poll.h>
 #endif
+#include <stdarg.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #ifdef ENABLE_LIBDRM
@@ -949,20 +952,53 @@ static bool client_wait_fence(struct virgl_egl *egl, EGLSyncKHR fence, bool bloc
    return egl_result != EGL_TIMEOUT_EXPIRED_KHR;
 }
 
+static void winehua_fence_diag(const char *fmt, ...)
+{
+   const char *path = getenv("WINEHUA_VIRGL_LOG_PATH");
+   FILE *file;
+   va_list args;
+
+   if (!path || !path[0])
+      return;
+
+   file = fopen(path, "a");
+   if (!file)
+      return;
+
+   flockfile(file);
+   fputs("[fence-wait] ", file);
+   va_start(args, fmt);
+   vfprintf(file, fmt, args);
+   va_end(args);
+   fputc('\n', file);
+   fflush(file);
+   funlockfile(file);
+   fclose(file);
+}
+
 bool virgl_egl_client_wait_fence(struct virgl_egl *egl, EGLSyncKHR fence, bool blocking)
 {
 #ifndef _WIN32
+   static unsigned int wait_count;
+   unsigned int wait_id = ++wait_count;
+
    if (getenv("VIRGL_DISABLE_NATIVE_FENCE_FD"))
       return client_wait_fence(egl, fence, blocking);
 
    /* attempt to poll the native fence fd instead of eglClientWaitSyncKHR() to
     * avoid Mesa's eglapi global-display-lock synchronizing vrend's sync_thread.
-    */
+   */
    int fd = -1;
+   if (wait_id <= 4)
+      winehua_fence_diag("id=%u export begin blocking=%d", wait_id, blocking);
    if (!virgl_egl_export_fence(egl, fence, &fd)) {
+      if (wait_id <= 4)
+         winehua_fence_diag("id=%u export failed; fallback=eglClientWaitSyncKHR", wait_id);
       return client_wait_fence(egl, fence, blocking);
    }
    assert(fd >= 0);
+   if (wait_id <= 4)
+      winehua_fence_diag("id=%u export ok fd=%d poll begin", wait_id, fd);
 
    int ret;
    struct pollfd pfd = {
@@ -977,6 +1013,10 @@ bool virgl_egl_client_wait_fence(struct virgl_egl *egl, EGLSyncKHR fence, bool b
       }
    } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
    close(fd);
+
+   if (wait_id <= 4 || ret <= 0)
+      winehua_fence_diag("id=%u poll end ret=%d revents=0x%x errno=%d",
+                         wait_id, ret, pfd.revents, errno);
 
    if (ret < 0)
       virgl_warn("Wait sync failed\n");
