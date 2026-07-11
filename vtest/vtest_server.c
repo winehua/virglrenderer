@@ -27,6 +27,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdarg.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <unistd.h>
@@ -120,6 +121,28 @@ struct vtest_server server = {
 
    .ctx_flags = 0,
 };
+
+static void winehua_server_diag(const char *fmt, ...)
+{
+   const char *path = getenv("WINEHUA_VIRGL_LOG_PATH");
+   FILE *file;
+   va_list args;
+
+   if (!path || !path[0])
+      return;
+   file = fopen(path, "a");
+   if (!file)
+      return;
+   flockfile(file);
+   fputs("[server] ", file);
+   va_start(args, fmt);
+   vfprintf(file, fmt, args);
+   va_end(args);
+   fputc('\n', file);
+   fflush(file);
+   funlockfile(file);
+   fclose(file);
+}
 
 static void vtest_server_getenv(void);
 static void vtest_server_parse_args(int argc, char **argv);
@@ -535,6 +558,10 @@ static void vtest_server_dispatch_clients(void)
 
       ret = vtest_client_dispatch_commands(client);
       if (ret) {
+         winehua_server_diag("client result in_fd=%d out_fd=%d context=%p result=%d (%s)",
+                             client->in_fd, client->out_fd,
+                             (void *)client->context,
+                             ret, vtest_client_result_string(ret));
          fprintf(ret == VTEST_CLIENT_DISCONNECTED ? stdout : stderr, "client: %s\n",
                  vtest_client_result_string(ret));
          list_del(&client->head);
@@ -788,6 +815,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
    TRACE_SCOPE_END(trace_scope);
 
    if (ret < 0) {
+      winehua_server_diag("command dispatch failed context=%p id=%u name=%s len=%u ret=%d",
+                          (void *)client->context, header[1], cmd->name, header[0], ret);
       return VTEST_CLIENT_ERROR_COMMAND_DISPATCH;
    }
 
