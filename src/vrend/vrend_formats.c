@@ -99,6 +99,7 @@ static struct vrend_format_table gl_z32_format[] = {
 
 static struct vrend_format_table gles_z32_format[] = {
    { VIRGL_FORMAT_Z32_UNORM, GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, NO_SWIZZLE, view_class_unsupported },
+   { VIRGL_FORMAT_Z32_FLOAT_S8X24_UINT, GL_DEPTH24_STENCIL8, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NO_SWIZZLE, view_class_unsupported },
 };
 
 static struct vrend_format_table rg_base_formats[] = {
@@ -529,9 +530,19 @@ static void vrend_add_compressed_formats(struct vrend_format_table *table, int n
    }
 }
 
+static void vrend_override_formats(struct vrend_format_table *table, int num_entries)
+{
+   for (int i = 0; i < num_entries; i++) {
+      const struct vrend_format_table *current =
+         vrend_get_format_table_entry(table[i].format);
+      vrend_insert_format(&table[i], current->bindings, current->flags);
+   }
+}
+
 
 #define add_formats(x) vrend_add_formats((x), ARRAY_SIZE((x)))
 #define add_compressed_formats(x) vrend_add_compressed_formats((x), ARRAY_SIZE((x)))
+#define override_formats(x) vrend_override_formats((x), ARRAY_SIZE((x)))
 
 void vrend_build_format_list_common(void)
 {
@@ -608,11 +619,10 @@ void vrend_build_format_list_gles(void)
    */
   add_formats(gles_bgra_formats);
 
-  /* The Z32 format is required, but OpenGL ES does not support
-   * using it as a depth buffer. We just fake support with Z24
-   * and hope nobody notices.
+  /* Z32 formats are required, but OpenGL ES does not guarantee that they can
+   * be used as framebuffer attachments. Emulate them with Z24/Z24S8.
    */
-  add_formats(gles_z32_format);
+  override_formats(gles_z32_format);
   add_formats(gles_bit10_formats);
 
   if (epoxy_has_gl_extension("GL_KHR_texture_compression_astc_ldr"))
