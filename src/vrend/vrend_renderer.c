@@ -3242,8 +3242,33 @@ void vrend_set_framebuffer_state(struct vrend_context *ctx,
 
    if (sub_ctx->nr_cbufs > 0 || sub_ctx->zsurf) {
       status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-      if (status != GL_FRAMEBUFFER_COMPLETE)
+      if (status != GL_FRAMEBUFFER_COMPLETE) {
          virgl_error("Failed to complete framebuffer 0x%x %s\n", status, ctx->debug_name);
+         for (uint32_t i = 0; i < sub_ctx->nr_cbufs; i++) {
+            surf = sub_ctx->surf[i];
+            if (!surf)
+               continue;
+            virgl_error("FBO color[%u] surface_format=%u gl_id=%u level=%u layers=%u..%u "
+                        "resource_format=%u target=0x%x resource_gl_id=%u size=%ux%ux%u samples=%u\n",
+                        i, surf->format, surf->gl_id, surf->level,
+                        surf->first_layer, surf->last_layer,
+                        surf->texture->base.format, surf->texture->target,
+                        surf->texture->gl_id, surf->texture->base.width0,
+                        surf->texture->base.height0, surf->texture->base.depth0,
+                        surf->texture->base.nr_samples);
+         }
+         if (sub_ctx->zsurf) {
+            surf = sub_ctx->zsurf;
+            virgl_error("FBO depth surface_format=%u gl_id=%u level=%u layers=%u..%u "
+                        "resource_format=%u target=0x%x resource_gl_id=%u size=%ux%ux%u samples=%u\n",
+                        surf->format, surf->gl_id, surf->level,
+                        surf->first_layer, surf->last_layer,
+                        surf->texture->base.format, surf->texture->target,
+                        surf->texture->gl_id, surf->texture->base.width0,
+                        surf->texture->base.height0, surf->texture->base.depth0,
+                        surf->texture->base.nr_samples);
+         }
+      }
    }
 
    sub_ctx->shader_dirty = true;

@@ -45,11 +45,9 @@
 #include <sys/uio.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #ifdef HAVE_EVENTFD_H
 #include <sys/eventfd.h>
-#endif
-#if defined (__FreeBSD__)
-#include <sys/stat.h>
 #endif
 
 #include "vtest.h"
@@ -224,6 +222,47 @@ static void winehua_diag(const char *fmt, ...)
    fputc('\n', winehua_diag_file);
    fflush(winehua_diag_file);
    funlockfile(winehua_diag_file);
+}
+
+static void winehua_virgl_log(enum virgl_log_level_flags level,
+                              const char *message,
+                              UNUSED void *user_data)
+{
+   if (level < VIRGL_LOG_LEVEL_WARNING || !message)
+      return;
+
+   winehua_diag("virgl level=%d %s", level, message);
+}
+
+static void winehua_dump_submit_failure(int ctx_id, const uint32_t *cbuf,
+                                        uint32_t length_dw, int ret)
+{
+   uint32_t offset = 0;
+   unsigned command_count = 0;
+
+   winehua_diag("submit failed ctx=%d length_dw=%u ret=%d first=%08x %08x %08x %08x",
+                ctx_id, length_dw, ret,
+                length_dw > 0 ? cbuf[0] : 0,
+                length_dw > 1 ? cbuf[1] : 0,
+                length_dw > 2 ? cbuf[2] : 0,
+                length_dw > 3 ? cbuf[3] : 0);
+
+   while (offset < length_dw && command_count < 64) {
+      uint32_t header = cbuf[offset];
+      uint32_t command_length = header >> 16;
+      uint32_t opcode = header & 0xff;
+
+      winehua_diag("submit command ctx=%d index=%u offset=%u header=%08x opcode=%u length=%u",
+                   ctx_id, command_count, offset, header, opcode, command_length);
+      command_count++;
+      if (command_length >= length_dw - offset)
+         break;
+      offset += command_length + 1;
+   }
+
+   if (offset < length_dw && command_count == 64)
+      winehua_diag("submit command list truncated ctx=%d remaining_dw=%u",
+                   ctx_id, length_dw - offset);
 }
 
 /*
@@ -667,9 +706,12 @@ int vtest_init_renderer(bool multi_clients,
 
    if (log_path && log_path[0]) {
       winehua_diag_file = fopen(log_path, "a");
-      if (winehua_diag_file)
+      if (winehua_diag_file) {
+         fchmod(fileno(winehua_diag_file), 0666);
          setvbuf(winehua_diag_file, NULL, _IOLBF, 0);
+      }
    }
+   virgl_set_log_callback(winehua_virgl_log, NULL, NULL);
    winehua_submit_count = 0;
    winehua_complete_count = 0;
    winehua_diag("renderer init sync=%s submitted=%u completed=%u multi_clients=%d",
@@ -1579,6 +1621,9 @@ int vtest_submit_cmd(uint32_t length_dw)
 
    ret = virgl_renderer_submit_cmd(cbuf, ctx->ctx_id, length_dw);
 
+   if (ret)
+      winehua_dump_submit_failure(ctx->ctx_id, cbuf, length_dw, ret);
+
    free(cbuf);
    if (ret)
       return -1;
@@ -1905,11 +1950,12 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
 
    if ((flags & VCMD_BUSY_WAIT_FLAG_WAIT) && getenv("VTEST_SYNC_GL_FINISH")) {
       ret = virgl_renderer_context_finish(ctx->ctx_id);
-      winehua_diag("busy wait context finish ctx=%d ret=%d submitted=%u completed=%u",
-                   ctx->ctx_id, ret, ctx->implicit_fence_submitted,
-                   (uint32_t)renderer.implicit_fence_completed);
-      if (ret)
+      if (ret) {
+         winehua_diag("busy wait context finish failed ctx=%d ret=%d submitted=%u completed=%u",
+                      ctx->ctx_id, ret, ctx->implicit_fence_submitted,
+                      (uint32_t)renderer.implicit_fence_completed);
          return ret;
+      }
    }
 
    do {
