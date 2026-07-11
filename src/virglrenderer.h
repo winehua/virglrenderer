@@ -283,6 +283,7 @@ VIRGL_EXPORT void virgl_renderer_resource_set_priv(uint32_t res_handle, void *pr
 VIRGL_EXPORT void *virgl_renderer_resource_get_priv(uint32_t res_handle);
 
 VIRGL_EXPORT int virgl_renderer_context_create(uint32_t handle, uint32_t nlen, const char *name);
+VIRGL_EXPORT int virgl_renderer_context_finish(uint32_t ctx_id);
 VIRGL_EXPORT void virgl_renderer_context_destroy(uint32_t handle);
 
 /* Submit a command buffer for execution.  ctx_id is the context ID.

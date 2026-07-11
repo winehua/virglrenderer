@@ -1661,6 +1661,17 @@ struct virgl_context *vrend_renderer_context_create(uint32_t handle,
    return &dctx->base;
 }
 
+int vrend_renderer_context_finish(struct virgl_context *ctx)
+{
+   struct vrend_decode_ctx *dctx = (struct vrend_decode_ctx *)ctx;
+
+   if (!dctx->grctx || !vrend_hw_switch_context(dctx->grctx, true))
+      return EINVAL;
+
+   glFinish();
+   return 0;
+}
+
 static void vrend_decode_ctx_destroy(struct virgl_context *ctx)
 {
    TRACE_FUNC();
