@@ -28,6 +28,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -199,6 +200,32 @@ struct vtest_renderer {
    struct vtest_context *current_context;
 };
 
+static FILE *winehua_diag_file;
+static uint64_t winehua_submit_count;
+static uint64_t winehua_complete_count;
+
+static uint64_t winehua_diag_now_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void winehua_diag(const char *fmt, ...)
+{
+   va_list args;
+   if (!winehua_diag_file)
+      return;
+   flockfile(winehua_diag_file);
+   fprintf(winehua_diag_file, "[%llu] ", (unsigned long long)winehua_diag_now_ms());
+   va_start(args, fmt);
+   vfprintf(winehua_diag_file, fmt, args);
+   va_end(args);
+   fputc('\n', winehua_diag_file);
+   fflush(winehua_diag_file);
+   funlockfile(winehua_diag_file);
+}
+
 /*
  * VCMD_RESOURCE_BUSY_WAIT is used to wait GPU works (VCMD_SUBMIT_CMD) or CPU
  * works (VCMD_TRANSFER_GET2).  A fence is needed only for GPU works.
@@ -208,12 +235,27 @@ static void vtest_create_implicit_fence(struct vtest_renderer *renderer,
 {
    ctx->implicit_fence_submitted = ++renderer->implicit_fence_submitted;
    virgl_renderer_create_fence(ctx->implicit_fence_submitted, 0);
+   winehua_submit_count++;
+   if (winehua_submit_count == 1 || !(winehua_submit_count % 120))
+      winehua_diag("fence submit ctx=%d id=%u completed=%u count=%llu",
+                   ctx->ctx_id, ctx->implicit_fence_submitted,
+                   (uint32_t)renderer->implicit_fence_completed,
+                   (unsigned long long)winehua_submit_count);
 }
 
 static void vtest_write_implicit_fence(UNUSED void *cookie, uint32_t fence_id_in)
 {
    struct vtest_renderer *renderer = (struct vtest_renderer*)cookie;
+   uint32_t previous = renderer->implicit_fence_completed;
+   if ((int32_t)(fence_id_in - previous) < 0)
+      winehua_diag("fence completion regressed previous=%u incoming=%u submitted=%u",
+                   previous, fence_id_in, (uint32_t)renderer->implicit_fence_submitted);
    renderer->implicit_fence_completed = fence_id_in;
+   winehua_complete_count++;
+   if (winehua_complete_count == 1 || !(winehua_complete_count % 120))
+      winehua_diag("fence complete id=%u submitted=%u count=%llu",
+                   fence_id_in, (uint32_t)renderer->implicit_fence_submitted,
+                   (unsigned long long)winehua_complete_count);
 }
 
 static void vtest_signal_timeline(struct vtest_timeline *timeline,
@@ -607,7 +649,22 @@ int vtest_init_renderer(bool multi_clients,
                         int ctx_flags,
                         const char *render_device)
 {
+   const char *sync_mode = getenv("WINEHUA_VIRGL_SYNC_MODE");
+   const char *log_path = getenv("WINEHUA_VIRGL_LOG_PATH");
    int ret;
+
+   if (!sync_mode || !sync_mode[0])
+      sync_mode = "egl-thread";
+   if (log_path && log_path[0]) {
+      winehua_diag_file = fopen(log_path, "a");
+      if (winehua_diag_file)
+         setvbuf(winehua_diag_file, NULL, _IOLBF, 0);
+   }
+   winehua_submit_count = 0;
+   winehua_complete_count = 0;
+   winehua_diag("renderer init sync=%s submitted=%u completed=%u multi_clients=%d",
+                sync_mode, (uint32_t)renderer.implicit_fence_submitted,
+                (uint32_t)renderer.implicit_fence_completed, multi_clients);
 
    renderer.rendernode_name = render_device;
    list_inithead(&renderer.active_contexts);
@@ -615,8 +672,9 @@ int vtest_init_renderer(bool multi_clients,
    list_inithead(&renderer.free_resources);
    list_inithead(&renderer.free_syncs);
 
-   ctx_flags |= VIRGL_RENDERER_THREAD_SYNC |
-                VIRGL_RENDERER_USE_EXTERNAL_BLOB;
+   ctx_flags |= VIRGL_RENDERER_USE_EXTERNAL_BLOB;
+   if (strcmp(sync_mode, "egl-main"))
+      ctx_flags |= VIRGL_RENDERER_THREAD_SYNC;
    ret = virgl_renderer_init(&renderer, ctx_flags, &renderer_cbs);
    if (ret) {
       fprintf(stderr, "failed to initialise renderer.\n");
@@ -633,6 +691,11 @@ static void vtest_free_context(struct vtest_context *ctx, bool cleanup);
 
 void vtest_cleanup_renderer(void)
 {
+   winehua_diag("renderer cleanup begin submitted=%u completed=%u submits=%llu completes=%llu",
+                (uint32_t)renderer.implicit_fence_submitted,
+                (uint32_t)renderer.implicit_fence_completed,
+                (unsigned long long)winehua_submit_count,
+                (unsigned long long)winehua_complete_count);
    if (renderer.next_context_id > 1) {
       struct vtest_context *ctx, *tmp;
 
@@ -673,6 +736,13 @@ void vtest_cleanup_renderer(void)
    }
 
    virgl_renderer_cleanup(&renderer);
+   winehua_diag("renderer cleanup end submitted=%u completed=%u",
+                (uint32_t)renderer.implicit_fence_submitted,
+                (uint32_t)renderer.implicit_fence_completed);
+   if (winehua_diag_file) {
+      fclose(winehua_diag_file);
+      winehua_diag_file = NULL;
+   }
 }
 
 static struct vtest_context *vtest_new_context(struct vtest_input *input,
@@ -731,12 +801,17 @@ static struct vtest_context *vtest_new_context(struct vtest_input *input,
    ctx->capset_id = 0;
    ctx->context_initialized = false;
    ctx->implicit_fence_submitted = renderer.implicit_fence_completed;
+   winehua_diag("client context allocated ctx=%d baseline=%u out_fd=%d",
+                ctx->ctx_id, ctx->implicit_fence_submitted, out_fd);
 
    return ctx;
 }
 
 static void vtest_free_context(struct vtest_context *ctx, bool cleanup)
 {
+   winehua_diag("client context free ctx=%d submitted=%u completed=%u cleanup=%d",
+                ctx->ctx_id, ctx->implicit_fence_submitted,
+                (uint32_t)renderer.implicit_fence_completed, cleanup);
    if (cleanup) {
       util_hash_table_destroy(ctx->resource_table);
       util_hash_table_destroy(ctx->sync_table);
@@ -1799,6 +1874,7 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
    int flags;
    uint32_t hdr_buf[VTEST_HDR_SIZE];
    uint32_t reply_buf[1];
+   uint64_t wait_started_ms = 0;
    bool busy = false;
 
    ret = ctx->input->read(ctx->input, &bw_buf, sizeof(bw_buf));
@@ -1823,12 +1899,27 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
       if (!busy || !(flags & VCMD_BUSY_WAIT_FLAG_WAIT))
          break;
 
+      if (!wait_started_ms) {
+         wait_started_ms = winehua_diag_now_ms();
+         winehua_diag("busy wait begin ctx=%d submitted=%u completed=%u poll_fd=%d",
+                      ctx->ctx_id, ctx->implicit_fence_submitted,
+                      (uint32_t)renderer.implicit_fence_completed,
+                      virgl_renderer_get_poll_fd());
+      }
+
       fd = virgl_renderer_get_poll_fd();
       if (fd != -1) {
          vtest_wait_for_fd_read(fd);
       }
       virgl_renderer_poll();
    } while (true);
+
+   if (wait_started_ms)
+      winehua_diag("busy wait end ctx=%d duration_ms=%llu submitted=%u completed=%u",
+                   ctx->ctx_id,
+                   (unsigned long long)(winehua_diag_now_ms() - wait_started_ms),
+                   ctx->implicit_fence_submitted,
+                   (uint32_t)renderer.implicit_fence_completed);
 
    hdr_buf[VTEST_CMD_LEN] = 1;
    hdr_buf[VTEST_CMD_ID] = VCMD_RESOURCE_BUSY_WAIT;
