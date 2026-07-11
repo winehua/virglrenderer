@@ -258,6 +258,7 @@ void vrend_destroy_context(struct vrend_context *ctx);
 struct virgl_context *vrend_renderer_context_create(uint32_t handle,
                                                     uint32_t nlen,
                                                     const char *name);
+int vrend_renderer_context_finish(struct virgl_context *ctx);
 
 struct vrend_renderer_resource_create_args {
    enum pipe_texture_target target;

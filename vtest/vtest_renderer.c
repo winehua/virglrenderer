@@ -655,6 +655,16 @@ int vtest_init_renderer(bool multi_clients,
 
    if (!sync_mode || !sync_mode[0])
       sync_mode = "egl-thread";
+
+   /* On OHOS, polling an EGL native fence from the renderer thread can stay
+    * in EGL_TIMEOUT_EXPIRED_KHR indefinitely.  The non-threaded mode can use
+    * a GLsync from the renderer share group without entering EGL's display
+    * synchronization path. */
+   if (!strcmp(sync_mode, "egl-main"))
+      setenv("VIRGL_DISABLE_EGL_FENCE", "1", 1);
+   else
+      unsetenv("VIRGL_DISABLE_EGL_FENCE");
+
    if (log_path && log_path[0]) {
       winehua_diag_file = fopen(log_path, "a");
       if (winehua_diag_file)
@@ -1892,6 +1902,15 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
 
    /*  handle = bw_buf[VCMD_BUSY_WAIT_HANDLE]; unused as of now */
    flags = bw_buf[VCMD_BUSY_WAIT_FLAGS];
+
+   if ((flags & VCMD_BUSY_WAIT_FLAG_WAIT) && getenv("VTEST_SYNC_GL_FINISH")) {
+      ret = virgl_renderer_context_finish(ctx->ctx_id);
+      winehua_diag("busy wait context finish ctx=%d ret=%d submitted=%u completed=%u",
+                   ctx->ctx_id, ret, ctx->implicit_fence_submitted,
+                   (uint32_t)renderer.implicit_fence_completed);
+      if (ret)
+         return ret;
+   }
 
    do {
       busy = (int32_t)(ctx->implicit_fence_submitted -

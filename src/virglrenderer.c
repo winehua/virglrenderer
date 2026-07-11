@@ -280,6 +280,17 @@ int virgl_renderer_context_create(uint32_t handle, uint32_t nlen, const char *na
                                                    name);
 }
 
+int virgl_renderer_context_finish(uint32_t ctx_id)
+{
+   struct virgl_context *ctx = virgl_context_lookup(ctx_id);
+
+   if (!ctx || (ctx->capset_id != VIRTGPU_DRM_CAPSET_VIRGL &&
+                ctx->capset_id != VIRTGPU_DRM_CAPSET_VIRGL2))
+      return EINVAL;
+
+   return vrend_renderer_context_finish(ctx);
+}
+
 void virgl_renderer_context_destroy(uint32_t handle)
 {
    TRACE_FUNC();
