@@ -1015,6 +1015,12 @@ int vtest_winehua_present(uint32_t length_dw)
    struct vtest_resource *res;
    struct virgl_renderer_resource_info info = { 0 };
    uint32_t command[VCMD_WINEHUA_PRESENT_SIZE];
+   uint32_t reply_header[VTEST_HDR_SIZE] = {
+      [VTEST_CMD_LEN] = VCMD_WINEHUA_PRESENT_REPLY_SIZE,
+      [VTEST_CMD_ID] = VCMD_WINEHUA_PRESENT,
+   };
+   uint32_t reply[VCMD_WINEHUA_PRESENT_REPLY_SIZE];
+   uint64_t next_present_deadline_ns = 0;
    uint64_t drawable;
    bool payload_matches;
    int callback_ret = -ENOSYS;
@@ -1059,6 +1065,7 @@ int vtest_winehua_present(uint32_t length_dw)
          command[VCMD_WINEHUA_PRESENT_CLIENT_PID],
          command[VCMD_WINEHUA_PRESENT_SURFACE_ID],
          command[VCMD_WINEHUA_PRESENT_FLAGS],
+         &next_present_deadline_ns,
          winehua_present_callback_data);
    }
    winehua_present_count++;
@@ -1070,7 +1077,7 @@ int vtest_winehua_present(uint32_t length_dw)
          "client_handle=%u server_handle=%u tex_id=%u level=%u layer=%u "
          "bind=0x%x guest_format=%u host_format=%u guest_size=%ux%u "
          "host_size=%ux%u host_stride=%u flags=0x%x info_ret=%d "
-         "callback_ret=%d match=%d",
+         "callback_ret=%d next_deadline_ns=%llu match=%d",
          (unsigned long long)winehua_present_count, ctx->ctx_id,
          command[VCMD_WINEHUA_PRESENT_SERIAL],
          command[VCMD_WINEHUA_PRESENT_CLIENT_PID],
@@ -1085,10 +1092,22 @@ int vtest_winehua_present(uint32_t length_dw)
          command[VCMD_WINEHUA_PRESENT_HEIGHT],
          info.width, info.height, info.stride,
          command[VCMD_WINEHUA_PRESENT_FLAGS], info_ret, callback_ret,
+         (unsigned long long)next_present_deadline_ns,
          payload_matches);
    }
 
-   return 0;
+   reply[VCMD_WINEHUA_PRESENT_REPLY_STATUS] = (uint32_t)(int32_t)callback_ret;
+   reply[VCMD_WINEHUA_PRESENT_REPLY_DEADLINE_LO] =
+      (uint32_t)next_present_deadline_ns;
+   reply[VCMD_WINEHUA_PRESENT_REPLY_DEADLINE_HI] =
+      (uint32_t)(next_present_deadline_ns >> 32);
+   reply[VCMD_WINEHUA_PRESENT_REPLY_SERIAL] =
+      command[VCMD_WINEHUA_PRESENT_SERIAL];
+   ret = vtest_block_write(ctx->out_fd, reply_header, sizeof(reply_header));
+   if (ret < 0)
+      return ret;
+   ret = vtest_block_write(ctx->out_fd, reply, sizeof(reply));
+   return ret < 0 ? ret : 0;
 }
 
 int vtest_ping_protocol_version(UNUSED uint32_t length_dw)

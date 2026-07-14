@@ -35,7 +35,7 @@ typedef int (*vtest_winehua_present_callback)(
    uint32_t tex_id, uint32_t width, uint32_t height, uint32_t format,
    uint32_t resource_flags, uint64_t drawable, uint32_t serial, uint32_t client_pid,
    uint32_t surface_id,
-   uint32_t present_flags, void *user_data);
+   uint32_t present_flags, uint64_t *next_present_deadline_ns, void *user_data);
 
 struct vtest_buffer {
    const char *buffer;
