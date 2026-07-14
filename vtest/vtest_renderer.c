@@ -201,6 +201,9 @@ struct vtest_renderer {
 static FILE *winehua_diag_file;
 static uint64_t winehua_submit_count;
 static uint64_t winehua_complete_count;
+static uint64_t winehua_present_count;
+static vtest_winehua_present_callback winehua_present_callback;
+static void *winehua_present_callback_data;
 
 static uint64_t winehua_diag_now_ms(void)
 {
@@ -714,6 +717,7 @@ int vtest_init_renderer(bool multi_clients,
    virgl_set_log_callback(winehua_virgl_log, NULL, NULL);
    winehua_submit_count = 0;
    winehua_complete_count = 0;
+   winehua_present_count = 0;
    winehua_diag("renderer init sync=%s submitted=%u completed=%u multi_clients=%d",
                 sync_mode, (uint32_t)renderer.implicit_fence_submitted,
                 (uint32_t)renderer.implicit_fence_completed, multi_clients);
@@ -743,11 +747,12 @@ static void vtest_free_context(struct vtest_context *ctx, bool cleanup);
 
 void vtest_cleanup_renderer(void)
 {
-   winehua_diag("renderer cleanup begin submitted=%u completed=%u submits=%llu completes=%llu",
+   winehua_diag("renderer cleanup begin submitted=%u completed=%u submits=%llu completes=%llu presents=%llu",
                 (uint32_t)renderer.implicit_fence_submitted,
                 (uint32_t)renderer.implicit_fence_completed,
                 (unsigned long long)winehua_submit_count,
-                (unsigned long long)winehua_complete_count);
+                (unsigned long long)winehua_complete_count,
+                (unsigned long long)winehua_present_count);
    if (renderer.next_context_id > 1) {
       struct vtest_context *ctx, *tmp;
 
@@ -995,6 +1000,95 @@ void vtest_set_current_context(struct vtest_context *ctx)
 static struct vtest_context *vtest_get_current_context(void)
 {
    return renderer.current_context;
+}
+
+void vtest_set_winehua_present_callback(
+   vtest_winehua_present_callback callback, void *user_data)
+{
+   winehua_present_callback = callback;
+   winehua_present_callback_data = user_data;
+}
+
+int vtest_winehua_present(uint32_t length_dw)
+{
+   struct vtest_context *ctx = vtest_get_current_context();
+   struct vtest_resource *res;
+   struct virgl_renderer_resource_info info = { 0 };
+   uint32_t command[VCMD_WINEHUA_PRESENT_SIZE];
+   uint64_t drawable;
+   bool payload_matches;
+   int callback_ret = -ENOSYS;
+   int info_ret;
+   int ret;
+
+   if (length_dw != VCMD_WINEHUA_PRESENT_SIZE)
+      return report_failure("invalid WineHua present command length", -EINVAL);
+
+   ret = ctx->input->read(ctx->input, command, sizeof(command));
+   if (ret != sizeof(command))
+      return -1;
+
+   if (command[VCMD_WINEHUA_PRESENT_PROTOCOL_VERSION] !=
+       VCMD_WINEHUA_PRESENT_VERSION)
+      return report_failure("unsupported WineHua present version", -EPROTONOSUPPORT);
+
+   if (command[VCMD_WINEHUA_PRESENT_FLAGS])
+      return report_failure("unsupported WineHua present flags", -EINVAL);
+
+   res = util_hash_table_get(
+      ctx->resource_table,
+      intptr_to_pointer(command[VCMD_WINEHUA_PRESENT_RES_HANDLE]));
+   if (!res)
+      return report_failed_call("WineHua present resource lookup", -ESRCH);
+
+   info_ret = virgl_renderer_resource_get_info(res->res_id, &info);
+   drawable =
+      (uint64_t)command[VCMD_WINEHUA_PRESENT_DRAWABLE_LO] |
+      (uint64_t)command[VCMD_WINEHUA_PRESENT_DRAWABLE_HI] << 32;
+   payload_matches =
+      info_ret == 0 &&
+      info.handle == res->res_id &&
+      info.virgl_format == command[VCMD_WINEHUA_PRESENT_FORMAT] &&
+      info.width == command[VCMD_WINEHUA_PRESENT_WIDTH] &&
+      info.height == command[VCMD_WINEHUA_PRESENT_HEIGHT] &&
+      info.tex_id != 0;
+   if (payload_matches && winehua_present_callback) {
+      callback_ret = winehua_present_callback(
+         info.tex_id, info.width, info.height, info.virgl_format, info.flags,
+         drawable, command[VCMD_WINEHUA_PRESENT_SERIAL],
+         command[VCMD_WINEHUA_PRESENT_CLIENT_PID],
+         command[VCMD_WINEHUA_PRESENT_SURFACE_ID],
+         command[VCMD_WINEHUA_PRESENT_FLAGS],
+         winehua_present_callback_data);
+   }
+   winehua_present_count++;
+
+   if (winehua_present_count == 1 || !(winehua_present_count % 120) ||
+       info_ret || !payload_matches) {
+      winehua_diag(
+         "present count=%llu ctx=%d serial=%u pid=%u surface=%u drawable=0x%llx "
+         "client_handle=%u server_handle=%u tex_id=%u level=%u layer=%u "
+         "bind=0x%x guest_format=%u host_format=%u guest_size=%ux%u "
+         "host_size=%ux%u host_stride=%u flags=0x%x info_ret=%d "
+         "callback_ret=%d match=%d",
+         (unsigned long long)winehua_present_count, ctx->ctx_id,
+         command[VCMD_WINEHUA_PRESENT_SERIAL],
+         command[VCMD_WINEHUA_PRESENT_CLIENT_PID],
+         command[VCMD_WINEHUA_PRESENT_SURFACE_ID],
+         (unsigned long long)drawable,
+         command[VCMD_WINEHUA_PRESENT_RES_HANDLE], res->res_id, info.tex_id,
+         command[VCMD_WINEHUA_PRESENT_LEVEL],
+         command[VCMD_WINEHUA_PRESENT_LAYER],
+         command[VCMD_WINEHUA_PRESENT_BIND],
+         command[VCMD_WINEHUA_PRESENT_FORMAT], info.virgl_format,
+         command[VCMD_WINEHUA_PRESENT_WIDTH],
+         command[VCMD_WINEHUA_PRESENT_HEIGHT],
+         info.width, info.height, info.stride,
+         command[VCMD_WINEHUA_PRESENT_FLAGS], info_ret, callback_ret,
+         payload_matches);
+   }
+
+   return 0;
 }
 
 int vtest_ping_protocol_version(UNUSED uint32_t length_dw)

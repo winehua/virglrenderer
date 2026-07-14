@@ -26,8 +26,16 @@
 #define VTEST_H
 
 #include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 struct vtest_context;
+
+typedef int (*vtest_winehua_present_callback)(
+   uint32_t tex_id, uint32_t width, uint32_t height, uint32_t format,
+   uint32_t resource_flags, uint64_t drawable, uint32_t serial, uint32_t client_pid,
+   uint32_t surface_id,
+   uint32_t present_flags, void *user_data);
 
 struct vtest_buffer {
    const char *buffer;
@@ -113,7 +121,10 @@ int vtest_drm_sync_query(uint32_t length_dw);
 int vtest_drm_sync_transfer(uint32_t length_dw);
 int vtest_resource_export_fd(uint32_t length_dw);
 
+int vtest_winehua_present(uint32_t length_dw);
+void vtest_set_winehua_present_callback(
+   vtest_winehua_present_callback callback, void *user_data);
+
 void vtest_set_max_length(uint32_t length);
 
 #endif
-
