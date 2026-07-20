@@ -6,12 +6,24 @@
 #include "vkr_device_memory.h"
 
 #include <math.h>
+#include <string.h>
+
+#ifdef __OHOS__
+#include <sys/mman.h>
+#include <unistd.h>
+#include "util/anon_file.h"
+#endif
 
 #include "venus-protocol/vn_protocol_renderer_transport.h"
 
 #include "vkr_device_memory_gen.h"
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
+
+static VkResult
+vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
+                                     VkDeviceSize offset,
+                                     VkDeviceSize size);
 
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
@@ -422,6 +434,20 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->mtl_shm = mtl_shm;
    mem->allocation_size = alloc_info->allocationSize;
    mem->memory_type_index = mem_type_index;
+#ifdef __OHOS__
+   mem->shadow_fd = -1;
+   mem->shadow_map = NULL;
+   mem->host_map = NULL;
+   mem->shadow_size = 0;
+   mem->shadow_sync_count = 0;
+   mem->shadow_remote_flush_count = 0;
+   mem->shadow_guest_write_depth = 0;
+   mem->shadow_remote_invalidate_count = 0;
+   mem->shadow_remote_active = false;
+   mem->shadow_host_dirty = false;
+   mem->shadow_dirty_offset = 0;
+   mem->shadow_dirty_size = 0;
+#endif
 }
 
 static void
@@ -460,6 +486,59 @@ vkr_dispatch_vkGetDeviceMemoryOpaqueCaptureAddress(
 
    vn_replace_vkGetDeviceMemoryOpaqueCaptureAddress_args_handle(args);
    args->ret = vk->GetDeviceMemoryOpaqueCaptureAddress(args->device, args->pInfo);
+}
+
+static void
+vkr_dispatch_vkFlushMappedMemoryRanges(
+   struct vn_dispatch_context *dispatch,
+   struct vn_command_vkFlushMappedMemoryRanges *args)
+{
+   struct vkr_context *ctx = dispatch->data;
+   args->ret = VK_SUCCESS;
+
+   mtx_lock(&ctx->object_mutex);
+   for (uint32_t i = 0; i < args->memoryRangeCount; i++) {
+      const VkMappedMemoryRange *range = &args->pMemoryRanges[i];
+      struct vkr_device_memory *mem = vkr_device_memory_from_handle(range->memory);
+      if (!mem) {
+         args->ret = VK_ERROR_MEMORY_MAP_FAILED;
+         break;
+      }
+
+      args->ret = vkr_device_memory_flush_shadow_range(
+         mem, range->offset, range->size);
+      if (args->ret != VK_SUCCESS)
+         break;
+   }
+   mtx_unlock(&ctx->object_mutex);
+}
+
+static void
+vkr_dispatch_vkInvalidateMappedMemoryRanges(
+   struct vn_dispatch_context *dispatch,
+   struct vn_command_vkInvalidateMappedMemoryRanges *args)
+{
+   struct vkr_context *ctx = dispatch->data;
+   args->ret = VK_SUCCESS;
+
+   mtx_lock(&ctx->object_mutex);
+   for (uint32_t i = 0; i < args->memoryRangeCount; i++) {
+      struct vkr_device_memory *mem =
+         vkr_device_memory_from_handle(args->pMemoryRanges[i].memory);
+      if (!mem) {
+         args->ret = VK_ERROR_MEMORY_MAP_FAILED;
+         break;
+      }
+#ifdef __OHOS__
+      mem->shadow_guest_write_depth++;
+      mem->shadow_remote_active = true;
+      const uint32_t count = mem->shadow_remote_invalidate_count++;
+      if (count < 8 || !(count % 60))
+         vkr_log("OHOS shadow guest write begin count=%u mem=%p depth=%u",
+                 count + 1, mem, mem->shadow_guest_write_depth);
+#endif
+   }
+   mtx_unlock(&ctx->object_mutex);
 }
 
 static void
@@ -514,8 +593,10 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
    dispatch->dispatch_vkFreeMemory = vkr_dispatch_vkFreeMemory;
    dispatch->dispatch_vkMapMemory = NULL;
    dispatch->dispatch_vkUnmapMemory = NULL;
-   dispatch->dispatch_vkFlushMappedMemoryRanges = NULL;
-   dispatch->dispatch_vkInvalidateMappedMemoryRanges = NULL;
+   dispatch->dispatch_vkFlushMappedMemoryRanges =
+      vkr_dispatch_vkFlushMappedMemoryRanges;
+   dispatch->dispatch_vkInvalidateMappedMemoryRanges =
+      vkr_dispatch_vkInvalidateMappedMemoryRanges;
    dispatch->dispatch_vkGetDeviceMemoryCommitment =
       vkr_dispatch_vkGetDeviceMemoryCommitment;
    dispatch->dispatch_vkGetDeviceMemoryOpaqueCaptureAddress =
@@ -528,6 +609,22 @@ vkr_context_init_device_memory_dispatch(struct vkr_context *ctx)
 void
 vkr_device_memory_release(struct vkr_device_memory *mem)
 {
+#ifdef __OHOS__
+   if (mem->host_map) {
+      struct vn_device_proc_table *vk = &mem->device->proc_table;
+      vk->UnmapMemory(mem->device->base.handle.device,
+                      mem->base.handle.device_memory);
+      mem->host_map = NULL;
+   }
+   if (mem->shadow_map) {
+      munmap(mem->shadow_map, mem->shadow_size);
+      mem->shadow_map = NULL;
+   }
+   if (mem->shadow_fd >= 0) {
+      close(mem->shadow_fd);
+      mem->shadow_fd = -1;
+   }
+#endif
    vkr_mtl_shm_free(mem->mtl_shm);
    if (mem->gbm_bo)
       vkr_gbm_bo_destroy(mem->gbm_bo);
@@ -608,8 +705,94 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
       vulkan_info.allocation_size = mem->allocation_size;
       vulkan_info.memory_type_index = mem->memory_type_index;
    } else {
+#ifdef __OHOS__
+      if (blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_CROSS_DEVICE) {
+         vkr_log("OHOS shadow memory cannot support cross-device export");
+         return false;
+      }
+
+      const uint64_t page_size = (uint64_t)getpagesize();
+      const uint64_t shadow_size = align(MAX2(blob_size, mem->allocation_size), page_size);
+      const bool mappable = blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_MAPPABLE;
+      if (mappable && !(mem->property_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+         vkr_log("OHOS shadow requested for non-host-visible memory");
+         return false;
+      }
+
+      int shadow_fd = os_create_anonymous_file(shadow_size, "vkr-ohos-shadow");
+      if (shadow_fd < 0) {
+         vkr_log("failed to allocate OHOS shadow fd: %s", strerror(errno));
+         return false;
+      }
+      void *shadow_map = mmap(NULL, shadow_size, PROT_READ | PROT_WRITE,
+                              MAP_SHARED, shadow_fd, 0);
+      if (shadow_map == MAP_FAILED) {
+         vkr_log("failed to map OHOS shadow fd: %s", strerror(errno));
+         close(shadow_fd);
+         return false;
+      }
+
+      struct vn_device_proc_table *vk = &mem->device->proc_table;
+      void *host_map = NULL;
+      if (mappable) {
+         VkResult result = vk->MapMemory(mem->device->base.handle.device,
+                                         mem->base.handle.device_memory,
+                                         0, VK_WHOLE_SIZE, 0, &host_map);
+         if (result != VK_SUCCESS) {
+            vkr_log("failed to map OHOS Host Vulkan memory (%d)", result);
+            munmap(shadow_map, shadow_size);
+            close(shadow_fd);
+            return false;
+         }
+      }
+
+      int exported_fd = os_dupfd_cloexec(shadow_fd);
+      if (exported_fd < 0) {
+         if (host_map) {
+            vk->UnmapMemory(mem->device->base.handle.device,
+                            mem->base.handle.device_memory);
+         }
+         munmap(shadow_map, shadow_size);
+         close(shadow_fd);
+         return false;
+      }
+
+      mem->shadow_fd = shadow_fd;
+      mem->shadow_map = shadow_map;
+      mem->host_map = host_map;
+      mem->shadow_size = shadow_size;
+      if (host_map) {
+         const bool coherent =
+            mem->property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+         if (!coherent) {
+            const VkMappedMemoryRange range = {
+               .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+               .memory = mem->base.handle.device_memory,
+               .offset = 0,
+               .size = VK_WHOLE_SIZE,
+            };
+            vk->InvalidateMappedMemoryRanges(mem->device->base.handle.device, 1, &range);
+         }
+         const size_t copy_size =
+            (size_t)MIN2(mem->shadow_size, mem->allocation_size);
+         memcpy(mem->shadow_map, mem->host_map, copy_size);
+
+      }
+      mem->exported = true;
+      *out_blob = (struct virgl_context_blob){
+         .type = VIRGL_RESOURCE_FD_SHM,
+         .u.fd = exported_fd,
+         .map_info = mappable ? map_info : VIRGL_RENDERER_MAP_CACHE_NONE,
+      };
+      vkr_log("using OHOS shadow memory size=%" PRIu64
+              " allocation=%" PRIu64 " flags=0x%x mappable=%d coherent=%d",
+              shadow_size, mem->allocation_size, mem->property_flags, mappable,
+              !!(mem->property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
+      return true;
+#else
       vkr_log("mem is not exportable");
       return false;
+#endif
    }
 
    int fd;
@@ -662,4 +845,195 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    };
 
    return true;
+}
+
+static void
+vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
+{
+#ifdef __OHOS__
+   if (!mem->host_map || !mem->shadow_map || !mem->shadow_size)
+      return;
+
+   struct vn_device_proc_table *vk = &mem->device->proc_table;
+   const VkMappedMemoryRange range = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = mem->base.handle.device_memory,
+      .offset = 0,
+      .size = VK_WHOLE_SIZE,
+   };
+   const bool coherent = mem->property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+   const size_t copy_size = (size_t)MIN2(mem->shadow_size, mem->allocation_size);
+
+   if (to_host && mem->shadow_remote_active) {
+      if (!mem->shadow_host_dirty)
+         return;
+
+      const VkMappedMemoryRange dirty_range = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = mem->base.handle.device_memory,
+         .offset = mem->shadow_dirty_offset,
+         .size = mem->shadow_dirty_size,
+      };
+      VkResult dirty_result = vk->FlushMappedMemoryRanges(
+         mem->device->base.handle.device, 1, &dirty_range);
+      if (dirty_result != VK_SUCCESS)
+         vkr_log("OHOS shadow dirty flush failed result=%d offset=%" PRIu64
+                 " size=%" PRIu64,
+                 dirty_result, (uint64_t)mem->shadow_dirty_offset,
+                 (uint64_t)mem->shadow_dirty_size);
+      mem->shadow_host_dirty = false;
+      return;
+   }
+
+   if (to_host) {
+      size_t first_diff = copy_size;
+      if (mem->shadow_sync_count < 16) {
+         const uint8_t *shadow = mem->shadow_map;
+         const uint8_t *host = mem->host_map;
+         const size_t page_size = 4096;
+         for (size_t offset = 0; offset < copy_size; offset += page_size) {
+            const size_t chunk = MIN2(page_size, copy_size - offset);
+            if (memcmp(shadow + offset, host + offset, chunk)) {
+               size_t byte = 0;
+               while (byte < chunk && shadow[offset + byte] == host[offset + byte])
+                  byte++;
+               first_diff = offset + byte;
+               break;
+            }
+         }
+         if (first_diff < copy_size) {
+            const uint8_t *shadow = mem->shadow_map;
+            const uint8_t *host = mem->host_map;
+            const size_t available = MIN2((size_t)16, copy_size - first_diff);
+            uint64_t shadow_word0 = 0, shadow_word1 = 0;
+            uint64_t host_word0 = 0, host_word1 = 0;
+            memcpy(&shadow_word0, shadow + first_diff, MIN2((size_t)8, available));
+            memcpy(&host_word0, host + first_diff, MIN2((size_t)8, available));
+            if (available > 8) {
+               memcpy(&shadow_word1, shadow + first_diff + 8, available - 8);
+               memcpy(&host_word1, host + first_diff + 8, available - 8);
+            }
+            vkr_log("OHOS shadow diff sync=%u mem=%p offset=%zu "
+                    "shadow=%016" PRIx64 "%016" PRIx64
+                    " host=%016" PRIx64 "%016" PRIx64,
+                    mem->shadow_sync_count, mem, first_diff,
+                    shadow_word0, shadow_word1, host_word0, host_word1);
+         }
+      }
+      memcpy(mem->host_map, mem->shadow_map, copy_size);
+      /* Maleoon advertises some host-visible heaps as coherent, but mapped
+       * writes made through the OHOS shadow bridge are not always visible to
+       * shader reads without an explicit cache-domain transition.  Flushing a
+       * coherent range is valid Vulkan and is a no-op on conformant coherent
+       * implementations, so force it for the OHOS compatibility path. */
+      VkResult result =
+         vk->FlushMappedMemoryRanges(mem->device->base.handle.device, 1, &range);
+      if (result != VK_SUCCESS)
+         vkr_log("OHOS shadow flush failed result=%d coherent=%d size=%zu",
+                 result, coherent, copy_size);
+      mem->shadow_sync_count++;
+   } else {
+      if (mem->shadow_guest_write_depth)
+         return;
+      VkResult result =
+         vk->InvalidateMappedMemoryRanges(mem->device->base.handle.device, 1, &range);
+      if (result != VK_SUCCESS)
+         vkr_log("OHOS shadow invalidate failed result=%d coherent=%d size=%zu",
+                 result, coherent, copy_size);
+      memcpy(mem->shadow_map, mem->host_map, copy_size);
+      if (mem->shadow_remote_active)
+         mem->shadow_host_dirty = false;
+   }
+#else
+   (void)mem;
+   (void)to_host;
+#endif
+}
+
+static VkResult
+vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
+                                     VkDeviceSize offset,
+                                     VkDeviceSize size)
+{
+#ifdef __OHOS__
+   if (!mem->host_map || !mem->shadow_map || !mem->shadow_size) {
+      if (mem->shadow_guest_write_depth)
+         mem->shadow_guest_write_depth--;
+      return VK_SUCCESS;
+   }
+
+   if (offset > mem->allocation_size)
+      return VK_ERROR_MEMORY_MAP_FAILED;
+
+   const VkDeviceSize available = mem->allocation_size - offset;
+   const VkDeviceSize copy_size = size == VK_WHOLE_SIZE
+      ? available
+      : MIN2(size, available);
+
+   memcpy((uint8_t *)mem->host_map + offset,
+          (const uint8_t *)mem->shadow_map + offset,
+          (size_t)copy_size);
+
+   mem->shadow_remote_active = true;
+   if (!mem->shadow_host_dirty) {
+      mem->shadow_dirty_offset = offset;
+      mem->shadow_dirty_size = copy_size;
+      mem->shadow_host_dirty = true;
+   } else {
+      const VkDeviceSize dirtyBegin = MIN2(mem->shadow_dirty_offset, offset);
+      const VkDeviceSize dirtyEnd = MAX2(
+         mem->shadow_dirty_offset + mem->shadow_dirty_size,
+         offset + copy_size);
+      mem->shadow_dirty_offset = dirtyBegin;
+      mem->shadow_dirty_size = dirtyEnd - dirtyBegin;
+   }
+
+   if (mem->shadow_guest_write_depth)
+      mem->shadow_guest_write_depth--;
+
+   const uint32_t flush_count = mem->shadow_remote_flush_count++;
+   if (flush_count < 8 || !(flush_count % 60))
+      vkr_log("OHOS shadow remote flush count=%u mem=%p offset=%" PRIu64
+              " size=%" PRIu64 " result=0",
+              flush_count + 1, mem, (uint64_t)offset,
+              (uint64_t)copy_size);
+
+   /* The queue-submit path performs the actual Host Vulkan cache-domain
+    * flush once per submit.  Doing it here for every 64-byte slice is
+    * correct but disproportionately expensive on Maleoon. */
+   return VK_SUCCESS;
+#else
+   (void)mem;
+   (void)offset;
+   (void)size;
+   return VK_SUCCESS;
+#endif
+}
+static void
+vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
+{
+#ifdef __OHOS__
+   mtx_lock(&ctx->object_mutex);
+   hash_table_foreach (ctx->object_table, entry) {
+      struct vkr_object *obj = entry->data;
+      if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY)
+         vkr_device_memory_sync_shadow((struct vkr_device_memory *)obj, to_host);
+   }
+   mtx_unlock(&ctx->object_mutex);
+#else
+   (void)ctx;
+   (void)to_host;
+#endif
+}
+
+void
+vkr_device_memory_sync_shadows_to_host(struct vkr_context *ctx)
+{
+   vkr_device_memory_sync_shadows(ctx, true);
+}
+
+void
+vkr_device_memory_sync_shadows_from_host(struct vkr_context *ctx)
+{
+   vkr_device_memory_sync_shadows(ctx, false);
 }

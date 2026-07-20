@@ -41,6 +41,11 @@
 
 #include "virgl_context.h"
 #include "virgl_fence.h"
+#include "virgl_util.h"
+
+#ifdef ENABLE_VENUS
+#include "venus/vkr_renderer.h"
+#endif
 
 #include <sys/uio.h>
 #include <sys/socket.h>
@@ -51,6 +56,14 @@
 #endif
 
 #include "vtest.h"
+
+#ifdef ENABLE_VENUS
+extern int virgl_renderer_winehua_vk_present(
+   uint32_t ctx_id, uint64_t queue_id, uint64_t image_id,
+   uint32_t width, uint32_t height, uint32_t format, uint32_t layout,
+   uint32_t client_pid, uint32_t surface_id, uint32_t serial,
+   uint32_t flags, uint64_t *next_present_deadline_ns);
+#endif
 #include "vtest_shm.h"
 #include "vtest_protocol.h"
 #include "threadpool.h"
@@ -200,8 +213,10 @@ struct vtest_renderer {
 
 static FILE *winehua_diag_file;
 static uint64_t winehua_submit_count;
+static uint64_t winehua_submit2_count;
 static uint64_t winehua_complete_count;
 static uint64_t winehua_present_count;
+static uint64_t winehua_vk_present_count;
 static vtest_winehua_present_callback winehua_present_callback;
 static void *winehua_present_callback_data;
 
@@ -231,7 +246,7 @@ static void winehua_virgl_log(enum virgl_log_level_flags level,
                               const char *message,
                               UNUSED void *user_data)
 {
-   if (level < VIRGL_LOG_LEVEL_WARNING || !message)
+   if (level < VIRGL_LOG_LEVEL_INFO || !message)
       return;
 
    winehua_diag("virgl level=%d %s", level, message);
@@ -716,11 +731,13 @@ int vtest_init_renderer(bool multi_clients,
    }
    virgl_set_log_callback(winehua_virgl_log, NULL, NULL);
    winehua_submit_count = 0;
+   winehua_submit2_count = 0;
    winehua_complete_count = 0;
    winehua_present_count = 0;
-   winehua_diag("renderer init sync=%s submitted=%u completed=%u multi_clients=%d",
+   winehua_vk_present_count = 0;
+   winehua_diag("renderer init sync=%s submitted=%u completed=%u multi_clients=%d ctx_flags=0x%x",
                 sync_mode, (uint32_t)renderer.implicit_fence_submitted,
-                (uint32_t)renderer.implicit_fence_completed, multi_clients);
+                (uint32_t)renderer.implicit_fence_completed, multi_clients, ctx_flags);
 
    renderer.rendernode_name = render_device;
    list_inithead(&renderer.active_contexts);
@@ -731,11 +748,16 @@ int vtest_init_renderer(bool multi_clients,
    ctx_flags |= VIRGL_RENDERER_USE_EXTERNAL_BLOB;
    if (strcmp(sync_mode, "egl-main"))
       ctx_flags |= VIRGL_RENDERER_THREAD_SYNC;
+   if (ctx_flags & VIRGL_RENDERER_VENUS)
+      virgl_override_log_level(VIRGL_LOG_LEVEL_INFO);
+   winehua_diag("renderer init effective ctx_flags=0x%x", ctx_flags);
    ret = virgl_renderer_init(&renderer, ctx_flags, &renderer_cbs);
    if (ret) {
+      winehua_diag("renderer init failed ret=%d", ret);
       fprintf(stderr, "failed to initialise renderer.\n");
       return -1;
    }
+   winehua_diag("renderer init complete ctx_flags=0x%x", ctx_flags);
 
    renderer.multi_clients = multi_clients;
    renderer.ctx_flags = ctx_flags;
@@ -1103,6 +1125,106 @@ int vtest_winehua_present(uint32_t length_dw)
       (uint32_t)(next_present_deadline_ns >> 32);
    reply[VCMD_WINEHUA_PRESENT_REPLY_SERIAL] =
       command[VCMD_WINEHUA_PRESENT_SERIAL];
+   ret = vtest_block_write(ctx->out_fd, reply_header, sizeof(reply_header));
+   if (ret < 0)
+      return ret;
+   ret = vtest_block_write(ctx->out_fd, reply, sizeof(reply));
+   return ret < 0 ? ret : 0;
+}
+
+int vtest_winehua_vk_present(uint32_t length_dw)
+{
+   struct vtest_context *ctx = vtest_get_current_context();
+   uint32_t command[VCMD_WINEHUA_VK_PRESENT_SIZE];
+   uint32_t reply_header[VTEST_HDR_SIZE] = {
+      [VTEST_CMD_LEN] = VCMD_WINEHUA_VK_PRESENT_REPLY_SIZE,
+      [VTEST_CMD_ID] = VCMD_WINEHUA_VK_PRESENT,
+   };
+   uint32_t reply[VCMD_WINEHUA_VK_PRESENT_REPLY_SIZE] = { 0 };
+   uint64_t next_present_deadline_ns = 0;
+   uint64_t queue_id = 0;
+   uint64_t image_id = 0;
+   int present_ret = -ENOSYS;
+   int ret;
+
+   if (length_dw != VCMD_WINEHUA_VK_PRESENT_SIZE)
+      return report_failure("invalid WineHua Vulkan present command length", -EINVAL);
+
+   ret = ctx->input->read(ctx->input, command, sizeof(command));
+   if (ret != sizeof(command))
+      return -1;
+
+   winehua_diag("vk present dispatch begin ctx=%u serial=%u", ctx->ctx_id,
+                command[VCMD_WINEHUA_VK_PRESENT_SERIAL]);
+
+   queue_id =
+      (uint64_t)command[VCMD_WINEHUA_VK_PRESENT_QUEUE_ID_LO] |
+      (uint64_t)command[VCMD_WINEHUA_VK_PRESENT_QUEUE_ID_HI] << 32;
+   image_id =
+      (uint64_t)command[VCMD_WINEHUA_VK_PRESENT_IMAGE_ID_LO] |
+      (uint64_t)command[VCMD_WINEHUA_VK_PRESENT_IMAGE_ID_HI] << 32;
+
+   if (command[VCMD_WINEHUA_VK_PRESENT_PROTOCOL_VERSION] !=
+       VCMD_WINEHUA_VK_PRESENT_VERSION) {
+      present_ret = -EPROTONOSUPPORT;
+   } else if (command[VCMD_WINEHUA_VK_PRESENT_FLAGS]) {
+      present_ret = -EINVAL;
+   }
+#ifdef ENABLE_VENUS
+   else {
+      winehua_diag("vk present renderer callback begin ctx=%u serial=%u", ctx->ctx_id,
+                   command[VCMD_WINEHUA_VK_PRESENT_SERIAL]);
+      present_ret = virgl_renderer_winehua_vk_present(
+         ctx->ctx_id,
+         queue_id,
+         image_id,
+         command[VCMD_WINEHUA_VK_PRESENT_WIDTH],
+         command[VCMD_WINEHUA_VK_PRESENT_HEIGHT],
+         command[VCMD_WINEHUA_VK_PRESENT_FORMAT],
+         command[VCMD_WINEHUA_VK_PRESENT_LAYOUT],
+         command[VCMD_WINEHUA_VK_PRESENT_CLIENT_PID],
+         command[VCMD_WINEHUA_VK_PRESENT_SURFACE_ID],
+         command[VCMD_WINEHUA_VK_PRESENT_SERIAL],
+         command[VCMD_WINEHUA_VK_PRESENT_FLAGS],
+         &next_present_deadline_ns);
+      winehua_diag("vk present renderer callback end ctx=%u serial=%u ret=%d", ctx->ctx_id,
+                   command[VCMD_WINEHUA_VK_PRESENT_SERIAL], present_ret);
+   }
+#endif
+
+   winehua_vk_present_count++;
+   if (winehua_vk_present_count == 1 || !(winehua_vk_present_count % 120) ||
+       present_ret < 0) {
+      winehua_diag(
+         "vk_present count=%llu ctx=%d serial=%u pid=%u surface=%u "
+         "queue_id=%llu image_id=%llu format=%u layout=%u size=%ux%u "
+         "flags=0x%x ret=%d next_deadline_ns=%llu",
+         (unsigned long long)winehua_vk_present_count,
+         ctx->ctx_id,
+         command[VCMD_WINEHUA_VK_PRESENT_SERIAL],
+         command[VCMD_WINEHUA_VK_PRESENT_CLIENT_PID],
+         command[VCMD_WINEHUA_VK_PRESENT_SURFACE_ID],
+         (unsigned long long)queue_id,
+         (unsigned long long)image_id,
+         command[VCMD_WINEHUA_VK_PRESENT_FORMAT],
+         command[VCMD_WINEHUA_VK_PRESENT_LAYOUT],
+         command[VCMD_WINEHUA_VK_PRESENT_WIDTH],
+         command[VCMD_WINEHUA_VK_PRESENT_HEIGHT],
+         command[VCMD_WINEHUA_VK_PRESENT_FLAGS],
+         present_ret,
+         (unsigned long long)next_present_deadline_ns);
+   }
+
+   reply[VCMD_WINEHUA_VK_PRESENT_REPLY_STATUS] = (uint32_t)(int32_t)present_ret;
+   reply[VCMD_WINEHUA_VK_PRESENT_REPLY_DEADLINE_LO] =
+      (uint32_t)next_present_deadline_ns;
+   reply[VCMD_WINEHUA_VK_PRESENT_REPLY_DEADLINE_HI] =
+      (uint32_t)(next_present_deadline_ns >> 32);
+   reply[VCMD_WINEHUA_VK_PRESENT_REPLY_SERIAL] =
+      command[VCMD_WINEHUA_VK_PRESENT_SERIAL];
+
+   winehua_diag("vk present dispatch reply ctx=%u serial=%u ret=%d", ctx->ctx_id,
+                command[VCMD_WINEHUA_VK_PRESENT_SERIAL], present_ret);
    ret = vtest_block_write(ctx->out_fd, reply_header, sizeof(reply_header));
    if (ret < 0)
       return ret;
@@ -1603,8 +1725,11 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
 
    ret = ctx->input->read(ctx->input, res_create_blob_buf,
                           sizeof(res_create_blob_buf));
-   if (ret != sizeof(res_create_blob_buf))
+   if (ret != sizeof(res_create_blob_buf)) {
+      winehua_diag("blob read failed ctx=%u expected=%zu ret=%d",
+                   ctx->ctx_id, sizeof(res_create_blob_buf), ret);
       return -1;
+   }
 
    memset(&args, 0, sizeof(args));
    args.blob_mem = res_create_blob_buf[VCMD_RES_CREATE_BLOB_TYPE];
@@ -1620,12 +1745,18 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
 
    args.res_handle = res->res_id;
    args.ctx_id = ctx->ctx_id;
+   winehua_diag("blob create begin ctx=%u res=%u mem=%u flags=0x%x size=%llu blob=%llu",
+                args.ctx_id, args.res_handle, args.blob_mem, args.blob_flags,
+                (unsigned long long)args.size, (unsigned long long)args.blob_id);
 
    switch (args.blob_mem) {
    case VIRGL_RENDERER_BLOB_MEM_GUEST:
    case VIRGL_RENDERER_BLOB_MEM_HOST3D_GUEST:
       fd = vtest_create_resource_setup_shm(res, args.size);
       if (fd < 0) {
+         winehua_diag("blob guest shm failed ctx=%u res=%u size=%llu ret=%d errno=%d",
+                      args.ctx_id, args.res_handle,
+                      (unsigned long long)args.size, fd, errno);
          vtest_unref_resource(res);
          return -ENOMEM;
       }
@@ -1643,6 +1774,10 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
 
    ret = virgl_renderer_resource_create_blob(&args);
    if (ret) {
+      winehua_diag("blob renderer create failed ctx=%u res=%u mem=%u size=%llu blob=%llu ret=%d",
+                   args.ctx_id, args.res_handle, args.blob_mem,
+                   (unsigned long long)args.size,
+                   (unsigned long long)args.blob_id, ret);
       if (fd >= 0)
          close(fd);
       vtest_unref_resource(res);
@@ -1654,9 +1789,13 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
       uint32_t fd_type;
       ret = virgl_renderer_resource_export_blob(res->res_id, &fd_type, &fd);
       if (ret) {
+         winehua_diag("blob export failed ctx=%u res=%u ret=%d",
+                      args.ctx_id, args.res_handle, ret);
          vtest_unref_resource(res);
          return report_failed_call("virgl_renderer_resource_export_blob", ret);
       }
+      winehua_diag("blob export ctx=%u res=%u fd_type=%u fd=%d",
+                   args.ctx_id, args.res_handle, fd_type, fd);
       if (fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF &&
           fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_SHM) {
          close(fd);
@@ -1679,6 +1818,8 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
 
    ret = vtest_send_fd(ctx->out_fd, fd);
    if (ret < 0) {
+      winehua_diag("blob send fd failed ctx=%u res=%u fd=%d ret=%d errno=%d",
+                   args.ctx_id, args.res_handle, fd, ret, errno);
       close(fd);
       vtest_unref_resource(res);
       return report_failed_call("vtest_send_fd", ret);
@@ -1686,6 +1827,7 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
 
    /* Closing the file descriptor does not unmap the region. */
    close(fd);
+   winehua_diag("blob create complete ctx=%u res=%u", args.ctx_id, args.res_handle);
 
    util_hash_table_set(ctx->resource_table, intptr_to_pointer(res->res_id), res);
 
@@ -2575,6 +2717,12 @@ static int vtest_submit_cmd2_batch(struct vtest_context *ctx,
    }
 
    ret = virgl_renderer_submit_cmd((void *)cmds, ctx->ctx_id, batch->cmd_size);
+   const uint64_t submit2_count = ++winehua_submit2_count;
+   if (submit2_count <= 8 || !(submit2_count % 256) || ret)
+      winehua_diag("submit2 ctx=%d count=%llu cmd_dw=%u syncs=%u ring=%u flags=0x%x ret=%d",
+                   ctx->ctx_id, (unsigned long long)submit2_count,
+                   batch->cmd_size, batch->sync_count, batch->ring_idx,
+                   batch->flags, ret);
    if (ret)
       goto out;
 

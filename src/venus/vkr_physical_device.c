@@ -441,6 +441,7 @@ vkr_dispatch_vkEnumeratePhysicalDevices(struct vn_dispatch_context *dispatch,
       }
 
       physical_dev->base.handle.physical_device = instance->physical_device_handles[i];
+      physical_dev->instance = instance;
 
       vkr_physical_device_init_proc_table(physical_dev, instance);
       vkr_physical_device_init_properties(physical_dev);

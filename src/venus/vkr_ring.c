@@ -309,12 +309,27 @@ vkr_ring_thread(void *arg)
          }
 
          const uint32_t ring_head = ring->buffer.cur;
+#ifdef __OHOS__
+         const uint64_t submit_count = ++ring->diagnostic_submit_count;
+         if (submit_count <= 8 || !(submit_count % 256))
+            vkr_log("OHOS ring dispatch id=%" PRIu64 " count=%" PRIu64
+                    " head=%u tail=%u bytes=%u",
+                    ring->id, submit_count, ring_head,
+                    vkr_ring_load_tail(ring), cmd_size);
+#endif
          vkr_ring_read_buffer(ring, ring->cmd, cmd_size);
 
          if (!vkr_ring_submit_cmd(ring, ring->cmd, cmd_size, ring_head)) {
             ret = -EINVAL;
             break;
          }
+#ifdef __OHOS__
+         if (submit_count <= 8 || !(submit_count % 256))
+            vkr_log("OHOS ring complete id=%" PRIu64 " count=%" PRIu64
+                    " head=%u tail=%u",
+                    ring->id, submit_count, vkr_ring_load_head(ring),
+                    vkr_ring_load_tail(ring));
+#endif
 
          last_submit = vkr_ring_now();
          relax_iter = 0;

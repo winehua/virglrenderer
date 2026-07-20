@@ -7,11 +7,105 @@
 
 #include "vkr_pipeline_gen.h"
 
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+/* Maleoon's Vulkan compiler mis-handles DXVK's binding-presence
+ * OpSpecConstantTrue values when they flow through generated vector selects.
+ * Keep this diagnostic workaround opt-in: bake boolean spec constants into
+ * ordinary OpConstantTrue/False instructions before the host driver sees the
+ * module. Non-boolean specialization constants and their decorations remain
+ * untouched. */
+static bool
+vkr_freeze_bool_spec_constants(const VkShaderModuleCreateInfo *src,
+                               VkShaderModuleCreateInfo *dst,
+                               uint32_t **owned_code)
+{
+   const uint32_t *code = src ? src->pCode : NULL;
+   uint32_t word_count, bound, offset, new_count;
+   uint8_t *bool_ids = NULL;
+   uint32_t *copy = NULL;
+
+   if (!src || !code || src->codeSize < 20 || (src->codeSize & 3) ||
+       code[0] != 0x07230203u)
+      return false;
+   word_count = (uint32_t)(src->codeSize / sizeof(uint32_t));
+   bound = code[3];
+   if (!bound || bound > 65536u) return false;
+   bool_ids = calloc(bound, sizeof(*bool_ids));
+   if (!bool_ids) return false;
+   offset = 5;
+   while (offset < word_count) {
+      uint32_t inst = code[offset];
+      uint16_t words = (uint16_t)(inst >> 16);
+      uint16_t opcode = (uint16_t)(inst & 0xffffu);
+      if (!words || offset + words > word_count) goto fail;
+      if ((opcode == 48 || opcode == 49) && words >= 3 && code[offset + 1] < bound)
+         bool_ids[code[offset + 2]] = 1;
+      offset += words;
+   }
+   new_count = 5;
+   offset = 5;
+   while (offset < word_count) {
+      uint32_t inst = code[offset];
+      uint16_t words = (uint16_t)(inst >> 16);
+      uint16_t opcode = (uint16_t)(inst & 0xffffu);
+      if (opcode == 71 && words >= 4 && code[offset + 2] == 1 &&
+          code[offset + 1] < bound && bool_ids[code[offset + 1]]) {
+         offset += words;
+         continue;
+      }
+      new_count += words;
+      offset += words;
+   }
+   if (new_count == word_count) {
+      free(bool_ids);
+      return false;
+   }
+   copy = malloc((size_t)new_count * sizeof(*copy));
+   if (!copy) goto fail;
+   memcpy(copy, code, 5 * sizeof(*copy));
+   new_count = 5;
+   offset = 5;
+   while (offset < word_count) {
+      uint32_t inst = code[offset];
+      uint16_t words = (uint16_t)(inst >> 16);
+      uint16_t opcode = (uint16_t)(inst & 0xffffu);
+      if (opcode == 71 && words >= 4 && code[offset + 2] == 1 &&
+          code[offset + 1] < bound && bool_ids[code[offset + 1]]) {
+         offset += words;
+         continue;
+      }
+      memcpy(copy + new_count, code + offset, (size_t)words * sizeof(*copy));
+      if (opcode == 48)
+         copy[new_count] = (uint32_t)((uint32_t)words << 16) | 41u;
+      else if (opcode == 49)
+         copy[new_count] = (uint32_t)((uint32_t)words << 16) | 42u;
+      new_count += words;
+      offset += words;
+   }
+   *dst = *src;
+   dst->codeSize = (size_t)new_count * sizeof(*copy);
+   dst->pCode = copy;
+   *owned_code = copy;
+   free(bool_ids);
+   return true;
+fail:
+   free(copy);
+   free(bool_ids);
+   return false;
+}
+
 static void
 vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkCreateShaderModule *args)
 {
    struct vkr_context *ctx = dispatch->data;
+   const VkShaderModuleCreateInfo *original = args->pCreateInfo;
+   VkShaderModuleCreateInfo frozen_info;
+   uint32_t *frozen_code = NULL;
+   bool frozen = false;
 
    /* Reject invalid codeSize.
     *
@@ -41,7 +135,18 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
       return;
    }
 
+   if (os_get_option("WINEHUA_VKR_FREEZE_BOOL_SPEC")) {
+      frozen = vkr_freeze_bool_spec_constants(original, &frozen_info, &frozen_code);
+      if (frozen) {
+         args->pCreateInfo = &frozen_info;
+         vkr_log("WineHuaSampled: froze boolean specialization constants codeSize=%zu->%zu",
+                 original->codeSize, frozen_info.codeSize);
+      }
+   }
+
    vkr_shader_module_create_and_add(dispatch->data, args);
+   args->pCreateInfo = original;
+   free(frozen_code);
 }
 
 static void
@@ -128,6 +233,26 @@ vkr_dispatch_vkCreateComputePipelines(struct vn_dispatch_context *dispatch,
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct object_array arr;
+
+   if (os_get_option("WINEHUA_VKR_TRACE_SAMPLED")) {
+      for (uint32_t i = 0; i < args->createInfoCount; i++) {
+         const VkSpecializationInfo *spec = args->pCreateInfos[i].stage.pSpecializationInfo;
+         if (!spec) {
+            vkr_log("WineHuaSampled: compute-pipeline[%u] specialization=null", i);
+            continue;
+         }
+         vkr_log("WineHuaSampled: compute-pipeline[%u] specialization mapCount=%u dataSize=%zu",
+                 i, spec->mapEntryCount, spec->dataSize);
+         for (uint32_t j = 0; j < spec->mapEntryCount; j++) {
+            const VkSpecializationMapEntry *entry = &spec->pMapEntries[j];
+            uint32_t value = 0;
+            if (entry->offset + sizeof(value) <= spec->dataSize)
+               memcpy(&value, (const uint8_t *)spec->pData + entry->offset, sizeof(value));
+            vkr_log("WineHuaSampled: compute-pipeline[%u] specialization[%u] id=%u offset=%zu size=%zu value=0x%x",
+                    i, j, entry->constantID, entry->offset, entry->size, value);
+         }
+      }
+   }
 
    if (vkr_compute_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
       return;

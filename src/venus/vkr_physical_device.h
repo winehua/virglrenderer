@@ -13,6 +13,8 @@
 struct vkr_physical_device {
    struct vkr_object base;
 
+   struct vkr_instance *instance;
+
    struct vn_physical_device_proc_table proc_table;
 
    VkPhysicalDeviceProperties properties;

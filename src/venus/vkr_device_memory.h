@@ -34,6 +34,23 @@ struct vkr_device_memory {
    uint32_t memory_type_index;
 
    bool exported;
+
+#ifdef __OHOS__
+   /* Compatibility path for Host-visible Maleoon memory when Linux external
+    * memory fd export is unavailable. */
+   int shadow_fd;
+   void *shadow_map;
+   void *host_map;
+   uint64_t shadow_size;
+   uint32_t shadow_sync_count;
+   uint32_t shadow_remote_flush_count;
+   uint32_t shadow_guest_write_depth;
+   uint32_t shadow_remote_invalidate_count;
+   bool shadow_remote_active;
+   bool shadow_host_dirty;
+   VkDeviceSize shadow_dirty_offset;
+   VkDeviceSize shadow_dirty_size;
+#endif
 };
 VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)
 
@@ -48,5 +65,11 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
                               uint64_t blob_size,
                               uint32_t blob_flags,
                               struct virgl_context_blob *out_blob);
+
+void
+vkr_device_memory_sync_shadows_to_host(struct vkr_context *ctx);
+
+void
+vkr_device_memory_sync_shadows_from_host(struct vkr_context *ctx);
 
 #endif /* VKR_DEVICE_MEMORY_H */

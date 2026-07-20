@@ -177,6 +177,13 @@ vkr_dispatch_vkCreateInstance(struct vn_dispatch_context *dispatch,
       create_info->pNext = &messenger_create_info;
    }
 
+#ifdef __OHOS__
+   /* WineHua's private presenter owns the host OHNativeWindow surface.  The
+    * extensions remain internal and are not advertised to the guest. */
+   ext_names[ext_count++] = "VK_KHR_surface";
+   ext_names[ext_count++] = "VK_OHOS_surface";
+#endif
+
 #ifdef __APPLE__
    if (vkr_library_has_portability_enumeration(
           vk->EnumerateInstanceExtensionProperties)) {

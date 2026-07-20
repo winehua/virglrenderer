@@ -6,6 +6,103 @@
 #include "vkr_descriptor_set.h"
 
 #include "vkr_descriptor_set_gen.h"
+#include "vkr_image.h"
+
+static bool
+vkr_winehua_sample_trace_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *value = os_get_option("WINEHUA_VKR_TRACE_SAMPLED");
+      enabled = value && value[0] == '1';
+   }
+   return enabled != 0;
+}
+
+static bool
+vkr_winehua_image_descriptor(VkDescriptorType type)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static void
+vkr_winehua_log_guest_descriptor_objects(uint32_t write_count,
+                                         const VkWriteDescriptorSet *writes)
+{
+   if (!vkr_winehua_sample_trace_enabled())
+      return;
+
+   for (uint32_t i = 0; i < write_count; i++) {
+      const VkWriteDescriptorSet *write = &writes[i];
+      struct vkr_descriptor_set *set;
+      if (!vkr_winehua_image_descriptor(write->descriptorType) ||
+          !write->pImageInfo)
+         continue;
+
+      set = vkr_descriptor_set_from_handle(write->dstSet);
+      for (uint32_t j = 0; j < write->descriptorCount; j++) {
+         const VkDescriptorImageInfo *info = &write->pImageInfo[j];
+         struct vkr_image_view *view = info->imageView
+            ? vkr_image_view_from_handle(info->imageView) : NULL;
+         struct vkr_sampler *sampler = info->sampler
+            ? vkr_sampler_from_handle(info->sampler) : NULL;
+         struct vkr_image *image = view ? view->image : NULL;
+
+         vkr_log("WineHuaSampled: host-descriptor phase=guest-object "
+                 "setId=%" PRIu64 " hostSet=0x%" PRIxPTR " binding=%u "
+                 "arrayElement=%u type=%u viewId=%" PRIu64 " "
+                 "hostView=0x%" PRIxPTR " imageId=%" PRIu64 " "
+                 "hostImage=0x%" PRIxPTR " samplerId=%" PRIu64 " "
+                 "hostSampler=0x%" PRIxPTR " layout=%u",
+                 set ? set->base.id : 0,
+                 set ? (uintptr_t)set->base.handle.descriptor_set : 0,
+                 write->dstBinding, write->dstArrayElement + j,
+                 write->descriptorType, view ? view->base.id : 0,
+                 view ? (uintptr_t)view->base.handle.image_view : 0,
+                 image ? image->base.id : 0,
+                 image ? (uintptr_t)image->base.handle.image : 0,
+                 sampler ? sampler->base.id : 0,
+                 sampler ? (uintptr_t)sampler->base.handle.sampler : 0,
+                 info->imageLayout);
+      }
+   }
+}
+
+static void
+vkr_winehua_log_host_descriptor_handles(uint32_t write_count,
+                                        const VkWriteDescriptorSet *writes)
+{
+   if (!vkr_winehua_sample_trace_enabled())
+      return;
+
+   for (uint32_t i = 0; i < write_count; i++) {
+      const VkWriteDescriptorSet *write = &writes[i];
+      if (!vkr_winehua_image_descriptor(write->descriptorType) ||
+          !write->pImageInfo)
+         continue;
+
+      for (uint32_t j = 0; j < write->descriptorCount; j++) {
+         const VkDescriptorImageInfo *info = &write->pImageInfo[j];
+         vkr_log("WineHuaSampled: host-descriptor phase=driver-call "
+                 "hostSet=0x%" PRIxPTR " binding=%u arrayElement=%u "
+                 "type=%u hostView=0x%" PRIxPTR " "
+                 "hostSampler=0x%" PRIxPTR " layout=%u",
+                 (uintptr_t)write->dstSet, write->dstBinding,
+                 write->dstArrayElement + j, write->descriptorType,
+                 (uintptr_t)info->imageView, (uintptr_t)info->sampler,
+                 info->imageLayout);
+      }
+   }
+}
 
 static void
 vkr_dispatch_vkGetDescriptorSetLayoutSupport(
@@ -139,7 +236,11 @@ vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+   vkr_winehua_log_guest_descriptor_objects(args->descriptorWriteCount,
+                                             args->pDescriptorWrites);
    vn_replace_vkUpdateDescriptorSets_args_handle(args);
+   vkr_winehua_log_host_descriptor_handles(args->descriptorWriteCount,
+                                            args->pDescriptorWrites);
    vk->UpdateDescriptorSets(args->device, args->descriptorWriteCount,
                             args->pDescriptorWrites, args->descriptorCopyCount,
                             args->pDescriptorCopies);

@@ -332,6 +332,20 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
       return false;
 
+   if (blob.type == VIRGL_RESOURCE_FD_SHM) {
+      int map_fd = os_dupfd_cloexec(blob.u.fd);
+      if (map_fd < 0 ||
+          !vkr_context_import_resource_from_shm(ctx, res_id, blob_size, map_fd)) {
+         if (map_fd >= 0)
+            close(map_fd);
+         close(blob.u.fd);
+         return false;
+      }
+      close(map_fd);
+      *out_blob = blob;
+      return true;
+   }
+
    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
     * - vkAllocateMemory for dma_buf import
     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query

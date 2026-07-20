@@ -218,6 +218,13 @@ vkr_dispatch_vkCreateRingMESA(struct vn_dispatch_context *dispatch,
 
    ring->id = args->ring;
 
+#ifdef __OHOS__
+   vkr_log("OHOS ring create id=%" PRIu64 " res=%u size=%u head=%u tail=%u",
+           ring->id, info->resourceId, info->bufferSize,
+           vkr_ring_load_head(ring),
+           atomic_load_explicit(ring->control.tail, memory_order_acquire));
+#endif
+
    mtx_lock(&ctx->ring_mutex);
    list_addtail(&ring->head, &ctx->rings);
    mtx_unlock(&ctx->ring_mutex);

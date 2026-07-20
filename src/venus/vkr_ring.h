@@ -102,6 +102,9 @@ struct vkr_ring {
    atomic_bool pending_notify;
    atomic_bool monitor;
    uint64_t virtqueue_seqno;
+#ifdef __OHOS__
+   uint64_t diagnostic_submit_count;
+#endif
 };
 
 struct vkr_ring *

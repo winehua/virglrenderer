@@ -137,6 +137,10 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    ext_count += physical_dev->KHR_external_memory_fd;
    ext_count += physical_dev->EXT_external_memory_dma_buf;
    ext_count += physical_dev->KHR_external_fence_fd;
+#ifdef __OHOS__
+   /* Internal WineHua SurfaceQueue presenter; never exposed as guest WSI. */
+   ext_count += 1;
+#endif
    if (ext_count > args->pCreateInfo->enabledExtensionCount) {
       exts = malloc(sizeof(*exts) * ext_count);
       if (!exts) {
@@ -160,6 +164,9 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
          exts[ext_count++] = "VK_EXT_external_memory_dma_buf";
       if (physical_dev->KHR_external_fence_fd)
          exts[ext_count++] = "VK_KHR_external_fence_fd";
+#ifdef __OHOS__
+      exts[ext_count++] = "VK_KHR_swapchain";
+#endif
 
       ((VkDeviceCreateInfo *)args->pCreateInfo)->ppEnabledExtensionNames = exts;
       ((VkDeviceCreateInfo *)args->pCreateInfo)->enabledExtensionCount = ext_count;

@@ -5,6 +5,7 @@
 
 #include "vkr_image.h"
 
+#include "vkr_device.h"
 #include "vkr_image_gen.h"
 #include "vkr_physical_device.h"
 
@@ -31,7 +32,31 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     * situation because the app does not consider the memory external.
     */
 
-   vkr_image_create_and_add(dispatch->data, args);
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   const VkImageCreateInfo create_info = *args->pCreateInfo;
+   struct vkr_image *image = vkr_image_create_and_add(dispatch->data, args);
+   if (!image)
+      return;
+
+   image->device = dev;
+   image->format = create_info.format;
+   image->extent = create_info.extent;
+   image->usage = create_info.usage;
+   image->image_type = create_info.imageType;
+   image->mip_levels = create_info.mipLevels;
+   image->array_layers = create_info.arrayLayers;
+   image->samples = create_info.samples;
+   image->tiling = create_info.tiling;
+   if (os_get_option("WINEHUA_VKR_TRACE_SAMPLED")) {
+      vkr_log("WineHuaSampled: host-image guestImage=%" PRIu64
+              " hostImage=0x%" PRIxPTR " format=%u extent=%ux%ux%u"
+              " mips=%u layers=%u usage=0x%x tiling=%u",
+              image->base.id, (uintptr_t)image->base.handle.image,
+              create_info.format, create_info.extent.width,
+              create_info.extent.height, create_info.extent.depth,
+              create_info.mipLevels, create_info.arrayLayers,
+              create_info.usage, create_info.tiling);
+   }
 }
 
 static void
@@ -171,7 +196,26 @@ static void
 vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCreateImageView *args)
 {
-   vkr_image_view_create_and_add(dispatch->data, args);
+   struct vkr_image *image =
+      vkr_image_from_handle(args->pCreateInfo->image);
+   struct vkr_image_view *view =
+      vkr_image_view_create_and_add(dispatch->data, args);
+
+   if (!view)
+      return;
+
+   view->image = image;
+   {
+      const char *trace = os_get_option("WINEHUA_VKR_TRACE_SAMPLED");
+      if (trace && trace[0] == '1') {
+         vkr_log("WineHuaSampled: host-image-view guestView=%" PRIu64 " "
+                 "guestImage=%" PRIu64 " hostView=0x%" PRIxPTR " "
+                 "hostImage=0x%" PRIxPTR,
+                 view->base.id, image ? image->base.id : 0,
+                 (uintptr_t)view->base.handle.image_view,
+                 image ? (uintptr_t)image->base.handle.image : 0);
+      }
+   }
 }
 
 static void

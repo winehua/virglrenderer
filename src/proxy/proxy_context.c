@@ -311,9 +311,22 @@ validate_resource_fd_shm(int fd, uint64_t expected_size)
    }
 #endif
 
+#if defined(__OHOS__) && defined(ENABLE_SAME_PROCESS_RENDER_SERVER) && \
+   defined(ENABLE_RENDER_SERVER_WORKER_THREAD)
+   /* The HarmonyOS sandbox rejects fstat on this sealed anonymous file even
+    * though fcntl and mmap are permitted.  In the all-thread renderer mode
+    * the fd was created by our trusted in-process Venus worker, and its size
+    * came from this request, so the Linux cross-process size check is not
+    * applicable.  The consumer mmap remains the authoritative usability
+    * check. */
+   (void)fd;
+   (void)expected_size;
+   return true;
+#endif
+
    struct stat st;
    if (fstat(fd, &st) < 0) {
-      proxy_log("failed to fstat shm fd");
+      proxy_log("failed to fstat shm fd %d: %s", fd, strerror(errno));
       return false;
    }
    if ((uint64_t)st.st_size < expected_size) {
