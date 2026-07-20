@@ -48,8 +48,11 @@ struct vkr_device_memory {
    uint32_t shadow_remote_invalidate_count;
    bool shadow_remote_active;
    bool shadow_host_dirty;
+   bool shadow_initial_sync_done;
    VkDeviceSize shadow_dirty_offset;
    VkDeviceSize shadow_dirty_size;
+   uint64_t shadow_pending_copy_bytes;
+   uint32_t shadow_pending_copy_count;
 #endif
 };
 VKR_DEFINE_OBJECT_CAST(device_memory, VK_OBJECT_TYPE_DEVICE_MEMORY, VkDeviceMemory)

@@ -13,8 +13,23 @@
 #include "vkr_queue_gen.h"
 
 #ifdef __OHOS__
+#include <time.h>
+
 static atomic_uint_fast64_t vkr_ohos_queue_submit_count;
 static atomic_uint_fast64_t vkr_ohos_fence_status_count;
+static atomic_uint_fast64_t vkr_ohos_fence_status_total_us;
+static atomic_uint_fast64_t vkr_ohos_fence_status_success_count;
+static atomic_uint_fast64_t vkr_ohos_fence_status_not_ready_count;
+static atomic_uint_fast64_t vkr_ohos_fence_wait_count;
+
+static uint64_t
+vkr_ohos_queue_now_ns(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_MONOTONIC, &ts))
+      return 0;
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 
 /* Maleoon can transiently return VK_ERROR_OUT_OF_HOST_MEMORY from a fence
  * status query even though the preceding queue submit succeeded and a repeat
@@ -26,10 +41,13 @@ static VkResult
 vkr_ohos_get_fence_status(struct vn_device_proc_table *vk,
                           VkDevice device,
                           VkFence fence,
-                          uint32_t *retry_count)
+                          uint32_t *retry_count,
+                          bool *used_wait_fallback)
 {
    VkResult result = VK_ERROR_OUT_OF_HOST_MEMORY;
    uint32_t retry;
+
+   *used_wait_fallback = false;
 
    for (retry = 0; retry < 4; retry++) {
       result = vk->GetFenceStatus(device, fence);
@@ -39,6 +57,20 @@ vkr_ohos_get_fence_status(struct vn_device_proc_table *vk,
    }
 
    *retry_count = retry;
+
+   /* A tight retry loop is insufficient once Maleoon's GetFenceStatus path
+    * enters its persistent transient-OOM state.  Query the same fence once
+    * through the non-blocking Vulkan wait path.  timeout=0 cannot stall the
+    * renderer worker and is semantically equivalent to GetFenceStatus:
+    * VK_TIMEOUT maps to VK_NOT_READY, while real device/allocation errors
+    * remain visible to Venus. */
+   if (result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+      const VkResult wait_result =
+         vk->WaitForFences(device, 1, &fence, VK_TRUE, 0);
+      *used_wait_fallback = true;
+      result = wait_result == VK_TIMEOUT ? VK_NOT_READY : wait_result;
+   }
+
    return result;
 }
 #endif
@@ -409,12 +441,15 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
 #ifdef __OHOS__
    const uint64_t submit_id =
       atomic_fetch_add_explicit(&vkr_ohos_queue_submit_count, 1, memory_order_relaxed) + 1;
-   vkr_log("OHOS queue submit begin id=%" PRIu64 " submits=%u", submit_id,
-           args->submitCount);
+   const bool log_submit = submit_id <= 8 || !(submit_id % 120);
+   if (log_submit)
+      vkr_log("OHOS queue submit begin id=%" PRIu64 " submits=%u", submit_id,
+              args->submitCount);
 #endif
    vkr_device_memory_sync_shadows_to_host(dispatch->data);
 #ifdef __OHOS__
-   vkr_log("OHOS queue submit shadows synced id=%" PRIu64, submit_id);
+   if (log_submit)
+      vkr_log("OHOS queue submit shadows synced id=%" PRIu64, submit_id);
 #endif
 
    mtx_lock(&queue->vk_mutex);
@@ -422,7 +457,9 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       vk->QueueSubmit(args->queue, args->submitCount, args->pSubmits, args->fence);
    mtx_unlock(&queue->vk_mutex);
 #ifdef __OHOS__
-   vkr_log("OHOS queue submit end id=%" PRIu64 " result=%d", submit_id, args->ret);
+   if (log_submit || args->ret != VK_SUCCESS)
+      vkr_log("OHOS queue submit end id=%" PRIu64 " result=%d", submit_id,
+              args->ret);
 #endif
 }
 
@@ -504,19 +541,44 @@ vkr_dispatch_vkGetFenceStatus(struct vn_dispatch_context *dispatch,
    vn_replace_vkGetFenceStatus_args_handle(args);
 #ifdef __OHOS__
    uint32_t retry_count = 0;
+   bool used_wait_fallback = false;
+   const uint64_t start_ns = vkr_ohos_queue_now_ns();
    args->ret = vkr_ohos_get_fence_status(vk, args->device, args->fence,
-                                         &retry_count);
+                                         &retry_count, &used_wait_fallback);
+   const uint64_t end_ns = vkr_ohos_queue_now_ns();
 #else
    args->ret = vk->GetFenceStatus(args->device, args->fence);
 #endif
 #ifdef __OHOS__
    const uint64_t status_id =
       atomic_fetch_add_explicit(&vkr_ohos_fence_status_count, 1, memory_order_relaxed) + 1;
+   const uint64_t elapsed_us = start_ns && end_ns >= start_ns
+      ? (end_ns - start_ns) / 1000 : 0;
+   const uint64_t total_us =
+      atomic_fetch_add_explicit(&vkr_ohos_fence_status_total_us, elapsed_us,
+                                memory_order_relaxed) + elapsed_us;
+   if (args->ret == VK_SUCCESS)
+      atomic_fetch_add_explicit(&vkr_ohos_fence_status_success_count, 1,
+                                memory_order_relaxed);
+   else if (args->ret == VK_NOT_READY)
+      atomic_fetch_add_explicit(&vkr_ohos_fence_status_not_ready_count, 1,
+                                memory_order_relaxed);
    if (retry_count)
       vkr_log("OHOS fence status transient OOM count=%" PRIu64
-              " retries=%u final=%d", status_id, retry_count, args->ret);
-   if (status_id <= 8 || !(status_id % 256) || args->ret != VK_NOT_READY)
-      vkr_log("OHOS fence status count=%" PRIu64 " result=%d", status_id, args->ret);
+              " retries=%u wait0=%u final=%d", status_id, retry_count,
+              used_wait_fallback, args->ret);
+   if (status_id <= 8 || !(status_id % 256) || args->ret < 0) {
+      const uint64_t success_count = atomic_load_explicit(
+         &vkr_ohos_fence_status_success_count, memory_order_relaxed);
+      const uint64_t not_ready_count = atomic_load_explicit(
+         &vkr_ohos_fence_status_not_ready_count, memory_order_relaxed);
+      vkr_log("OHOS fence status count=%" PRIu64
+              " success=%" PRIu64 " not_ready=%" PRIu64
+              " result=%d elapsed_us=%" PRIu64
+              " average_us=%" PRIu64,
+              status_id, success_count, not_ready_count, args->ret,
+              elapsed_us, status_id ? total_us / status_id : 0);
+   }
 #endif
    if (args->ret == VK_SUCCESS)
       vkr_device_memory_sync_shadows_from_host(dispatch->data);
@@ -530,8 +592,25 @@ vkr_dispatch_vkWaitForFences(struct vn_dispatch_context *dispatch,
    struct vn_device_proc_table *vk = &dev->proc_table;
 
    vn_replace_vkWaitForFences_args_handle(args);
+#ifdef __OHOS__
+   const uint64_t start_ns = vkr_ohos_queue_now_ns();
+#endif
    args->ret = vk->WaitForFences(args->device, args->fenceCount, args->pFences,
                                  args->waitAll, args->timeout);
+#ifdef __OHOS__
+   const uint64_t end_ns = vkr_ohos_queue_now_ns();
+   const uint64_t wait_id =
+      atomic_fetch_add_explicit(&vkr_ohos_fence_wait_count, 1,
+                                memory_order_relaxed) + 1;
+   const uint64_t elapsed_us = start_ns && end_ns >= start_ns
+      ? (end_ns - start_ns) / 1000 : 0;
+   if (wait_id <= 8 || !(wait_id % 120) || args->ret != VK_SUCCESS)
+      vkr_log("OHOS fence wait count=%" PRIu64
+              " fences=%u wait_all=%u timeout_ns=%" PRIu64
+              " result=%d elapsed_us=%" PRIu64,
+              wait_id, args->fenceCount, args->waitAll, args->timeout,
+              args->ret, elapsed_us);
+#endif
    if (args->ret == VK_SUCCESS)
       vkr_device_memory_sync_shadows_from_host(dispatch->data);
 }

@@ -10,6 +10,7 @@
 
 #ifdef __OHOS__
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #include "util/anon_file.h"
 #endif
@@ -24,6 +25,30 @@ static VkResult
 vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
                                      VkDeviceSize offset,
                                      VkDeviceSize size);
+static VkResult
+vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
+                                          VkDeviceSize offset,
+                                          VkDeviceSize size);
+
+struct vkr_shadow_sync_stats {
+   uint64_t bytes;
+   uint32_t copies;
+   uint32_t cache_ops;
+};
+
+#ifdef __OHOS__
+static atomic_uint_fast64_t vkr_ohos_shadow_to_host_sync_count;
+static atomic_uint_fast64_t vkr_ohos_shadow_from_host_sync_count;
+
+static uint64_t
+vkr_ohos_now_ns(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_MONOTONIC, &ts))
+      return 0;
+   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
 
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
@@ -354,7 +379,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
                 * involves an invalid chunk towards the end of the page boundary. As a
                 * result, any guest side accelerated instructions that rely on the
                 * paddings can end up with Illegal instruction error. The most common
-                * trigger is via memcpy'ing valid range to the guest side mapped buffer
+                * trigger is via memcpy'ing valid range to the guest side mapped buffe
                 * memory, and then, e.g. __memcpy_avx_unaligned_erms  can hit the error.
                 */
                alloc_info->allocationSize =
@@ -445,8 +470,11 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->shadow_remote_invalidate_count = 0;
    mem->shadow_remote_active = false;
    mem->shadow_host_dirty = false;
+   mem->shadow_initial_sync_done = false;
    mem->shadow_dirty_offset = 0;
    mem->shadow_dirty_size = 0;
+   mem->shadow_pending_copy_bytes = 0;
+   mem->shadow_pending_copy_count = 0;
 #endif
 }
 
@@ -520,6 +548,10 @@ vkr_dispatch_vkInvalidateMappedMemoryRanges(
 {
    struct vkr_context *ctx = dispatch->data;
    args->ret = VK_SUCCESS;
+#ifdef __OHOS__
+   const char *mode = os_get_option("VKR_WINEHUA_SHADOW_FROM_HOST");
+   const bool precise = mode && !strcmp(mode, "precise");
+#endif
 
    mtx_lock(&ctx->object_mutex);
    for (uint32_t i = 0; i < args->memoryRangeCount; i++) {
@@ -530,12 +562,23 @@ vkr_dispatch_vkInvalidateMappedMemoryRanges(
          break;
       }
 #ifdef __OHOS__
-      mem->shadow_guest_write_depth++;
-      mem->shadow_remote_active = true;
-      const uint32_t count = mem->shadow_remote_invalidate_count++;
-      if (count < 8 || !(count % 60))
-         vkr_log("OHOS shadow guest write begin count=%u mem=%p depth=%u",
-                 count + 1, mem, mem->shadow_guest_write_depth);
+      if (precise) {
+         args->ret = vkr_device_memory_invalidate_shadow_range(
+            mem, args->pMemoryRanges[i].offset,
+            args->pMemoryRanges[i].size);
+         if (args->ret != VK_SUCCESS)
+            break;
+      } else {
+         /* Legacy WineHua DXVK builds used invalidate as a write-begin
+          * marker.  Keep that contract outside the precise profile so old
+          * runtime overlays remain bisectable. */
+         mem->shadow_guest_write_depth++;
+         mem->shadow_remote_active = true;
+         const uint32_t count = mem->shadow_remote_invalidate_count++;
+         if (count < 8 || !(count % 60))
+            vkr_log("OHOS shadow guest write begin count=%u mem=%p depth=%u",
+                    count + 1, mem, mem->shadow_guest_write_depth);
+      }
 #endif
    }
    mtx_unlock(&ctx->object_mutex);
@@ -785,8 +828,10 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
          .map_info = mappable ? map_info : VIRGL_RENDERER_MAP_CACHE_NONE,
       };
       vkr_log("using OHOS shadow memory size=%" PRIu64
-              " allocation=%" PRIu64 " flags=0x%x mappable=%d coherent=%d",
-              shadow_size, mem->allocation_size, mem->property_flags, mappable,
+              " allocation=%" PRIu64 " mem=%p guest_memory=%" PRIu64
+              " flags=0x%x mappable=%d coherent=%d",
+              shadow_size, mem->allocation_size, mem,
+              (uint64_t)mem->base.id, mem->property_flags, mappable,
               !!(mem->property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
       return true;
 #else
@@ -847,12 +892,13 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
    return true;
 }
 
-static void
+static struct vkr_shadow_sync_stats
 vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
 {
+   struct vkr_shadow_sync_stats stats = { 0 };
 #ifdef __OHOS__
    if (!mem->host_map || !mem->shadow_map || !mem->shadow_size)
-      return;
+      return stats;
 
    struct vn_device_proc_table *vk = &mem->device->proc_table;
    const VkMappedMemoryRange range = {
@@ -863,10 +909,14 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
    };
    const bool coherent = mem->property_flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
    const size_t copy_size = (size_t)MIN2(mem->shadow_size, mem->allocation_size);
+   const char *to_host_mode = os_get_option("VKR_WINEHUA_SHADOW_TO_HOST");
+   const bool explicit_to_host =
+      to_host_mode && (!strcmp(to_host_mode, "explicit") ||
+                       !strcmp(to_host_mode, "explicit-only"));
 
    if (to_host && mem->shadow_remote_active) {
       if (!mem->shadow_host_dirty)
-         return;
+         return stats;
 
       const VkMappedMemoryRange dirty_range = {
          .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
@@ -881,8 +931,34 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
                  " size=%" PRIu64,
                  dirty_result, (uint64_t)mem->shadow_dirty_offset,
                  (uint64_t)mem->shadow_dirty_size);
+      stats.bytes = mem->shadow_pending_copy_bytes;
+      stats.copies = mem->shadow_pending_copy_count;
+      stats.cache_ops = 1;
+      mem->shadow_pending_copy_bytes = 0;
+      mem->shadow_pending_copy_count = 0;
       mem->shadow_host_dirty = false;
-      return;
+      return stats;
+   }
+
+   if (to_host && explicit_to_host) {
+      if (mem->shadow_initial_sync_done)
+         return stats;
+
+      memcpy(mem->host_map, mem->shadow_map, copy_size);
+      VkResult result =
+         vk->FlushMappedMemoryRanges(mem->device->base.handle.device, 1, &range);
+      if (result != VK_SUCCESS)
+         vkr_log("OHOS shadow initial flush failed result=%d coherent=%d size=%zu",
+                 result, coherent, copy_size);
+      stats.bytes = copy_size;
+      stats.copies = copy_size ? 1 : 0;
+      stats.cache_ops = 1;
+      mem->shadow_initial_sync_done = true;
+      mem->shadow_sync_count++;
+      vkr_log("OHOS shadow explicit initial guest_memory=%" PRIu64
+              " bytes=%zu result=%d",
+              (uint64_t)mem->base.id, copy_size, result);
+      return stats;
    }
 
    if (to_host) {
@@ -921,6 +997,8 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
          }
       }
       memcpy(mem->host_map, mem->shadow_map, copy_size);
+      stats.bytes = copy_size;
+      stats.copies = copy_size ? 1 : 0;
       /* Maleoon advertises some host-visible heaps as coherent, but mapped
        * writes made through the OHOS shadow bridge are not always visible to
        * shader reads without an explicit cache-domain transition.  Flushing a
@@ -931,16 +1009,21 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
       if (result != VK_SUCCESS)
          vkr_log("OHOS shadow flush failed result=%d coherent=%d size=%zu",
                  result, coherent, copy_size);
+      stats.cache_ops = 1;
+      mem->shadow_initial_sync_done = true;
       mem->shadow_sync_count++;
    } else {
       if (mem->shadow_guest_write_depth)
-         return;
+         return stats;
       VkResult result =
          vk->InvalidateMappedMemoryRanges(mem->device->base.handle.device, 1, &range);
       if (result != VK_SUCCESS)
          vkr_log("OHOS shadow invalidate failed result=%d coherent=%d size=%zu",
                  result, coherent, copy_size);
       memcpy(mem->shadow_map, mem->host_map, copy_size);
+      stats.bytes = copy_size;
+      stats.copies = copy_size ? 1 : 0;
+      stats.cache_ops = 1;
       if (mem->shadow_remote_active)
          mem->shadow_host_dirty = false;
    }
@@ -948,6 +1031,7 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
    (void)mem;
    (void)to_host;
 #endif
+   return stats;
 }
 
 static VkResult
@@ -973,6 +1057,9 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
    memcpy((uint8_t *)mem->host_map + offset,
           (const uint8_t *)mem->shadow_map + offset,
           (size_t)copy_size);
+   mem->shadow_pending_copy_bytes += copy_size;
+   if (copy_size)
+      mem->shadow_pending_copy_count++;
 
    mem->shadow_remote_active = true;
    if (!mem->shadow_host_dirty) {
@@ -1009,17 +1096,95 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
    return VK_SUCCESS;
 #endif
 }
+
+static VkResult
+vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
+                                          VkDeviceSize offset,
+                                          VkDeviceSize size)
+{
+#ifdef __OHOS__
+   if (!mem->host_map || !mem->shadow_map || !mem->shadow_size)
+      return VK_SUCCESS;
+
+   if (offset > mem->allocation_size)
+      return VK_ERROR_MEMORY_MAP_FAILED;
+
+   const VkDeviceSize available = MIN2(
+      mem->allocation_size - offset,
+      mem->shadow_size > offset ? mem->shadow_size - offset : 0);
+   const VkDeviceSize copy_size = size == VK_WHOLE_SIZE
+      ? available
+      : MIN2(size, available);
+   if (!copy_size)
+      return VK_SUCCESS;
+
+   struct vn_device_proc_table *vk = &mem->device->proc_table;
+   const VkMappedMemoryRange range = {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = mem->base.handle.device_memory,
+      .offset = offset,
+      .size = size == VK_WHOLE_SIZE ? VK_WHOLE_SIZE : copy_size,
+   };
+   VkResult result = vk->InvalidateMappedMemoryRanges(
+      mem->device->base.handle.device, 1, &range);
+   if (result == VK_SUCCESS) {
+      memcpy((uint8_t *)mem->shadow_map + offset,
+             (const uint8_t *)mem->host_map + offset,
+             (size_t)copy_size);
+      mem->shadow_remote_active = true;
+   }
+
+   const uint32_t count = mem->shadow_remote_invalidate_count++;
+   if (count < 8 || !(count % 60) || result != VK_SUCCESS)
+      vkr_log("OHOS shadow remote invalidate count=%u mem=%p offset=%" PRIu64
+              " size=%" PRIu64 " result=%d",
+              count + 1, mem, (uint64_t)offset,
+              (uint64_t)copy_size, result);
+   return result;
+#else
+   (void)mem;
+   (void)offset;
+   (void)size;
+   return VK_SUCCESS;
+#endif
+}
 static void
 vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
 {
 #ifdef __OHOS__
+   const uint64_t start_ns = vkr_ohos_now_ns();
+   struct vkr_shadow_sync_stats total = { 0 };
+   uint32_t scanned = 0;
    mtx_lock(&ctx->object_mutex);
    hash_table_foreach (ctx->object_table, entry) {
       struct vkr_object *obj = entry->data;
-      if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY)
-         vkr_device_memory_sync_shadow((struct vkr_device_memory *)obj, to_host);
+      if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY) {
+         const struct vkr_shadow_sync_stats stats =
+            vkr_device_memory_sync_shadow((struct vkr_device_memory *)obj,
+                                          to_host);
+         scanned++;
+         total.bytes += stats.bytes;
+         total.copies += stats.copies;
+         total.cache_ops += stats.cache_ops;
+      }
    }
    mtx_unlock(&ctx->object_mutex);
+
+   atomic_uint_fast64_t *counter = to_host
+      ? &vkr_ohos_shadow_to_host_sync_count
+      : &vkr_ohos_shadow_from_host_sync_count;
+   const uint64_t call_id =
+      atomic_fetch_add_explicit(counter, 1, memory_order_relaxed) + 1;
+   const uint64_t end_ns = vkr_ohos_now_ns();
+   const uint64_t elapsed_us = start_ns && end_ns >= start_ns
+      ? (end_ns - start_ns) / 1000 : 0;
+   if (call_id <= 8 || !(call_id % 120) || elapsed_us >= 20000) {
+      vkr_log("OHOS shadow sync direction=%s call=%" PRIu64
+              " scanned=%u copies=%u bytes=%" PRIu64
+              " cache_ops=%u elapsed_us=%" PRIu64,
+              to_host ? "to-host" : "from-host", call_id, scanned,
+              total.copies, total.bytes, total.cache_ops, elapsed_us);
+   }
 #else
    (void)ctx;
    (void)to_host;
@@ -1035,5 +1200,19 @@ vkr_device_memory_sync_shadows_to_host(struct vkr_context *ctx)
 void
 vkr_device_memory_sync_shadows_from_host(struct vkr_context *ctx)
 {
+#ifdef __OHOS__
+   const char *mode = os_get_option("VKR_WINEHUA_SHADOW_FROM_HOST");
+   if (mode && (!strcmp(mode, "none") || !strcmp(mode, "disabled") ||
+                !strcmp(mode, "precise"))) {
+      const uint64_t call_id =
+         atomic_fetch_add_explicit(&vkr_ohos_shadow_from_host_sync_count, 1,
+                                   memory_order_relaxed) + 1;
+      if (call_id <= 8 || !(call_id % 120))
+         vkr_log("OHOS shadow sync direction=from-host call=%" PRIu64
+                 " skipped=1 mode=%s",
+                 call_id, mode);
+      return;
+   }
+#endif
    vkr_device_memory_sync_shadows(ctx, false);
 }

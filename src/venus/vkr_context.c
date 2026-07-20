@@ -35,6 +35,13 @@
 #include "vkr_ring.h"
 #include "vkr_transport.h"
 
+static bool
+vkr_winehua_resource_trace_enabled(void)
+{
+   const char *value = getenv("WINEHUA_RESOURCE_TRACE");
+   return value && value[0] == '1';
+}
+
 void
 vkr_context_add_instance(struct vkr_context *ctx,
                          struct vkr_instance *instance,
@@ -410,14 +417,25 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
    if (!res)
       return;
 
-   if (!vkr_cs_encoder_check_stream(&ctx->encoder, res))
+   const bool encoder_busy = !vkr_cs_encoder_check_stream(&ctx->encoder, res);
+   uint32_t ring_count = 0;
+   uint32_t ring_conflicts = 0;
+
+   if (encoder_busy)
       vkr_context_set_fatal(ctx);
 
    mtx_lock(&ctx->ring_mutex);
    list_for_each_entry_safe (struct vkr_ring, ring, &ctx->rings, head) {
-      if (ring->resource == res ||
-          !vkr_cs_decoder_check_stream(&ring->decoder, res) ||
-          !vkr_cs_encoder_check_stream(&ring->encoder, res)) {
+      ring_count++;
+      const bool ring_resource = ring->resource == res;
+      const bool decoder_busy = !vkr_cs_decoder_check_stream(&ring->decoder, res);
+      const bool ring_encoder_busy = !vkr_cs_encoder_check_stream(&ring->encoder, res);
+      if (ring_resource || decoder_busy || ring_encoder_busy) {
+         ring_conflicts++;
+         vkr_log("WineHua resource destroy conflict ctx=%u res=%u ring=%" PRIu64
+                 " ring_resource=%d decoder_busy=%d encoder_busy=%d",
+                 ctx->ctx_id, res_id, ring->id, ring_resource, decoder_busy,
+                 ring_encoder_busy);
          vkr_context_set_fatal(ctx);
 
          mtx_unlock(&ctx->ring_mutex);
@@ -428,6 +446,10 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
       }
    }
    mtx_unlock(&ctx->ring_mutex);
+
+   if (vkr_winehua_resource_trace_enabled() || encoder_busy || ring_conflicts)
+      vkr_log("WineHua resource destroy ctx=%u res=%u encoder_busy=%d rings=%u conflicts=%u",
+              ctx->ctx_id, res_id, encoder_busy, ring_count, ring_conflicts);
 
    vkr_context_remove_resource(ctx, res_id);
 }

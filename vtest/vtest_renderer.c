@@ -227,6 +227,12 @@ static uint64_t winehua_diag_now_ms(void)
    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+static bool winehua_vk_present_trace_enabled(void)
+{
+   const char *value = getenv("WINEHUA_VK_PRESENT_TRACE");
+   return value && value[0] == '1';
+}
+
 static void winehua_diag(const char *fmt, ...)
 {
    va_list args;
@@ -1154,8 +1160,9 @@ int vtest_winehua_vk_present(uint32_t length_dw)
    if (ret != sizeof(command))
       return -1;
 
-   winehua_diag("vk present dispatch begin ctx=%u serial=%u", ctx->ctx_id,
-                command[VCMD_WINEHUA_VK_PRESENT_SERIAL]);
+   if (winehua_vk_present_trace_enabled())
+      winehua_diag("vk present dispatch begin ctx=%u serial=%u", ctx->ctx_id,
+                   command[VCMD_WINEHUA_VK_PRESENT_SERIAL]);
 
    queue_id =
       (uint64_t)command[VCMD_WINEHUA_VK_PRESENT_QUEUE_ID_LO] |
@@ -1172,8 +1179,10 @@ int vtest_winehua_vk_present(uint32_t length_dw)
    }
 #ifdef ENABLE_VENUS
    else {
-      winehua_diag("vk present renderer callback begin ctx=%u serial=%u", ctx->ctx_id,
-                   command[VCMD_WINEHUA_VK_PRESENT_SERIAL]);
+      if (winehua_vk_present_trace_enabled())
+         winehua_diag("vk present renderer callback begin ctx=%u serial=%u",
+                      ctx->ctx_id,
+                      command[VCMD_WINEHUA_VK_PRESENT_SERIAL]);
       present_ret = virgl_renderer_winehua_vk_present(
          ctx->ctx_id,
          queue_id,
@@ -1187,8 +1196,10 @@ int vtest_winehua_vk_present(uint32_t length_dw)
          command[VCMD_WINEHUA_VK_PRESENT_SERIAL],
          command[VCMD_WINEHUA_VK_PRESENT_FLAGS],
          &next_present_deadline_ns);
-      winehua_diag("vk present renderer callback end ctx=%u serial=%u ret=%d", ctx->ctx_id,
-                   command[VCMD_WINEHUA_VK_PRESENT_SERIAL], present_ret);
+      if (winehua_vk_present_trace_enabled())
+         winehua_diag("vk present renderer callback end ctx=%u serial=%u ret=%d",
+                      ctx->ctx_id,
+                      command[VCMD_WINEHUA_VK_PRESENT_SERIAL], present_ret);
    }
 #endif
 
@@ -1223,8 +1234,10 @@ int vtest_winehua_vk_present(uint32_t length_dw)
    reply[VCMD_WINEHUA_VK_PRESENT_REPLY_SERIAL] =
       command[VCMD_WINEHUA_VK_PRESENT_SERIAL];
 
-   winehua_diag("vk present dispatch reply ctx=%u serial=%u ret=%d", ctx->ctx_id,
-                command[VCMD_WINEHUA_VK_PRESENT_SERIAL], present_ret);
+   if (winehua_vk_present_trace_enabled())
+      winehua_diag("vk present dispatch reply ctx=%u serial=%u ret=%d",
+                   ctx->ctx_id, command[VCMD_WINEHUA_VK_PRESENT_SERIAL],
+                   present_ret);
    ret = vtest_block_write(ctx->out_fd, reply_header, sizeof(reply_header));
    if (ret < 0)
       return ret;
@@ -1848,6 +1861,12 @@ int vtest_resource_unref(UNUSED uint32_t length_dw)
    }
 
    handle = res_unref_buf[VCMD_RES_UNREF_RES_HANDLE];
+   const char *resource_trace = getenv("WINEHUA_RESOURCE_TRACE");
+   if (resource_trace && resource_trace[0] == '1')
+      winehua_diag("resource unref ctx=%u res=%u present=%d",
+                   ctx->ctx_id, handle,
+                   util_hash_table_get(ctx->resource_table,
+                                       intptr_to_pointer(handle)) != NULL);
    util_hash_table_remove(ctx->resource_table, intptr_to_pointer(handle));
 
    return 0;

@@ -35,13 +35,16 @@ static struct vkr_context *vkr_context_cache[64];
 static void
 vkr_winehua_stage(const char *stage)
 {
+   const char *trace = getenv("WINEHUA_VKR_PRESENT_STAGE_TRACE");
+   if (!trace || trace[0] != '1')
+      return;
    const char *path = getenv("WINEHUA_VIRGL_LOG_PATH");
    if (!path || !path[0])
       return;
    FILE *file = fopen(path, "a");
    if (!file)
       return;
-   fprintf(file, "[vkr-present] %s\\n", stage);
+   fprintf(file, "[vkr-present] %s\n", stage);
    fflush(file);
    fclose(file);
 }
