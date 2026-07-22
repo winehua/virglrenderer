@@ -13,6 +13,15 @@
 
 #include "vkr_context.h"
 
+#ifdef __OHOS__
+static bool
+vkr_ohos_ring_trace_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_TRACE");
+   return value && value[0] == '1' && !value[1];
+}
+#endif
+
 static inline void *
 get_resource_pointer(const struct vkr_resource *res, size_t offset)
 {
@@ -311,7 +320,9 @@ vkr_ring_thread(void *arg)
          const uint32_t ring_head = ring->buffer.cur;
 #ifdef __OHOS__
          const uint64_t submit_count = ++ring->diagnostic_submit_count;
-         if (submit_count <= 8 || !(submit_count % 256))
+         const bool log_submit = vkr_ohos_ring_trace_enabled() &&
+            (submit_count <= 8 || !(submit_count % 256));
+         if (log_submit)
             vkr_log("OHOS ring dispatch id=%" PRIu64 " count=%" PRIu64
                     " head=%u tail=%u bytes=%u",
                     ring->id, submit_count, ring_head,
@@ -324,7 +335,7 @@ vkr_ring_thread(void *arg)
             break;
          }
 #ifdef __OHOS__
-         if (submit_count <= 8 || !(submit_count % 256))
+         if (log_submit)
             vkr_log("OHOS ring complete id=%" PRIu64 " count=%" PRIu64
                     " head=%u tail=%u",
                     ring->id, submit_count, vkr_ring_load_head(ring),

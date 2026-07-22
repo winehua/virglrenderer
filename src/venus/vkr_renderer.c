@@ -71,6 +71,23 @@ static vkr_renderer_winehua_present_callback_type
    vkr_winehua_present_callback;
 static void *vkr_winehua_present_callback_data;
 
+struct vkr_winehua_queue_guard {
+   mtx_t *mutex;
+   bool locked;
+};
+
+static void
+vkr_winehua_release_queue(void *data)
+{
+   struct vkr_winehua_queue_guard *guard = data;
+   if (!guard || !guard->locked)
+      return;
+
+   guard->locked = false;
+   mtx_unlock(guard->mutex);
+   vkr_winehua_stage("queue-released-by-present");
+}
+
 size_t
 vkr_get_capset(void *capset, uint32_t flags)
 {
@@ -348,12 +365,17 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
    mtx_unlock(&vkr_state.context_mutex);
    vkr_winehua_stage("object-locks-released");
 
+   struct vkr_winehua_queue_guard queue_guard = {
+      .mutex = &queue->vk_mutex,
+      .locked = true,
+   };
    const int ret = vkr_winehua_present_callback(
       ctx_id, instance_handle, physical_device_handle, device_handle,
       queue_handle, image_handle, queue_family, width, height, format, layout,
       client_pid, surface_id, serial, flags, next_present_deadline_ns,
+      vkr_winehua_release_queue, &queue_guard,
       vkr_winehua_present_callback_data);
-   mtx_unlock(&queue->vk_mutex);
+   vkr_winehua_release_queue(&queue_guard);
    vkr_winehua_stage("queue-unlocked");
    return ret;
 }

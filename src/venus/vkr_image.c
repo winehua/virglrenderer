@@ -9,6 +9,15 @@
 #include "vkr_image_gen.h"
 #include "vkr_physical_device.h"
 
+#include <string.h>
+
+static bool
+vkr_winehua_option_enabled(const char *name)
+{
+   const char *value = os_get_option(name);
+   return value && !strcmp(value, "1");
+}
+
 static void
 vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                            struct vn_command_vkCreateImage *args)
@@ -47,7 +56,7 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
    image->array_layers = create_info.arrayLayers;
    image->samples = create_info.samples;
    image->tiling = create_info.tiling;
-   if (os_get_option("WINEHUA_VKR_TRACE_SAMPLED")) {
+   if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
       vkr_log("WineHuaSampled: host-image guestImage=%" PRIu64
               " hostImage=0x%" PRIxPTR " format=%u extent=%ux%ux%u"
               " mips=%u layers=%u usage=0x%x tiling=%u",
@@ -196,6 +205,7 @@ static void
 vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCreateImageView *args)
 {
+   const VkImageViewCreateInfo create_info = *args->pCreateInfo;
    struct vkr_image *image =
       vkr_image_from_handle(args->pCreateInfo->image);
    struct vkr_image_view *view =
@@ -206,14 +216,20 @@ vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
 
    view->image = image;
    {
-      const char *trace = os_get_option("WINEHUA_VKR_TRACE_SAMPLED");
-      if (trace && trace[0] == '1') {
+      if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
          vkr_log("WineHuaSampled: host-image-view guestView=%" PRIu64 " "
                  "guestImage=%" PRIu64 " hostView=0x%" PRIxPTR " "
-                 "hostImage=0x%" PRIxPTR,
+                 "hostImage=0x%" PRIxPTR " format=%u viewType=%u "
+                 "aspect=0x%x mip=%u+%u layer=%u+%u",
                  view->base.id, image ? image->base.id : 0,
                  (uintptr_t)view->base.handle.image_view,
-                 image ? (uintptr_t)image->base.handle.image : 0);
+                 image ? (uintptr_t)image->base.handle.image : 0,
+                 create_info.format, create_info.viewType,
+                 create_info.subresourceRange.aspectMask,
+                 create_info.subresourceRange.baseMipLevel,
+                 create_info.subresourceRange.levelCount,
+                 create_info.subresourceRange.baseArrayLayer,
+                 create_info.subresourceRange.layerCount);
       }
    }
 }
@@ -229,7 +245,23 @@ static void
 vkr_dispatch_vkCreateSampler(struct vn_dispatch_context *dispatch,
                              struct vn_command_vkCreateSampler *args)
 {
-   vkr_sampler_create_and_add(dispatch->data, args);
+   const VkSamplerCreateInfo create_info = *args->pCreateInfo;
+   struct vkr_sampler *sampler =
+      vkr_sampler_create_and_add(dispatch->data, args);
+   if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
+      vkr_log("WineHuaSampled: host-sampler guestSampler=%" PRIu64 " "
+              "hostSampler=0x%" PRIxPTR " compareEnable=%u compareOp=%u "
+              "minFilter=%u magFilter=%u mipmapMode=%u "
+              "address=%u,%u,%u lod=%f..%f border=%u result=%d",
+              sampler ? sampler->base.id : 0,
+              sampler ? (uintptr_t)sampler->base.handle.sampler : 0,
+              create_info.compareEnable, create_info.compareOp,
+              create_info.minFilter, create_info.magFilter,
+              create_info.mipmapMode, create_info.addressModeU,
+              create_info.addressModeV, create_info.addressModeW,
+              create_info.minLod, create_info.maxLod,
+              create_info.borderColor, args->ret);
+   }
 }
 
 static void

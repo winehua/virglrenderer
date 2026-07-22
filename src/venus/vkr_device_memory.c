@@ -40,6 +40,13 @@ struct vkr_shadow_sync_stats {
 static atomic_uint_fast64_t vkr_ohos_shadow_to_host_sync_count;
 static atomic_uint_fast64_t vkr_ohos_shadow_from_host_sync_count;
 
+static bool
+vkr_ohos_shadow_trace_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_TRACE");
+   return value && value[0] == '1' && !value[1];
+}
+
 static uint64_t
 vkr_ohos_now_ns(void)
 {
@@ -575,7 +582,8 @@ vkr_dispatch_vkInvalidateMappedMemoryRanges(
          mem->shadow_guest_write_depth++;
          mem->shadow_remote_active = true;
          const uint32_t count = mem->shadow_remote_invalidate_count++;
-         if (count < 8 || !(count % 60))
+         if (vkr_ohos_shadow_trace_enabled() &&
+             (count < 8 || !(count % 60)))
             vkr_log("OHOS shadow guest write begin count=%u mem=%p depth=%u",
                     count + 1, mem, mem->shadow_guest_write_depth);
       }
@@ -955,15 +963,16 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
       stats.cache_ops = 1;
       mem->shadow_initial_sync_done = true;
       mem->shadow_sync_count++;
-      vkr_log("OHOS shadow explicit initial guest_memory=%" PRIu64
-              " bytes=%zu result=%d",
-              (uint64_t)mem->base.id, copy_size, result);
+      if (vkr_ohos_shadow_trace_enabled())
+         vkr_log("OHOS shadow explicit initial guest_memory=%" PRIu64
+                 " bytes=%zu result=%d",
+                 (uint64_t)mem->base.id, copy_size, result);
       return stats;
    }
 
    if (to_host) {
       size_t first_diff = copy_size;
-      if (mem->shadow_sync_count < 16) {
+      if (vkr_ohos_shadow_trace_enabled() && mem->shadow_sync_count < 16) {
          const uint8_t *shadow = mem->shadow_map;
          const uint8_t *host = mem->host_map;
          const size_t page_size = 4096;
@@ -1079,7 +1088,8 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
       mem->shadow_guest_write_depth--;
 
    const uint32_t flush_count = mem->shadow_remote_flush_count++;
-   if (flush_count < 8 || !(flush_count % 60))
+   if (vkr_ohos_shadow_trace_enabled() &&
+       (flush_count < 8 || !(flush_count % 60)))
       vkr_log("OHOS shadow remote flush count=%u mem=%p offset=%" PRIu64
               " size=%" PRIu64 " result=0",
               flush_count + 1, mem, (uint64_t)offset,
@@ -1135,7 +1145,8 @@ vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
    }
 
    const uint32_t count = mem->shadow_remote_invalidate_count++;
-   if (count < 8 || !(count % 60) || result != VK_SUCCESS)
+   if ((vkr_ohos_shadow_trace_enabled() &&
+        (count < 8 || !(count % 60))) || result != VK_SUCCESS)
       vkr_log("OHOS shadow remote invalidate count=%u mem=%p offset=%" PRIu64
               " size=%" PRIu64 " result=%d",
               count + 1, mem, (uint64_t)offset,
@@ -1178,7 +1189,8 @@ vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
    const uint64_t end_ns = vkr_ohos_now_ns();
    const uint64_t elapsed_us = start_ns && end_ns >= start_ns
       ? (end_ns - start_ns) / 1000 : 0;
-   if (call_id <= 8 || !(call_id % 120) || elapsed_us >= 20000) {
+   if (vkr_ohos_shadow_trace_enabled() &&
+       (call_id <= 8 || !(call_id % 120) || elapsed_us >= 20000)) {
       vkr_log("OHOS shadow sync direction=%s call=%" PRIu64
               " scanned=%u copies=%u bytes=%" PRIu64
               " cache_ops=%u elapsed_us=%" PRIu64,
@@ -1207,7 +1219,8 @@ vkr_device_memory_sync_shadows_from_host(struct vkr_context *ctx)
       const uint64_t call_id =
          atomic_fetch_add_explicit(&vkr_ohos_shadow_from_host_sync_count, 1,
                                    memory_order_relaxed) + 1;
-      if (call_id <= 8 || !(call_id % 120))
+      if (vkr_ohos_shadow_trace_enabled() &&
+          (call_id <= 8 || !(call_id % 120)))
          vkr_log("OHOS shadow sync direction=from-host call=%" PRIu64
                  " skipped=1 mode=%s",
                  call_id, mode);

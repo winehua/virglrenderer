@@ -16,11 +16,19 @@
 #include <time.h>
 
 static atomic_uint_fast64_t vkr_ohos_queue_submit_count;
+static atomic_uint_fast64_t vkr_ohos_queue_submit_slow_count;
 static atomic_uint_fast64_t vkr_ohos_fence_status_count;
 static atomic_uint_fast64_t vkr_ohos_fence_status_total_us;
 static atomic_uint_fast64_t vkr_ohos_fence_status_success_count;
 static atomic_uint_fast64_t vkr_ohos_fence_status_not_ready_count;
 static atomic_uint_fast64_t vkr_ohos_fence_wait_count;
+
+static bool
+vkr_ohos_perf_trace_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_TRACE");
+   return value && value[0] == '1' && !value[1];
+}
 
 static uint64_t
 vkr_ohos_queue_now_ns(void)
@@ -441,7 +449,9 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
 #ifdef __OHOS__
    const uint64_t submit_id =
       atomic_fetch_add_explicit(&vkr_ohos_queue_submit_count, 1, memory_order_relaxed) + 1;
-   const bool log_submit = submit_id <= 8 || !(submit_id % 120);
+   const bool perf_trace = vkr_ohos_perf_trace_enabled();
+   const bool log_submit = perf_trace &&
+      (submit_id <= 8 || !(submit_id % 120));
    if (log_submit)
       vkr_log("OHOS queue submit begin id=%" PRIu64 " submits=%u", submit_id,
               args->submitCount);
@@ -452,11 +462,38 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       vkr_log("OHOS queue submit shadows synced id=%" PRIu64, submit_id);
 #endif
 
+#ifdef __OHOS__
+   const uint64_t lock_start_ns = vkr_ohos_queue_now_ns();
+#endif
    mtx_lock(&queue->vk_mutex);
+#ifdef __OHOS__
+   const uint64_t lock_acquired_ns = vkr_ohos_queue_now_ns();
+#endif
    args->ret =
       vk->QueueSubmit(args->queue, args->submitCount, args->pSubmits, args->fence);
+#ifdef __OHOS__
+   const uint64_t driver_end_ns = vkr_ohos_queue_now_ns();
+#endif
    mtx_unlock(&queue->vk_mutex);
 #ifdef __OHOS__
+   const uint64_t lock_wait_us = lock_acquired_ns >= lock_start_ns
+                                    ? (lock_acquired_ns - lock_start_ns) / 1000
+                                    : 0;
+   const uint64_t driver_us = driver_end_ns >= lock_acquired_ns
+                                 ? (driver_end_ns - lock_acquired_ns) / 1000
+                                 : 0;
+   const bool slow_submit = lock_wait_us >= 1000 || driver_us >= 1000;
+   const uint64_t slow_id = slow_submit
+                               ? atomic_fetch_add_explicit(
+                                    &vkr_ohos_queue_submit_slow_count, 1,
+                                    memory_order_relaxed) + 1
+                               : 0;
+   if (perf_trace && (log_submit ||
+       (slow_submit && (slow_id <= 8 || !(slow_id % 60)))))
+      vkr_log("OHOS queue submit phases id=%" PRIu64
+              " slow=%" PRIu64 " lock_wait_us=%" PRIu64
+              " driver_us=%" PRIu64,
+              submit_id, slow_id, lock_wait_us, driver_us);
    if (log_submit || args->ret != VK_SUCCESS)
       vkr_log("OHOS queue submit end id=%" PRIu64 " result=%d", submit_id,
               args->ret);
@@ -567,7 +604,8 @@ vkr_dispatch_vkGetFenceStatus(struct vn_dispatch_context *dispatch,
       vkr_log("OHOS fence status transient OOM count=%" PRIu64
               " retries=%u wait0=%u final=%d", status_id, retry_count,
               used_wait_fallback, args->ret);
-   if (status_id <= 8 || !(status_id % 256) || args->ret < 0) {
+   if ((vkr_ohos_perf_trace_enabled() &&
+        (status_id <= 8 || !(status_id % 256))) || args->ret < 0) {
       const uint64_t success_count = atomic_load_explicit(
          &vkr_ohos_fence_status_success_count, memory_order_relaxed);
       const uint64_t not_ready_count = atomic_load_explicit(
@@ -604,7 +642,8 @@ vkr_dispatch_vkWaitForFences(struct vn_dispatch_context *dispatch,
                                 memory_order_relaxed) + 1;
    const uint64_t elapsed_us = start_ns && end_ns >= start_ns
       ? (end_ns - start_ns) / 1000 : 0;
-   if (wait_id <= 8 || !(wait_id % 120) || args->ret != VK_SUCCESS)
+   if ((vkr_ohos_perf_trace_enabled() &&
+        (wait_id <= 8 || !(wait_id % 120))) || args->ret != VK_SUCCESS)
       vkr_log("OHOS fence wait count=%" PRIu64
               " fences=%u wait_all=%u timeout_ns=%" PRIu64
               " result=%d elapsed_us=%" PRIu64,

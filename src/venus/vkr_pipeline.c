@@ -11,6 +11,13 @@
 #include <stdlib.h>
 #include <stdbool.h>
 
+static bool
+vkr_winehua_option_enabled(const char *name)
+{
+   const char *value = os_get_option(name);
+   return value && !strcmp(value, "1");
+}
+
 /* Maleoon's Vulkan compiler mis-handles DXVK's binding-presence
  * OpSpecConstantTrue values when they flow through generated vector selects.
  * Keep this diagnostic workaround opt-in: bake boolean spec constants into
@@ -135,7 +142,7 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
       return;
    }
 
-   if (os_get_option("WINEHUA_VKR_FREEZE_BOOL_SPEC")) {
+   if (vkr_winehua_option_enabled("WINEHUA_VKR_FREEZE_BOOL_SPEC")) {
       frozen = vkr_freeze_bool_spec_constants(original, &frozen_info, &frozen_code);
       if (frozen) {
          args->pCreateInfo = &frozen_info;
@@ -234,7 +241,7 @@ vkr_dispatch_vkCreateComputePipelines(struct vn_dispatch_context *dispatch,
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct object_array arr;
 
-   if (os_get_option("WINEHUA_VKR_TRACE_SAMPLED")) {
+   if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
       for (uint32_t i = 0; i < args->createInfoCount; i++) {
          const VkSpecializationInfo *spec = args->pCreateInfos[i].stage.pSpecializationInfo;
          if (!spec) {

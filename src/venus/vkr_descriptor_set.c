@@ -8,6 +8,10 @@
 #include "vkr_descriptor_set_gen.h"
 #include "vkr_image.h"
 
+#include <stdatomic.h>
+
+#define VKR_WINEHUA_SAMPLE_TRACE_LIMIT 32768u
+
 static bool
 vkr_winehua_sample_trace_enabled(void)
 {
@@ -17,6 +21,21 @@ vkr_winehua_sample_trace_enabled(void)
       enabled = value && value[0] == '1';
    }
    return enabled != 0;
+}
+
+static bool
+vkr_winehua_sample_trace_allow(void)
+{
+   static atomic_uint emitted = ATOMIC_VAR_INIT(0);
+   const unsigned index =
+      atomic_fetch_add_explicit(&emitted, 1, memory_order_relaxed);
+
+   if (index < VKR_WINEHUA_SAMPLE_TRACE_LIMIT)
+      return true;
+   if (index == VKR_WINEHUA_SAMPLE_TRACE_LIMIT)
+      vkr_log("WineHuaSampled: host descriptor trace limit reached; "
+              "further records suppressed");
+   return false;
 }
 
 static bool
@@ -50,6 +69,8 @@ vkr_winehua_log_guest_descriptor_objects(uint32_t write_count,
 
       set = vkr_descriptor_set_from_handle(write->dstSet);
       for (uint32_t j = 0; j < write->descriptorCount; j++) {
+         if (!vkr_winehua_sample_trace_allow())
+            continue;
          const VkDescriptorImageInfo *info = &write->pImageInfo[j];
          struct vkr_image_view *view = info->imageView
             ? vkr_image_view_from_handle(info->imageView) : NULL;
@@ -91,6 +112,8 @@ vkr_winehua_log_host_descriptor_handles(uint32_t write_count,
          continue;
 
       for (uint32_t j = 0; j < write->descriptorCount; j++) {
+         if (!vkr_winehua_sample_trace_allow())
+            continue;
          const VkDescriptorImageInfo *info = &write->pImageInfo[j];
          vkr_log("WineHuaSampled: host-descriptor phase=driver-call "
                  "hostSet=0x%" PRIxPTR " binding=%u arrayElement=%u "

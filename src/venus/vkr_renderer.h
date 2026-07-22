@@ -21,6 +21,9 @@ typedef void (*vkr_renderer_retire_fence_callback_type)(uint32_t ctx_id,
                                                         uint32_t ring_idx,
                                                         uint64_t fence_id);
 
+typedef void (*vkr_renderer_winehua_release_queue_callback_type)(
+   void *queue_sync_data);
+
 typedef int (*vkr_renderer_winehua_present_callback_type)(
    uint32_t ctx_id,
    uintptr_t instance,
@@ -38,6 +41,8 @@ typedef int (*vkr_renderer_winehua_present_callback_type)(
    uint32_t serial,
    uint32_t flags,
    uint64_t *next_present_deadline_ns,
+   vkr_renderer_winehua_release_queue_callback_type release_queue,
+   void *queue_sync_data,
    void *user_data);
 
 struct vkr_renderer_callbacks {
