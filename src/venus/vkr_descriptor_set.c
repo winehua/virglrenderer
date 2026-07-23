@@ -5,7 +5,9 @@
 
 #include "vkr_descriptor_set.h"
 
+#include "vkr_buffer.h"
 #include "vkr_descriptor_set_gen.h"
+#include "vkr_device_memory.h"
 #include "vkr_image.h"
 
 #include <stdatomic.h>
@@ -53,6 +55,83 @@ vkr_winehua_image_descriptor(VkDescriptorType type)
    }
 }
 
+static bool
+vkr_winehua_buffer_descriptor(VkDescriptorType type)
+{
+   switch (type) {
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+      return true;
+   default:
+      return false;
+   }
+}
+
+#ifdef __OHOS__
+#define VKR_WINEHUA_BUFFER_HASH_LIMIT 4096u
+#define VKR_WINEHUA_FNV_OFFSET UINT64_C(1469598103934665603)
+#define VKR_WINEHUA_FNV_PRIME UINT64_C(1099511628211)
+
+struct vkr_winehua_buffer_hashes {
+   VkDeviceSize absolute_offset;
+   size_t byte_count;
+   uint64_t shadow_hash;
+   uint64_t host_hash;
+   int offset_valid;
+   int equal;
+};
+
+static uint64_t
+vkr_winehua_fnv1a64(const void *data, size_t size)
+{
+   const uint8_t *bytes = data;
+   uint64_t hash = VKR_WINEHUA_FNV_OFFSET;
+
+   for (size_t i = 0; i < size; i++) {
+      hash ^= bytes[i];
+      hash *= VKR_WINEHUA_FNV_PRIME;
+   }
+   return hash;
+}
+
+static struct vkr_winehua_buffer_hashes
+vkr_winehua_hash_buffer_descriptor(const struct vkr_buffer *buffer,
+                                    const VkDescriptorBufferInfo *info)
+{
+   struct vkr_winehua_buffer_hashes hashes = {
+      .equal = -1,
+   };
+   const struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
+   if (!mem || info->offset > UINT64_MAX - buffer->bound_memory_offset)
+      return hashes;
+
+   hashes.offset_valid = 1;
+   hashes.absolute_offset = buffer->bound_memory_offset + info->offset;
+   if (!mem->shadow_map || !mem->host_map ||
+       hashes.absolute_offset >= mem->allocation_size ||
+       hashes.absolute_offset >= mem->shadow_size)
+      return hashes;
+
+   VkDeviceSize available = MIN2(mem->allocation_size - hashes.absolute_offset,
+                                 mem->shadow_size - hashes.absolute_offset);
+   if (info->range != VK_WHOLE_SIZE)
+      available = MIN2(available, info->range);
+   available = MIN2(available, (VkDeviceSize)VKR_WINEHUA_BUFFER_HASH_LIMIT);
+   if (!available)
+      return hashes;
+
+   hashes.byte_count = (size_t)available;
+   const uint8_t *shadow = (const uint8_t *)mem->shadow_map + hashes.absolute_offset;
+   const uint8_t *host = (const uint8_t *)mem->host_map + hashes.absolute_offset;
+   hashes.shadow_hash = vkr_winehua_fnv1a64(shadow, hashes.byte_count);
+   hashes.host_hash = vkr_winehua_fnv1a64(host, hashes.byte_count);
+   hashes.equal = memcmp(shadow, host, hashes.byte_count) == 0;
+   return hashes;
+}
+#endif
+
 static void
 vkr_winehua_log_guest_descriptor_objects(uint32_t write_count,
                                          const VkWriteDescriptorSet *writes)
@@ -63,38 +142,79 @@ vkr_winehua_log_guest_descriptor_objects(uint32_t write_count,
    for (uint32_t i = 0; i < write_count; i++) {
       const VkWriteDescriptorSet *write = &writes[i];
       struct vkr_descriptor_set *set;
-      if (!vkr_winehua_image_descriptor(write->descriptorType) ||
-          !write->pImageInfo)
+      const bool image_descriptor =
+         vkr_winehua_image_descriptor(write->descriptorType) && write->pImageInfo;
+      const bool buffer_descriptor =
+         vkr_winehua_buffer_descriptor(write->descriptorType) && write->pBufferInfo;
+      if (!image_descriptor && !buffer_descriptor)
          continue;
 
       set = vkr_descriptor_set_from_handle(write->dstSet);
-      for (uint32_t j = 0; j < write->descriptorCount; j++) {
-         if (!vkr_winehua_sample_trace_allow())
-            continue;
-         const VkDescriptorImageInfo *info = &write->pImageInfo[j];
-         struct vkr_image_view *view = info->imageView
-            ? vkr_image_view_from_handle(info->imageView) : NULL;
-         struct vkr_sampler *sampler = info->sampler
-            ? vkr_sampler_from_handle(info->sampler) : NULL;
-         struct vkr_image *image = view ? view->image : NULL;
+      if (image_descriptor) {
+         for (uint32_t j = 0; j < write->descriptorCount; j++) {
+            if (!vkr_winehua_sample_trace_allow())
+               continue;
+            const VkDescriptorImageInfo *info = &write->pImageInfo[j];
+            struct vkr_image_view *view = info->imageView
+               ? vkr_image_view_from_handle(info->imageView) : NULL;
+            struct vkr_sampler *sampler = info->sampler
+               ? vkr_sampler_from_handle(info->sampler) : NULL;
+            struct vkr_image *image = view ? view->image : NULL;
 
-         vkr_log("WineHuaSampled: host-descriptor phase=guest-object "
-                 "setId=%" PRIu64 " hostSet=0x%" PRIxPTR " binding=%u "
-                 "arrayElement=%u type=%u viewId=%" PRIu64 " "
-                 "hostView=0x%" PRIxPTR " imageId=%" PRIu64 " "
-                 "hostImage=0x%" PRIxPTR " samplerId=%" PRIu64 " "
-                 "hostSampler=0x%" PRIxPTR " layout=%u",
-                 set ? set->base.id : 0,
-                 set ? (uintptr_t)set->base.handle.descriptor_set : 0,
-                 write->dstBinding, write->dstArrayElement + j,
-                 write->descriptorType, view ? view->base.id : 0,
-                 view ? (uintptr_t)view->base.handle.image_view : 0,
-                 image ? image->base.id : 0,
-                 image ? (uintptr_t)image->base.handle.image : 0,
-                 sampler ? sampler->base.id : 0,
-                 sampler ? (uintptr_t)sampler->base.handle.sampler : 0,
-                 info->imageLayout);
+            vkr_log("WineHuaSampled: host-descriptor phase=guest-object "
+                    "setId=%" PRIu64 " hostSet=0x%" PRIxPTR " binding=%u "
+                    "arrayElement=%u type=%u viewId=%" PRIu64 " "
+                    "hostView=0x%" PRIxPTR " imageId=%" PRIu64 " "
+                    "hostImage=0x%" PRIxPTR " samplerId=%" PRIu64 " "
+                    "hostSampler=0x%" PRIxPTR " layout=%u",
+                    set ? set->base.id : 0,
+                    set ? (uintptr_t)set->base.handle.descriptor_set : 0,
+                    write->dstBinding, write->dstArrayElement + j,
+                    write->descriptorType, view ? view->base.id : 0,
+                    view ? (uintptr_t)view->base.handle.image_view : 0,
+                    image ? image->base.id : 0,
+                    image ? (uintptr_t)image->base.handle.image : 0,
+                    sampler ? sampler->base.id : 0,
+                    sampler ? (uintptr_t)sampler->base.handle.sampler : 0,
+                    info->imageLayout);
+         }
       }
+#ifdef __OHOS__
+      if (buffer_descriptor) {
+         for (uint32_t j = 0; j < write->descriptorCount; j++) {
+            if (!vkr_winehua_sample_trace_allow())
+               continue;
+            const VkDescriptorBufferInfo *info = &write->pBufferInfo[j];
+            struct vkr_buffer *buffer = info->buffer
+               ? vkr_buffer_from_handle(info->buffer) : NULL;
+            struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
+            const struct vkr_winehua_buffer_hashes hashes =
+               vkr_winehua_hash_buffer_descriptor(buffer, info);
+
+            vkr_log("WineHuaSampled: host-descriptor phase=guest-buffer "
+                    "setId=%" PRIu64 " hostSet=0x%" PRIxPTR " binding=%u "
+                    "arrayElement=%u type=%u bufferId=%" PRIu64 " "
+                    "hostBuffer=0x%" PRIxPTR " memoryId=%" PRIu64 " "
+                    "hostMemory=0x%" PRIxPTR " descriptorOffset=%" PRIu64 " "
+                    "descriptorRange=%" PRIu64 " memoryOffset=%" PRIu64 " "
+                    "absoluteOffset=%" PRIu64 " offsetValid=%d hashBytes=%zu "
+                    "shadowHash=%016" PRIx64 " hostHash=%016" PRIx64 " "
+                    "hashEqual=%d",
+                    set ? set->base.id : 0,
+                    set ? (uintptr_t)set->base.handle.descriptor_set : 0,
+                    write->dstBinding, write->dstArrayElement + j,
+                    write->descriptorType, buffer ? buffer->base.id : 0,
+                    buffer ? (uintptr_t)buffer->base.handle.buffer : 0,
+                    mem ? mem->base.id : 0,
+                    mem ? (uintptr_t)mem->base.handle.device_memory : 0,
+                    (uint64_t)info->offset, (uint64_t)info->range,
+                    buffer ? (uint64_t)buffer->bound_memory_offset : 0,
+                    (uint64_t)hashes.absolute_offset, hashes.offset_valid,
+                    hashes.byte_count, hashes.shadow_hash, hashes.host_hash,
+                    hashes.equal);
+         }
+      }
+#endif
    }
 }
 
@@ -107,22 +227,42 @@ vkr_winehua_log_host_descriptor_handles(uint32_t write_count,
 
    for (uint32_t i = 0; i < write_count; i++) {
       const VkWriteDescriptorSet *write = &writes[i];
-      if (!vkr_winehua_image_descriptor(write->descriptorType) ||
-          !write->pImageInfo)
+      const bool image_descriptor =
+         vkr_winehua_image_descriptor(write->descriptorType) && write->pImageInfo;
+      const bool buffer_descriptor =
+         vkr_winehua_buffer_descriptor(write->descriptorType) && write->pBufferInfo;
+      if (!image_descriptor && !buffer_descriptor)
          continue;
 
-      for (uint32_t j = 0; j < write->descriptorCount; j++) {
-         if (!vkr_winehua_sample_trace_allow())
-            continue;
-         const VkDescriptorImageInfo *info = &write->pImageInfo[j];
-         vkr_log("WineHuaSampled: host-descriptor phase=driver-call "
-                 "hostSet=0x%" PRIxPTR " binding=%u arrayElement=%u "
-                 "type=%u hostView=0x%" PRIxPTR " "
-                 "hostSampler=0x%" PRIxPTR " layout=%u",
-                 (uintptr_t)write->dstSet, write->dstBinding,
-                 write->dstArrayElement + j, write->descriptorType,
-                 (uintptr_t)info->imageView, (uintptr_t)info->sampler,
-                 info->imageLayout);
+      if (image_descriptor) {
+         for (uint32_t j = 0; j < write->descriptorCount; j++) {
+            if (!vkr_winehua_sample_trace_allow())
+               continue;
+            const VkDescriptorImageInfo *info = &write->pImageInfo[j];
+            vkr_log("WineHuaSampled: host-descriptor phase=driver-call "
+                    "hostSet=0x%" PRIxPTR " binding=%u arrayElement=%u "
+                    "type=%u hostView=0x%" PRIxPTR " "
+                    "hostSampler=0x%" PRIxPTR " layout=%u",
+                    (uintptr_t)write->dstSet, write->dstBinding,
+                    write->dstArrayElement + j, write->descriptorType,
+                    (uintptr_t)info->imageView, (uintptr_t)info->sampler,
+                    info->imageLayout);
+         }
+      }
+      if (buffer_descriptor) {
+         for (uint32_t j = 0; j < write->descriptorCount; j++) {
+            if (!vkr_winehua_sample_trace_allow())
+               continue;
+            const VkDescriptorBufferInfo *info = &write->pBufferInfo[j];
+            vkr_log("WineHuaSampled: host-descriptor phase=driver-buffer "
+                    "hostSet=0x%" PRIxPTR " binding=%u arrayElement=%u "
+                    "type=%u hostBuffer=0x%" PRIxPTR " offset=%" PRIu64 " "
+                    "range=%" PRIu64,
+                    (uintptr_t)write->dstSet, write->dstBinding,
+                    write->dstArrayElement + j, write->descriptorType,
+                    (uintptr_t)info->buffer, (uint64_t)info->offset,
+                    (uint64_t)info->range);
+         }
       }
    }
 }

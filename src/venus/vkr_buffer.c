@@ -6,7 +6,16 @@
 #include "vkr_buffer.h"
 
 #include "vkr_buffer_gen.h"
+#include "vkr_device_memory.h"
 #include "vkr_physical_device.h"
+
+#ifdef __OHOS__
+struct vkr_winehua_buffer_binding {
+   struct vkr_buffer *buffer;
+   struct vkr_device_memory *memory;
+   VkDeviceSize offset;
+};
+#endif
 
 static void
 vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
@@ -73,14 +82,25 @@ vkr_dispatch_vkGetBufferMemoryRequirements2(
 
 static void
 vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
-                                struct vn_command_vkBindBufferMemory *args)
+                                 struct vn_command_vkBindBufferMemory *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+#ifdef __OHOS__
+   struct vkr_buffer *buffer = vkr_buffer_from_handle(args->buffer);
+   struct vkr_device_memory *memory = vkr_device_memory_from_handle(args->memory);
+   const VkDeviceSize memory_offset = args->memoryOffset;
+#endif
 
    vn_replace_vkBindBufferMemory_args_handle(args);
    args->ret =
       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
+#ifdef __OHOS__
+   if (args->ret == VK_SUCCESS && buffer) {
+      buffer->bound_memory = memory;
+      buffer->bound_memory_offset = memory_offset;
+   }
+#endif
 }
 
 static void
@@ -89,9 +109,31 @@ vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+#ifdef __OHOS__
+   STACK_ARRAY(struct vkr_winehua_buffer_binding, bindings, args->bindInfoCount);
+   if (bindings) {
+      for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+         const VkBindBufferMemoryInfo *info = &args->pBindInfos[i];
+         bindings[i].buffer = vkr_buffer_from_handle(info->buffer);
+         bindings[i].memory = vkr_device_memory_from_handle(info->memory);
+         bindings[i].offset = info->memoryOffset;
+      }
+   }
+#endif
 
    vn_replace_vkBindBufferMemory2_args_handle(args);
    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+#ifdef __OHOS__
+   if (args->ret == VK_SUCCESS && bindings) {
+      for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+         if (bindings[i].buffer) {
+            bindings[i].buffer->bound_memory = bindings[i].memory;
+            bindings[i].buffer->bound_memory_offset = bindings[i].offset;
+         }
+      }
+   }
+   STACK_ARRAY_FINISH(bindings);
+#endif
 }
 
 static void

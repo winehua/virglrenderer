@@ -10,6 +10,13 @@
 
 struct vkr_buffer {
    struct vkr_object base;
+
+#ifdef __OHOS__
+   /* Diagnostic ownership only. Vulkan requires bound memory to outlive the
+    * buffer, so this non-owning pointer is valid for the buffer lifetime. */
+   struct vkr_device_memory *bound_memory;
+   VkDeviceSize bound_memory_offset;
+#endif
 };
 VKR_DEFINE_OBJECT_CAST(buffer, VK_OBJECT_TYPE_BUFFER, VkBuffer)
 
