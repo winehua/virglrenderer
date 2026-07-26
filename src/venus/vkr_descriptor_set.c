@@ -9,10 +9,12 @@
 #include "vkr_descriptor_set_gen.h"
 #include "vkr_device_memory.h"
 #include "vkr_image.h"
+#include "vkr_queue.h"
 
 #include <stdatomic.h>
 
 #define VKR_WINEHUA_SAMPLE_TRACE_LIMIT 32768u
+#define VKR_WINEHUA_CAPTURE_TRACE_LIMIT 512u
 
 static bool
 vkr_winehua_sample_trace_enabled(void)
@@ -39,6 +41,73 @@ vkr_winehua_sample_trace_allow(void)
               "further records suppressed");
    return false;
 }
+
+/* Detailed capture is deliberately separate from the descriptor trace.  It
+ * is enabled only by WineHua's shadow-trace diagnostic profile and bounded so
+ * a real game cannot turn the host log into an unbounded performance hazard. */
+static bool
+vkr_winehua_capture_trace_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *value = os_get_option("WINEHUA_VKR_TRACE_CAPTURE");
+      enabled = value && value[0] == '1';
+   }
+   return enabled != 0;
+}
+
+static bool
+vkr_winehua_capture_trace_allow(void)
+{
+   static atomic_uint emitted = ATOMIC_VAR_INIT(0);
+   const unsigned index =
+      atomic_fetch_add_explicit(&emitted, 1, memory_order_relaxed);
+
+   if (index < VKR_WINEHUA_CAPTURE_TRACE_LIMIT)
+      return true;
+   if (index == VKR_WINEHUA_CAPTURE_TRACE_LIMIT)
+      vkr_log("WineHuaCapture: host capture limit reached; further records suppressed");
+   return false;
+}
+
+#ifdef __OHOS__
+static bool
+vkr_winehua_descriptor_update_serialize_enabled(void)
+{
+   static atomic_int enabled = ATOMIC_VAR_INIT(-1);
+   int value = atomic_load_explicit(&enabled, memory_order_relaxed);
+   if (value < 0) {
+      const char *option = os_get_option("VKR_WINEHUA_DESCRIPTOR_UPDATE_SERIALIZE");
+      value = option && option[0] == '1' && !option[1];
+      atomic_store_explicit(&enabled, value, memory_order_relaxed);
+   }
+   return value != 0;
+}
+
+static void
+vkr_winehua_wait_descriptor_update_queues(struct vkr_device *dev)
+{
+   if (!dev || !vkr_winehua_descriptor_update_serialize_enabled())
+      return;
+
+   static atomic_uint_fast64_t wait_count = ATOMIC_VAR_INIT(0);
+   uint32_t queue_count = 0;
+   VkResult first_error = VK_SUCCESS;
+   list_for_each_entry (struct vkr_queue, queue, &dev->queues, base.track_head) {
+      mtx_lock(&queue->vk_mutex);
+      const VkResult result = dev->proc_table.QueueWaitIdle(queue->base.handle.queue);
+      mtx_unlock(&queue->vk_mutex);
+      queue_count++;
+      if (first_error == VK_SUCCESS && result != VK_SUCCESS)
+         first_error = result;
+   }
+
+   const uint64_t count = atomic_fetch_add_explicit(&wait_count, 1, memory_order_relaxed) + 1;
+   if (count <= 8 || !(count % 120) || first_error != VK_SUCCESS)
+      vkr_log("WineHua descriptor update queue wait count=%" PRIu64
+              " queues=%u result=%d", count, queue_count, first_error);
+}
+#endif
 
 static bool
 vkr_winehua_image_descriptor(VkDescriptorType type)
@@ -71,6 +140,7 @@ vkr_winehua_buffer_descriptor(VkDescriptorType type)
 
 #ifdef __OHOS__
 #define VKR_WINEHUA_BUFFER_HASH_LIMIT 4096u
+#define VKR_WINEHUA_BUFFER_PREVIEW_BYTES 64u
 #define VKR_WINEHUA_FNV_OFFSET UINT64_C(1469598103934665603)
 #define VKR_WINEHUA_FNV_PRIME UINT64_C(1099511628211)
 
@@ -129,6 +199,40 @@ vkr_winehua_hash_buffer_descriptor(const struct vkr_buffer *buffer,
    hashes.host_hash = vkr_winehua_fnv1a64(host, hashes.byte_count);
    hashes.equal = memcmp(shadow, host, hashes.byte_count) == 0;
    return hashes;
+}
+
+static void
+vkr_winehua_log_buffer_preview(const struct vkr_descriptor_set *set,
+                                const VkWriteDescriptorSet *write,
+                                const struct vkr_buffer *buffer,
+                                const struct vkr_winehua_buffer_hashes *hashes)
+{
+   if (!vkr_winehua_capture_trace_enabled() ||
+       !vkr_winehua_capture_trace_allow() || !buffer || !buffer->bound_memory ||
+       !hashes->byte_count || !hashes->offset_valid)
+      return;
+
+   const struct vkr_device_memory *mem = buffer->bound_memory;
+   const size_t byte_count = MIN2(hashes->byte_count,
+                                  (size_t)VKR_WINEHUA_BUFFER_PREVIEW_BYTES);
+   char shadow_hex[VKR_WINEHUA_BUFFER_PREVIEW_BYTES * 2 + 1];
+   char host_hex[VKR_WINEHUA_BUFFER_PREVIEW_BYTES * 2 + 1];
+   const uint8_t *shadow = (const uint8_t *)mem->shadow_map + hashes->absolute_offset;
+   const uint8_t *host = (const uint8_t *)mem->host_map + hashes->absolute_offset;
+
+   for (size_t i = 0; i < byte_count; i++) {
+      snprintf(&shadow_hex[i * 2], 3, "%02x", shadow[i]);
+      snprintf(&host_hex[i * 2], 3, "%02x", host[i]);
+   }
+   shadow_hex[byte_count * 2] = '\0';
+   host_hex[byte_count * 2] = '\0';
+
+   vkr_log("WineHuaCapture: descriptor-buffer setId=%" PRIu64
+           " binding=%u bufferId=%" PRIu64 " memoryId=%" PRIu64
+           " absoluteOffset=%" PRIu64 " previewBytes=%zu shadow=%s host=%s",
+           set ? set->base.id : 0, write->dstBinding, buffer->base.id,
+           mem->base.id, (uint64_t)hashes->absolute_offset, byte_count,
+           shadow_hex, host_hex);
 }
 #endif
 
@@ -190,6 +294,8 @@ vkr_winehua_log_guest_descriptor_objects(uint32_t write_count,
             struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
             const struct vkr_winehua_buffer_hashes hashes =
                vkr_winehua_hash_buffer_descriptor(buffer, info);
+
+            vkr_winehua_log_buffer_preview(set, write, buffer, &hashes);
 
             vkr_log("WineHuaSampled: host-descriptor phase=guest-buffer "
                     "setId=%" PRIu64 " hostSet=0x%" PRIxPTR " binding=%u "
@@ -399,6 +505,9 @@ vkr_dispatch_vkUpdateDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
 
+#ifdef __OHOS__
+   vkr_winehua_wait_descriptor_update_queues(dev);
+#endif
    vkr_winehua_log_guest_descriptor_objects(args->descriptorWriteCount,
                                              args->pDescriptorWrites);
    vn_replace_vkUpdateDescriptorSets_args_handle(args);

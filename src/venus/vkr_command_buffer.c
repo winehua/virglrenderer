@@ -6,6 +6,15 @@
 #include "vkr_command_buffer.h"
 
 #include "vkr_command_buffer_gen.h"
+#include "vkr_buffer.h"
+#include "vkr_descriptor_set.h"
+#include "vkr_device_memory.h"
+#include "vkr_image.h"
+#include "vkr_pipeline.h"
+#include "vkr_render_pass.h"
+
+#include <stdatomic.h>
+#include <stdlib.h>
 
 #ifdef __clang__
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
@@ -20,6 +29,156 @@
       vn_replace_vk##cmd_name##_args_handle(args);                                       \
       _vk->cmd_name(args->commandBuffer, ##__VA_ARGS__);                                 \
    } while (0)
+
+#define VKR_WINEHUA_CAPTURE_TRACE_LIMIT 512u
+
+static bool
+vkr_winehua_capture_trace_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0) {
+      const char *value = os_get_option("WINEHUA_VKR_TRACE_CAPTURE");
+      enabled = value && value[0] == '1';
+   }
+   return enabled != 0;
+}
+
+static unsigned
+vkr_winehua_capture_trace_limit(void)
+{
+   static unsigned limit;
+   if (!limit) {
+      const char *value = os_get_option("WINEHUA_VKR_TRACE_CAPTURE_LIMIT");
+      char *end = NULL;
+      const unsigned parsed = value ? (unsigned)strtoul(value, &end, 10) : 0;
+      limit = parsed && end && !*end && parsed <= 1000000u ? parsed :
+         VKR_WINEHUA_CAPTURE_TRACE_LIMIT;
+   }
+   return limit;
+}
+
+static bool
+vkr_winehua_capture_trace_allow(void)
+{
+   static atomic_uint emitted = ATOMIC_VAR_INIT(0);
+   const unsigned limit = vkr_winehua_capture_trace_limit();
+   const unsigned index =
+      atomic_fetch_add_explicit(&emitted, 1, memory_order_relaxed);
+
+   if (index < limit)
+      return true;
+   if (index == limit)
+      vkr_log("WineHuaCapture: command capture limit reached; further records suppressed");
+   return false;
+}
+
+static void
+vkr_winehua_log_buffer_binding(const char *kind,
+                                const struct vkr_command_buffer *cmd,
+                                uint32_t binding,
+                                const struct vkr_buffer *buffer,
+                                VkDeviceSize offset)
+{
+   if (!vkr_winehua_capture_trace_enabled() ||
+       !vkr_winehua_capture_trace_allow())
+      return;
+
+   const struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
+   vkr_log("WineHuaCapture: %s cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR
+           " binding=%u bufferId=%" PRIu64 " hostBuffer=0x%" PRIxPTR
+           " memoryId=%" PRIu64 " memoryOffset=%" PRIu64 " bindOffset=%" PRIu64,
+           kind, cmd ? cmd->base.id : 0,
+           cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0, binding,
+           buffer ? buffer->base.id : 0,
+           buffer ? (uintptr_t)buffer->base.handle.buffer : 0,
+           mem ? mem->base.id : 0,
+           buffer ? (uint64_t)buffer->bound_memory_offset : 0,
+           (uint64_t)offset);
+}
+
+static void
+vkr_winehua_log_image_copy(const char *kind,
+                           const struct vkr_command_buffer *cmd,
+                           const struct vkr_buffer *buffer,
+                           const struct vkr_image *image,
+                           VkImageLayout layout,
+                           uint32_t region_count,
+                           const VkBufferImageCopy *regions)
+{
+   if (!vkr_winehua_capture_trace_enabled())
+      return;
+
+   for (uint32_t i = 0; i < region_count; i++) {
+      if (!vkr_winehua_capture_trace_allow())
+         break;
+      const VkBufferImageCopy *region = &regions[i];
+      vkr_log("WineHuaCapture: %s cmdId=%" PRIu64
+              " hostCmd=0x%" PRIxPTR " bufferId=%" PRIu64
+              " hostBuffer=0x%" PRIxPTR " imageId=%" PRIu64
+              " hostImage=0x%" PRIxPTR " format=%u usage=0x%x layout=%u"
+              " region=%u bufferOffset=%" PRIu64 " rowLength=%u imageHeight=%u"
+              " aspect=0x%x mip=%u baseLayer=%u layers=%u"
+              " imageOffset=%d,%d,%d extent=%u,%u,%u",
+              kind, cmd ? cmd->base.id : 0,
+              cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+              buffer ? buffer->base.id : 0,
+              buffer ? (uintptr_t)buffer->base.handle.buffer : 0,
+              image ? image->base.id : 0,
+              image ? (uintptr_t)image->base.handle.image : 0,
+              image ? image->format : VK_FORMAT_UNDEFINED,
+              image ? image->usage : 0, layout, i,
+              (uint64_t)region->bufferOffset, region->bufferRowLength,
+              region->bufferImageHeight,
+              region->imageSubresource.aspectMask,
+              region->imageSubresource.mipLevel,
+              region->imageSubresource.baseArrayLayer,
+              region->imageSubresource.layerCount,
+              region->imageOffset.x, region->imageOffset.y, region->imageOffset.z,
+              region->imageExtent.width, region->imageExtent.height,
+              region->imageExtent.depth);
+   }
+}
+
+static void
+vkr_winehua_log_buffer_copy(const struct vkr_command_buffer *cmd,
+                             const struct vkr_buffer *src,
+                             const struct vkr_buffer *dst,
+                             uint32_t region_count,
+                             const VkBufferCopy *regions)
+{
+   if (!vkr_winehua_capture_trace_enabled())
+      return;
+
+   const struct vkr_device_memory *src_mem = src ? src->bound_memory : NULL;
+   const struct vkr_device_memory *dst_mem = dst ? dst->bound_memory : NULL;
+   for (uint32_t i = 0; i < region_count; i++) {
+      if (!vkr_winehua_capture_trace_allow())
+         break;
+      const VkBufferCopy *region = &regions[i];
+      vkr_log("WineHuaCapture: copy-buffer cmdId=%" PRIu64
+              " hostCmd=0x%" PRIxPTR " srcBufferId=%" PRIu64
+              " hostSrcBuffer=0x%" PRIxPTR " srcMemoryId=%" PRIu64
+              " srcHostMemory=0x%" PRIxPTR " srcBindOffset=%" PRIu64
+              " dstBufferId=%" PRIu64 " hostDstBuffer=0x%" PRIxPTR
+              " dstMemoryId=%" PRIu64 " dstHostMemory=0x%" PRIxPTR
+              " dstBindOffset=%" PRIu64 " region=%u srcOffset=%" PRIu64
+              " dstOffset=%" PRIu64 " size=%" PRIu64,
+              cmd ? cmd->base.id : 0,
+              cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+              src ? src->base.id : 0,
+              src ? (uintptr_t)src->base.handle.buffer : 0,
+              src_mem ? src_mem->base.id : 0,
+              src_mem ? (uintptr_t)src_mem->base.handle.device_memory : 0,
+              src ? (uint64_t)src->bound_memory_offset : 0,
+              dst ? dst->base.id : 0,
+              dst ? (uintptr_t)dst->base.handle.buffer : 0,
+              dst_mem ? dst_mem->base.id : 0,
+              dst_mem ? (uintptr_t)dst_mem->base.handle.device_memory : 0,
+              dst ? (uint64_t)dst->bound_memory_offset : 0,
+              i, (uint64_t)region->srcOffset,
+              (uint64_t)region->dstOffset, (uint64_t)region->size);
+   }
+}
 
 static void
 vkr_dispatch_vkCreateCommandPool(struct vn_dispatch_context *dispatch,
@@ -145,6 +304,16 @@ static void
 vkr_dispatch_vkCmdBindPipeline(UNUSED struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCmdBindPipeline *args)
 {
+   if (vkr_winehua_capture_trace_enabled() && vkr_winehua_capture_trace_allow()) {
+      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+      const struct vkr_pipeline *pipeline = vkr_pipeline_from_handle(args->pipeline);
+      vkr_log("WineHuaCapture: bind-pipeline cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR
+              " bindPoint=%u pipelineId=%" PRIu64 " hostPipeline=0x%" PRIxPTR,
+              cmd ? cmd->base.id : 0,
+              cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+              args->pipelineBindPoint, pipeline ? pipeline->base.id : 0,
+              pipeline ? (uintptr_t)pipeline->base.handle.pipeline : 0);
+   }
    VKR_CMD_CALL(CmdBindPipeline, args, args->pipelineBindPoint, args->pipeline);
 }
 
@@ -218,15 +387,39 @@ static void
 vkr_dispatch_vkCmdBindDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
                                      struct vn_command_vkCmdBindDescriptorSets *args)
 {
-   VKR_CMD_CALL(CmdBindDescriptorSets, args, args->pipelineBindPoint, args->layout,
-                args->firstSet, args->descriptorSetCount, args->pDescriptorSets,
-                args->dynamicOffsetCount, args->pDynamicOffsets);
+   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+
+   if (vkr_winehua_capture_trace_enabled()) {
+      for (uint32_t i = 0; i < args->descriptorSetCount; i++) {
+         const struct vkr_descriptor_set *set =
+            vkr_descriptor_set_from_handle(args->pDescriptorSets[i]);
+         if (!vkr_winehua_capture_trace_allow())
+            break;
+         vkr_log("WineHuaCapture: bind-descriptor cmdId=%" PRIu64
+                 " hostCmd=0x%" PRIxPTR " firstSet=%u setIndex=%u setId=%" PRIu64
+                 " hostSet=0x%" PRIxPTR " bindPoint=%u dynamicOffsets=%u",
+                 cmd ? cmd->base.id : 0,
+                 cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+                 args->firstSet, i, set ? set->base.id : 0,
+                 set ? (uintptr_t)set->base.handle.descriptor_set : 0,
+                 args->pipelineBindPoint, args->dynamicOffsetCount);
+      }
+   }
+
+   vn_replace_vkCmdBindDescriptorSets_args_handle(args);
+   cmd->device->proc_table.CmdBindDescriptorSets(
+      args->commandBuffer, args->pipelineBindPoint, args->layout, args->firstSet,
+      args->descriptorSetCount, args->pDescriptorSets, args->dynamicOffsetCount,
+      args->pDynamicOffsets);
 }
 
 static void
 vkr_dispatch_vkCmdBindIndexBuffer(UNUSED struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkCmdBindIndexBuffer *args)
 {
+   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+   struct vkr_buffer *buffer = vkr_buffer_from_handle(args->buffer);
+   vkr_winehua_log_buffer_binding("bind-index", cmd, 0, buffer, args->offset);
    VKR_CMD_CALL(CmdBindIndexBuffer, args, args->buffer, args->offset, args->indexType);
 }
 
@@ -234,6 +427,14 @@ static void
 vkr_dispatch_vkCmdBindVertexBuffers(UNUSED struct vn_dispatch_context *dispatch,
                                     struct vn_command_vkCmdBindVertexBuffers *args)
 {
+   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+   if (vkr_winehua_capture_trace_enabled()) {
+      for (uint32_t i = 0; i < args->bindingCount; i++)
+         vkr_winehua_log_buffer_binding("bind-vertex", cmd,
+                                         args->firstBinding + i,
+                                         vkr_buffer_from_handle(args->pBuffers[i]),
+                                         args->pOffsets[i]);
+   }
    VKR_CMD_CALL(CmdBindVertexBuffers, args, args->firstBinding, args->bindingCount,
                 args->pBuffers, args->pOffsets);
 }
@@ -242,6 +443,15 @@ static void
 vkr_dispatch_vkCmdDraw(UNUSED struct vn_dispatch_context *dispatch,
                        struct vn_command_vkCmdDraw *args)
 {
+   if (vkr_winehua_capture_trace_enabled() && vkr_winehua_capture_trace_allow()) {
+      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+      vkr_log("WineHuaCapture: draw cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR
+              " vertices=%u instances=%u firstVertex=%u firstInstance=%u",
+              cmd ? cmd->base.id : 0,
+              cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+              args->vertexCount, args->instanceCount, args->firstVertex,
+              args->firstInstance);
+   }
    VKR_CMD_CALL(CmdDraw, args, args->vertexCount, args->instanceCount, args->firstVertex,
                 args->firstInstance);
 }
@@ -250,6 +460,15 @@ static void
 vkr_dispatch_vkCmdDrawIndexed(UNUSED struct vn_dispatch_context *dispatch,
                               struct vn_command_vkCmdDrawIndexed *args)
 {
+   if (vkr_winehua_capture_trace_enabled() && vkr_winehua_capture_trace_allow()) {
+      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+      vkr_log("WineHuaCapture: draw-indexed cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR
+              " indices=%u instances=%u firstIndex=%u vertexOffset=%d firstInstance=%u",
+              cmd ? cmd->base.id : 0,
+              cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+              args->indexCount, args->instanceCount, args->firstIndex,
+              args->vertexOffset, args->firstInstance);
+   }
    VKR_CMD_CALL(CmdDrawIndexed, args, args->indexCount, args->instanceCount,
                 args->firstIndex, args->vertexOffset, args->firstInstance);
 }
@@ -289,6 +508,11 @@ static void
 vkr_dispatch_vkCmdCopyBuffer(UNUSED struct vn_dispatch_context *dispatch,
                              struct vn_command_vkCmdCopyBuffer *args)
 {
+   vkr_winehua_log_buffer_copy(
+      vkr_command_buffer_from_handle(args->commandBuffer),
+      vkr_buffer_from_handle(args->srcBuffer),
+      vkr_buffer_from_handle(args->dstBuffer),
+      args->regionCount, args->pRegions);
    VKR_CMD_CALL(CmdCopyBuffer, args, args->srcBuffer, args->dstBuffer, args->regionCount,
                 args->pRegions);
 }
@@ -334,6 +558,12 @@ static void
 vkr_dispatch_vkCmdCopyBufferToImage(UNUSED struct vn_dispatch_context *dispatch,
                                     struct vn_command_vkCmdCopyBufferToImage *args)
 {
+   vkr_winehua_log_image_copy(
+      "copy-buffer-to-image",
+      vkr_command_buffer_from_handle(args->commandBuffer),
+      vkr_buffer_from_handle(args->srcBuffer),
+      vkr_image_from_handle(args->dstImage), args->dstImageLayout,
+      args->regionCount, args->pRegions);
    VKR_CMD_CALL(CmdCopyBufferToImage, args, args->srcBuffer, args->dstImage,
                 args->dstImageLayout, args->regionCount, args->pRegions);
 }
@@ -349,6 +579,12 @@ static void
 vkr_dispatch_vkCmdCopyImageToBuffer(UNUSED struct vn_dispatch_context *dispatch,
                                     struct vn_command_vkCmdCopyImageToBuffer *args)
 {
+   vkr_winehua_log_image_copy(
+      "copy-image-to-buffer",
+      vkr_command_buffer_from_handle(args->commandBuffer),
+      vkr_buffer_from_handle(args->dstBuffer),
+      vkr_image_from_handle(args->srcImage), args->srcImageLayout,
+      args->regionCount, args->pRegions);
    VKR_CMD_CALL(CmdCopyImageToBuffer, args, args->srcImage, args->srcImageLayout,
                 args->dstBuffer, args->regionCount, args->pRegions);
 }
@@ -444,6 +680,33 @@ static void
 vkr_dispatch_vkCmdPipelineBarrier(UNUSED struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkCmdPipelineBarrier *args)
 {
+   if (vkr_winehua_capture_trace_enabled()) {
+      struct vkr_command_buffer *cmd =
+         vkr_command_buffer_from_handle(args->commandBuffer);
+      for (uint32_t i = 0; i < args->imageMemoryBarrierCount; i++) {
+         if (!vkr_winehua_capture_trace_allow())
+            break;
+         const VkImageMemoryBarrier *barrier = &args->pImageMemoryBarriers[i];
+         const struct vkr_image *image = vkr_image_from_handle(barrier->image);
+         vkr_log("WineHuaCapture: image-barrier cmdId=%" PRIu64
+                 " hostCmd=0x%" PRIxPTR " imageId=%" PRIu64
+                 " hostImage=0x%" PRIxPTR " srcStage=0x%x dstStage=0x%x"
+                 " srcAccess=0x%x dstAccess=0x%x oldLayout=%u newLayout=%u"
+                 " aspect=0x%x baseMip=%u levels=%u baseLayer=%u layers=%u",
+                 cmd ? cmd->base.id : 0,
+                 cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+                 image ? image->base.id : 0,
+                 image ? (uintptr_t)image->base.handle.image : 0,
+                 args->srcStageMask, args->dstStageMask,
+                 barrier->srcAccessMask, barrier->dstAccessMask,
+                 barrier->oldLayout, barrier->newLayout,
+                 barrier->subresourceRange.aspectMask,
+                 barrier->subresourceRange.baseMipLevel,
+                 barrier->subresourceRange.levelCount,
+                 barrier->subresourceRange.baseArrayLayer,
+                 barrier->subresourceRange.layerCount);
+      }
+   }
    VKR_CMD_CALL(CmdPipelineBarrier, args, args->srcStageMask, args->dstStageMask,
                 args->dependencyFlags, args->memoryBarrierCount, args->pMemoryBarriers,
                 args->bufferMemoryBarrierCount, args->pBufferMemoryBarriers,
@@ -501,6 +764,29 @@ static void
 vkr_dispatch_vkCmdBeginRenderPass(UNUSED struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkCmdBeginRenderPass *args)
 {
+   if (vkr_winehua_capture_trace_enabled() && vkr_winehua_capture_trace_allow()) {
+      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+      const VkRenderPassBeginInfo *begin = args->pRenderPassBegin;
+      const struct vkr_render_pass *pass =
+         begin ? vkr_render_pass_from_handle(begin->renderPass) : NULL;
+      const struct vkr_framebuffer *fb =
+         begin ? vkr_framebuffer_from_handle(begin->framebuffer) : NULL;
+      vkr_log("WineHuaCapture: begin-render-pass cmdId=%" PRIu64
+              " hostCmd=0x%" PRIxPTR " passId=%" PRIu64 " hostPass=0x%" PRIxPTR
+              " framebufferId=%" PRIu64 " hostFramebuffer=0x%" PRIxPTR
+              " area=%d,%d %ux%u clearValues=%u contents=%u",
+              cmd ? cmd->base.id : 0,
+              cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+              pass ? pass->base.id : 0,
+              pass ? (uintptr_t)pass->base.handle.render_pass : 0,
+              fb ? fb->base.id : 0,
+              fb ? (uintptr_t)fb->base.handle.framebuffer : 0,
+              begin ? begin->renderArea.offset.x : 0,
+              begin ? begin->renderArea.offset.y : 0,
+              begin ? begin->renderArea.extent.width : 0,
+              begin ? begin->renderArea.extent.height : 0,
+              begin ? begin->clearValueCount : 0, args->contents);
+   }
    VKR_CMD_CALL(CmdBeginRenderPass, args, args->pRenderPassBegin, args->contents);
 }
 
@@ -515,6 +801,12 @@ static void
 vkr_dispatch_vkCmdEndRenderPass(UNUSED struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkCmdEndRenderPass *args)
 {
+   if (vkr_winehua_capture_trace_enabled() && vkr_winehua_capture_trace_allow()) {
+      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+      vkr_log("WineHuaCapture: end-render-pass cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR,
+              cmd ? cmd->base.id : 0,
+              cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0);
+   }
    VKR_CMD_CALL(CmdEndRenderPass, args);
 }
 
@@ -546,6 +838,29 @@ static void
 vkr_dispatch_vkCmdBeginRenderPass2(UNUSED struct vn_dispatch_context *dispatch,
                                    struct vn_command_vkCmdBeginRenderPass2 *args)
 {
+   if (vkr_winehua_capture_trace_enabled() && vkr_winehua_capture_trace_allow()) {
+      struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+      const VkRenderPassBeginInfo *begin = args->pRenderPassBegin;
+      const struct vkr_render_pass *pass =
+         begin ? vkr_render_pass_from_handle(begin->renderPass) : NULL;
+      const struct vkr_framebuffer *fb =
+         begin ? vkr_framebuffer_from_handle(begin->framebuffer) : NULL;
+      vkr_log("WineHuaCapture: begin-render-pass2 cmdId=%" PRIu64
+              " hostCmd=0x%" PRIxPTR " passId=%" PRIu64 " hostPass=0x%" PRIxPTR
+              " framebufferId=%" PRIu64 " hostFramebuffer=0x%" PRIxPTR
+              " area=%d,%d %ux%u clearValues=%u",
+              cmd ? cmd->base.id : 0,
+              cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+              pass ? pass->base.id : 0,
+              pass ? (uintptr_t)pass->base.handle.render_pass : 0,
+              fb ? fb->base.id : 0,
+              fb ? (uintptr_t)fb->base.handle.framebuffer : 0,
+              begin ? begin->renderArea.offset.x : 0,
+              begin ? begin->renderArea.offset.y : 0,
+              begin ? begin->renderArea.extent.width : 0,
+              begin ? begin->renderArea.extent.height : 0,
+              begin ? begin->clearValueCount : 0);
+   }
    VKR_CMD_CALL(CmdBeginRenderPass2, args, args->pRenderPassBegin,
                 args->pSubpassBeginInfo);
 }

@@ -6,6 +6,7 @@
 #include "vkr_device_memory.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef __OHOS__
@@ -18,8 +19,10 @@
 #include "venus-protocol/vn_protocol_renderer_transport.h"
 
 #include "vkr_device_memory_gen.h"
+#include "vkr_buffer.h"
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
+#include "vkr_queue.h"
 
 static VkResult
 vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
@@ -29,12 +32,6 @@ static VkResult
 vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
                                           VkDeviceSize offset,
                                           VkDeviceSize size);
-
-struct vkr_shadow_sync_stats {
-   uint64_t bytes;
-   uint32_t copies;
-   uint32_t cache_ops;
-};
 
 #ifdef __OHOS__
 static atomic_uint_fast64_t vkr_ohos_shadow_to_host_sync_count;
@@ -47,6 +44,354 @@ vkr_ohos_shadow_trace_enabled(void)
    return value && value[0] == '1' && !value[1];
 }
 
+static bool
+vkr_ohos_shadow_submit_unmap_large_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_SUBMIT_UNMAP_LARGE");
+   return value && value[0] == '1' && !value[1];
+}
+
+static bool
+vkr_ohos_shadow_msync_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_MSYNC");
+   return value && value[0] == '1' && !value[1];
+}
+
+static bool
+vkr_ohos_shadow_upload_wait_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_GPU_UPLOAD_WAIT");
+   return value && value[0] == '1' && !value[1];
+}
+
+static bool
+vkr_ohos_shadow_dirty_list_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_DIRTY_LIST");
+   return !(value && value[0] == '0' && !value[1]);
+}
+
+static bool
+vkr_ohos_shadow_bound_buffer_list_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_BOUND_BUFFER_LIST");
+   return value && value[0] == '1' && !value[1];
+}
+
+static bool
+vkr_ohos_shadow_defer_host_copy_enabled(const struct vkr_device *dev)
+{
+   const char *value = os_get_option("VKR_WINEHUA_GPU_UPLOAD_INLINE");
+   return vkr_device_memory_gpu_upload_enabled(dev) &&
+      value && value[0] == '1' && !value[1];
+}
+
+/* A dirty mapped allocation is already copied into Host memory by the
+ * remote-flush bridge.  Flushing one VkMappedMemoryRange per allocation adds
+ * one Venus/Host call for every dynamic allocation touched by a submit.  Keep
+ * the cache-domain transition, but batch ranges belonging to the same device.
+ * The caller falls back to the old per-allocation path on overflow, mixed
+ * devices, or a failed batch call. */
+static bool
+vkr_ohos_shadow_batch_flush_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_BATCH_FLUSH");
+   return !(value && value[0] == '0' && !value[1]);
+}
+
+static bool
+vkr_ohos_shadow_merge_ranges_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_MERGE_RANGES");
+   return !(value && value[0] == '0' && !value[1]);
+}
+
+static int
+vkr_ohos_shadow_dirty_range_compare(const void *lhs_ptr, const void *rhs_ptr)
+{
+   const struct vkr_ohos_shadow_dirty_range *lhs = lhs_ptr;
+   const struct vkr_ohos_shadow_dirty_range *rhs = rhs_ptr;
+   if (lhs->offset < rhs->offset)
+      return -1;
+   if (lhs->offset > rhs->offset)
+      return 1;
+   if (lhs->size < rhs->size)
+      return -1;
+   if (lhs->size > rhs->size)
+      return 1;
+   return 0;
+}
+
+static void
+vkr_ohos_record_shadow_upload_range(struct vn_device_proc_table *vk,
+                                    VkCommandBuffer command,
+                                    const struct vkr_buffer *buffer,
+                                    const struct vkr_device_memory *mem,
+                                    VkDeviceSize relative_begin,
+                                    VkDeviceSize relative_end,
+                                    uint32_t *update_count,
+                                    uint64_t *upload_bytes)
+{
+   VkDeviceSize remaining = relative_end - relative_begin;
+   VkDeviceSize dst_offset = relative_begin;
+   const uint8_t *source = mem->shadow_host_copy_deferred &&
+      mem->shadow_upload_snapshot
+      ? mem->shadow_upload_snapshot : mem->shadow_map;
+   const uint8_t *data = source + buffer->bound_memory_offset +
+      relative_begin;
+
+   while (remaining) {
+      VkDeviceSize chunk = MIN2(remaining, (VkDeviceSize)65536);
+      chunk &= ~(VkDeviceSize)3;
+      if (!chunk)
+         break;
+      vk->CmdUpdateBuffer(command, buffer->base.handle.buffer, dst_offset,
+                          chunk, data);
+      (*update_count)++;
+      *upload_bytes += chunk;
+      remaining -= chunk;
+      dst_offset += chunk;
+      data += chunk;
+   }
+}
+
+struct vkr_ohos_shadow_upload_record {
+   struct vn_device_proc_table *vk;
+   VkCommandBuffer command;
+   struct vkr_device *device;
+   bool merge_ranges;
+   uint32_t update_count;
+   uint32_t upload_range_count;
+   uint64_t upload_bytes;
+};
+
+struct vkr_ohos_shadow_dirty_summary {
+   uint64_t bytes;
+   uint32_t allocation_count;
+   uint32_t range_count;
+   uint32_t range_overflow_count;
+};
+
+static bool
+vkr_ohos_shadow_dirty_ranges_buffer_covered(
+   const struct vkr_device_memory *mem)
+{
+   const VkDeviceSize allocation_size = MIN2(
+      mem->allocation_size, mem->shadow_size);
+   for (uint32_t range_index = 0;
+        range_index < mem->shadow_dirty_range_count;
+        range_index++) {
+      const struct vkr_ohos_shadow_dirty_range *range =
+         &mem->shadow_dirty_ranges[range_index];
+      VkDeviceSize cursor = MIN2(range->offset, allocation_size);
+      const VkDeviceSize range_size = MIN2(
+         range->size, allocation_size - cursor);
+      const VkDeviceSize range_end = cursor + range_size;
+
+      while (cursor < range_end) {
+         VkDeviceSize covered_end = cursor;
+         list_for_each_entry (struct vkr_buffer, buffer,
+                              &mem->bound_buffers, memory_head) {
+            if (buffer->bound_memory != mem ||
+                !(buffer->host_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+               continue;
+
+            const VkDeviceSize buffer_begin = MIN2(
+               buffer->bound_memory_offset, allocation_size);
+            const VkDeviceSize buffer_size = MIN2(
+               buffer->size, allocation_size - buffer_begin);
+            const VkDeviceSize buffer_end = buffer_begin + buffer_size;
+            if (buffer_begin <= cursor && buffer_end > covered_end)
+               covered_end = MIN2(buffer_end, range_end);
+         }
+         if (covered_end == cursor)
+            return false;
+         cursor = covered_end;
+      }
+   }
+   return mem->shadow_dirty_range_count > 0;
+}
+
+static void
+vkr_ohos_prepare_shadow_dirty_memory(
+   struct vkr_device_memory *mem,
+   struct vkr_device *device,
+   struct vkr_ohos_shadow_dirty_summary *summary)
+{
+   if (mem->device != device || !mem->shadow_host_dirty)
+      return;
+
+   mem->shadow_gpu_upload_covered = false;
+   /* Every precise dirty range must be represented by transfer-dst buffers
+    * before the mapped Host copy can be skipped. */
+   mem->shadow_gpu_upload_full_coverage = false;
+   summary->allocation_count++;
+   if (mem->shadow_dirty_range_overflow || !mem->shadow_dirty_range_count) {
+      summary->range_overflow_count++;
+      return;
+   }
+
+   if (mem->shadow_dirty_range_count > 1)
+      qsort(mem->shadow_dirty_ranges, mem->shadow_dirty_range_count,
+            sizeof(*mem->shadow_dirty_ranges),
+            vkr_ohos_shadow_dirty_range_compare);
+   summary->range_count += mem->shadow_dirty_range_count;
+   for (uint32_t i = 0; i < mem->shadow_dirty_range_count; i++)
+      summary->bytes += mem->shadow_dirty_ranges[i].size;
+   mem->shadow_gpu_upload_full_coverage =
+      vkr_ohos_shadow_dirty_ranges_buffer_covered(mem);
+}
+
+static void
+vkr_ohos_record_shadow_upload_buffer(
+   struct vkr_ohos_shadow_upload_record *record,
+   struct vkr_buffer *buffer)
+{
+   struct vkr_device_memory *mem = buffer->bound_memory;
+   if (!mem || mem->device != record->device || !mem->shadow_host_dirty ||
+       !mem->shadow_map || !mem->shadow_size ||
+       mem->shadow_dirty_range_overflow ||
+       !mem->shadow_dirty_range_count ||
+       !(buffer->host_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+      return;
+
+   const VkDeviceSize allocation_size = MIN2(
+      mem->allocation_size, mem->shadow_size);
+   const VkDeviceSize buffer_begin = MIN2(
+      buffer->bound_memory_offset, allocation_size);
+   const VkDeviceSize buffer_size = MIN2(
+      buffer->size, allocation_size - buffer_begin);
+   const VkDeviceSize buffer_end = buffer_begin + buffer_size;
+
+   bool pending = false;
+   VkDeviceSize pending_begin = 0;
+   VkDeviceSize pending_end = 0;
+   for (uint32_t range_index = 0;
+        range_index < mem->shadow_dirty_range_count;
+        range_index++) {
+      const struct vkr_ohos_shadow_dirty_range *range =
+         &mem->shadow_dirty_ranges[range_index];
+      const VkDeviceSize dirty_begin = MIN2(range->offset, allocation_size);
+      const VkDeviceSize dirty_size = MIN2(
+         range->size, allocation_size - dirty_begin);
+      const VkDeviceSize dirty_end = dirty_begin + dirty_size;
+      const VkDeviceSize intersection_begin =
+         MAX2(dirty_begin, buffer_begin);
+      const VkDeviceSize intersection_end = MIN2(dirty_end, buffer_end);
+      if (intersection_end <= intersection_begin)
+         continue;
+
+      VkDeviceSize relative_begin = intersection_begin - buffer_begin;
+      VkDeviceSize relative_end = intersection_end - buffer_begin;
+      relative_begin &= ~(VkDeviceSize)3;
+      relative_end = MIN2(ALIGN(relative_end, 4), buffer_size);
+      relative_end &= ~(VkDeviceSize)3;
+      if (relative_end <= relative_begin)
+         continue;
+
+      mem->shadow_gpu_upload_covered = true;
+      record->upload_range_count++;
+      if (!record->merge_ranges) {
+         vkr_ohos_record_shadow_upload_range(
+            record->vk, record->command, buffer, mem, relative_begin,
+            relative_end, &record->update_count, &record->upload_bytes);
+         continue;
+      }
+
+      if (!pending) {
+         pending_begin = relative_begin;
+         pending_end = relative_end;
+         pending = true;
+      } else if (relative_begin <= pending_end) {
+         pending_end = MAX2(pending_end, relative_end);
+      } else {
+         vkr_ohos_record_shadow_upload_range(
+            record->vk, record->command, buffer, mem, pending_begin,
+            pending_end, &record->update_count, &record->upload_bytes);
+         pending_begin = relative_begin;
+         pending_end = relative_end;
+      }
+   }
+   if (pending)
+      vkr_ohos_record_shadow_upload_range(
+         record->vk, record->command, buffer, mem, pending_begin,
+         pending_end, &record->update_count, &record->upload_bytes);
+}
+
+#define VKR_OHOS_SHADOW_BATCH_MAX_RANGES 256u
+
+struct vkr_ohos_shadow_flush_batch {
+   struct vkr_device *device;
+   VkMappedMemoryRange ranges[VKR_OHOS_SHADOW_BATCH_MAX_RANGES];
+   uint32_t count;
+   bool overflow;
+};
+
+static bool
+vkr_ohos_shadow_flush_batch_add(
+   struct vkr_ohos_shadow_flush_batch *batch,
+   struct vkr_device_memory *mem)
+{
+   if (!mem->host_map || !mem->shadow_map || !mem->shadow_size ||
+       !mem->shadow_remote_active || !mem->shadow_host_dirty ||
+       !mem->shadow_dirty_size ||
+       (vkr_device_memory_gpu_upload_enabled(mem->device) &&
+        mem->shadow_gpu_upload_full_coverage))
+      return true;
+
+   if ((batch->device && batch->device != mem->device) ||
+       batch->count >= VKR_OHOS_SHADOW_BATCH_MAX_RANGES) {
+      batch->overflow = true;
+      return false;
+   }
+
+   if (!batch->device)
+      batch->device = mem->device;
+
+   batch->ranges[batch->count++] = (VkMappedMemoryRange) {
+      .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+      .memory = mem->base.handle.device_memory,
+      .offset = mem->shadow_dirty_offset,
+      .size = mem->shadow_dirty_size,
+   };
+   return true;
+}
+
+static VkResult
+vkr_ohos_shadow_flush_batch_submit(
+   const struct vkr_ohos_shadow_flush_batch *batch)
+{
+   if (!batch->count || batch->overflow || !batch->device)
+      return batch->overflow ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
+
+   struct vn_device_proc_table *vk = &batch->device->proc_table;
+   return vk->FlushMappedMemoryRanges(
+      batch->device->base.handle.device, batch->count, batch->ranges);
+}
+
+static void
+vkr_ohos_shadow_dirty_list_remove(struct vkr_device_memory *mem)
+{
+   if (!mem->shadow_dirty_listed)
+      return;
+
+   list_del(&mem->shadow_dirty_head);
+   list_inithead(&mem->shadow_dirty_head);
+   mem->shadow_dirty_listed = false;
+}
+
+static void
+vkr_ohos_shadow_dirty_list_add(struct vkr_device_memory *mem)
+{
+   if (!mem->context || mem->shadow_dirty_listed ||
+       !vkr_ohos_shadow_dirty_list_enabled())
+      return;
+
+   list_addtail(&mem->shadow_dirty_head, &mem->context->shadow_dirty_memories);
+   mem->shadow_dirty_listed = true;
+}
+
 static uint64_t
 vkr_ohos_now_ns(void)
 {
@@ -55,7 +400,100 @@ vkr_ohos_now_ns(void)
       return 0;
    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
+
+static uint32_t
+vkr_ohos_fnv1a32(const void *data, size_t size)
+{
+   const uint8_t *bytes = data;
+   uint32_t hash = 2166136261u;
+   for (size_t i = 0; i < size; i++) {
+      hash ^= bytes[i];
+      hash *= 16777619u;
+   }
+   return hash;
+}
+
+#define VKR_OHOS_MAX_SHADOW_DIRTY_RANGES 4096u
+
+static bool
+vkr_ohos_record_shadow_dirty_range(struct vkr_device_memory *mem,
+                                   VkDeviceSize offset,
+                                   VkDeviceSize size)
+{
+   if (!size)
+      return true;
+   if (mem->shadow_dirty_range_overflow)
+      return false;
+
+   VkDeviceSize begin = offset;
+   VkDeviceSize end = offset + size;
+   for (uint32_t i = 0; i < mem->shadow_dirty_range_count;) {
+      const struct vkr_ohos_shadow_dirty_range *range =
+         &mem->shadow_dirty_ranges[i];
+      const VkDeviceSize range_begin = range->offset;
+      const VkDeviceSize range_end = range->offset + range->size;
+      if (end < range_begin || begin > range_end) {
+         i++;
+         continue;
+      }
+
+      begin = MIN2(begin, range_begin);
+      end = MAX2(end, range_end);
+      mem->shadow_dirty_ranges[i] =
+         mem->shadow_dirty_ranges[--mem->shadow_dirty_range_count];
+      i = 0;
+   }
+
+   if (mem->shadow_dirty_range_count == mem->shadow_dirty_range_capacity) {
+      if (mem->shadow_dirty_range_capacity >=
+          VKR_OHOS_MAX_SHADOW_DIRTY_RANGES) {
+         mem->shadow_dirty_range_overflow = true;
+         vkr_log("OHOS shadow precise dirty range overflow guestMemory=%" PRIu64
+                 " count=%u",
+                 (uint64_t)mem->base.id, mem->shadow_dirty_range_count);
+         return false;
+      }
+      uint32_t new_capacity = mem->shadow_dirty_range_capacity
+         ? mem->shadow_dirty_range_capacity * 2 : 16;
+      new_capacity = MIN2(new_capacity, VKR_OHOS_MAX_SHADOW_DIRTY_RANGES);
+      struct vkr_ohos_shadow_dirty_range *new_ranges = realloc(
+         mem->shadow_dirty_ranges, sizeof(*new_ranges) * new_capacity);
+      if (!new_ranges) {
+         mem->shadow_dirty_range_overflow = true;
+         vkr_log("OHOS shadow precise dirty range allocation failed guestMemory=%"
+                 PRIu64 " capacity=%u",
+                 (uint64_t)mem->base.id, new_capacity);
+         return false;
+      }
+      mem->shadow_dirty_ranges = new_ranges;
+      mem->shadow_dirty_range_capacity = new_capacity;
+   }
+
+   mem->shadow_dirty_ranges[mem->shadow_dirty_range_count++] =
+      (struct vkr_ohos_shadow_dirty_range) {
+         .offset = begin,
+         .size = end - begin,
+      };
+   return true;
+}
 #endif
+
+bool
+vkr_device_memory_gpu_upload_enabled(const struct vkr_device *dev)
+{
+#ifdef __OHOS__
+   const char *value = os_get_option("VKR_WINEHUA_GPU_UPLOAD");
+   if (value && value[0] == '1' && !value[1])
+      return true;
+   if (value && value[0] == '0' && !value[1])
+      return false;
+   return dev && dev->physical_device &&
+          dev->physical_device->winehua_shadow_gpu_upload_quirk;
+#else
+   (void)dev;
+   return false;
+#endif
+}
 
 static bool
 vkr_get_fd_info_from_resource_info(struct vkr_context *ctx,
@@ -467,6 +905,7 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->allocation_size = alloc_info->allocationSize;
    mem->memory_type_index = mem_type_index;
 #ifdef __OHOS__
+   mem->context = ctx;
    mem->shadow_fd = -1;
    mem->shadow_map = NULL;
    mem->host_map = NULL;
@@ -480,6 +919,17 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->shadow_initial_sync_done = false;
    mem->shadow_dirty_offset = 0;
    mem->shadow_dirty_size = 0;
+   mem->shadow_dirty_ranges = NULL;
+   mem->shadow_dirty_range_count = 0;
+   mem->shadow_dirty_range_capacity = 0;
+   mem->shadow_dirty_range_overflow = false;
+   list_inithead(&mem->shadow_dirty_head);
+   mem->shadow_dirty_listed = false;
+   list_inithead(&mem->bound_buffers);
+   mem->shadow_upload_snapshot = NULL;
+   mem->shadow_host_copy_deferred = false;
+   mem->shadow_gpu_upload_covered = false;
+   mem->shadow_gpu_upload_full_coverage = false;
    mem->shadow_pending_copy_bytes = 0;
    mem->shadow_pending_copy_count = 0;
 #endif
@@ -661,6 +1111,20 @@ void
 vkr_device_memory_release(struct vkr_device_memory *mem)
 {
 #ifdef __OHOS__
+   if (mem->context) {
+      mtx_lock(&mem->context->object_mutex);
+      vkr_ohos_shadow_dirty_list_remove(mem);
+      list_for_each_entry_safe (struct vkr_buffer, buffer,
+                                &mem->bound_buffers, memory_head) {
+         list_del(&buffer->memory_head);
+         list_inithead(&buffer->memory_head);
+         buffer->memory_listed = false;
+         buffer->bound_memory = NULL;
+         buffer->bound_memory_offset = 0;
+      }
+      mtx_unlock(&mem->context->object_mutex);
+   }
+
    if (mem->host_map) {
       struct vn_device_proc_table *vk = &mem->device->proc_table;
       vk->UnmapMemory(mem->device->base.handle.device,
@@ -675,6 +1139,13 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
       close(mem->shadow_fd);
       mem->shadow_fd = -1;
    }
+   free(mem->shadow_dirty_ranges);
+   mem->shadow_dirty_ranges = NULL;
+   free(mem->shadow_upload_snapshot);
+   mem->shadow_upload_snapshot = NULL;
+   mem->shadow_host_copy_deferred = false;
+   mem->shadow_dirty_range_count = 0;
+   mem->shadow_dirty_range_capacity = 0;
 #endif
    vkr_mtl_shm_free(mem->mtl_shm);
    if (mem->gbm_bo)
@@ -901,7 +1372,8 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
 }
 
 static struct vkr_shadow_sync_stats
-vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
+vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
+                              bool host_flush_prepared)
 {
    struct vkr_shadow_sync_stats stats = { 0 };
 #ifdef __OHOS__
@@ -922,9 +1394,79 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
       to_host_mode && (!strcmp(to_host_mode, "explicit") ||
                        !strcmp(to_host_mode, "explicit-only"));
 
+   /* CmdUpdateBuffer has already copied this exact mapped range into the
+    * Host buffer.  Do not repeat the same bytes through vkMapMemory.  The
+    * dirty state is retired here so later submits do not rescan it. */
+   if (to_host && mem->shadow_remote_active && mem->shadow_host_dirty &&
+       vkr_device_memory_gpu_upload_enabled(mem->device) &&
+       mem->shadow_gpu_upload_full_coverage) {
+      stats.gpu_upload_skipped_bytes = mem->shadow_pending_copy_bytes;
+      stats.gpu_upload_skipped_copies = mem->shadow_pending_copy_count;
+      if (vkr_ohos_shadow_trace_enabled())
+         vkr_log("OHOS shadow host sync skipped gpu-upload-covered guestMemory=%" PRIu64
+                 " bytes=%" PRIu64 " copies=%u",
+                 (uint64_t)mem->base.id, stats.gpu_upload_skipped_bytes,
+                 stats.gpu_upload_skipped_copies);
+      mem->shadow_pending_copy_bytes = 0;
+      mem->shadow_pending_copy_count = 0;
+      mem->shadow_host_dirty = false;
+      mem->shadow_dirty_range_count = 0;
+      mem->shadow_dirty_range_overflow = false;
+      mem->shadow_host_copy_deferred = false;
+      mem->shadow_gpu_upload_full_coverage = false;
+      vkr_ohos_shadow_dirty_list_remove(mem);
+      return stats;
+   }
+
    if (to_host && mem->shadow_remote_active) {
-      if (!mem->shadow_host_dirty)
+      if (!mem->shadow_host_dirty) {
+         vkr_ohos_shadow_dirty_list_remove(mem);
          return stats;
+      }
+
+      if (vkr_ohos_shadow_trace_enabled()) {
+         const VkDeviceSize available = MIN2(mem->shadow_size,
+                                             mem->allocation_size);
+         const VkDeviceSize trace_offset = MIN2(mem->shadow_dirty_offset,
+                                                available);
+         const VkDeviceSize trace_size = MIN2(mem->shadow_dirty_size,
+                                              available - trace_offset);
+         const uint8_t *shadow = mem->shadow_map;
+         const uint8_t *host = mem->host_map;
+         const uint32_t shadow_hash = vkr_ohos_fnv1a32(
+            shadow + trace_offset, (size_t)trace_size);
+         const uint32_t host_hash = vkr_ohos_fnv1a32(
+            host + trace_offset, (size_t)trace_size);
+         vkr_log("OHOS shadow submit-input guestMemory=%" PRIu64
+                 " hostMemory=0x%" PRIxPTR " offset=%" PRIu64
+                 " size=%" PRIu64 " shadowFnv=0x%08x hostFnv=0x%08x"
+                 " equal=%u",
+                 (uint64_t)mem->base.id,
+                 (uintptr_t)mem->base.handle.device_memory,
+                 (uint64_t)trace_offset, (uint64_t)trace_size,
+                 shadow_hash, host_hash, shadow_hash == host_hash);
+      }
+
+      if (mem->shadow_host_copy_deferred &&
+          mem->shadow_upload_snapshot) {
+         if (!mem->shadow_dirty_range_overflow &&
+             mem->shadow_dirty_range_count) {
+            for (uint32_t i = 0; i < mem->shadow_dirty_range_count; i++) {
+               const struct vkr_ohos_shadow_dirty_range *copy_range =
+                  &mem->shadow_dirty_ranges[i];
+               memcpy((uint8_t *)mem->host_map + copy_range->offset,
+                      (const uint8_t *)mem->shadow_upload_snapshot +
+                         copy_range->offset,
+                      (size_t)copy_range->size);
+            }
+         } else {
+            memcpy((uint8_t *)mem->host_map + mem->shadow_dirty_offset,
+                   (const uint8_t *)mem->shadow_upload_snapshot +
+                      mem->shadow_dirty_offset,
+                   (size_t)mem->shadow_dirty_size);
+         }
+         mem->shadow_host_copy_deferred = false;
+      }
 
       const VkMappedMemoryRange dirty_range = {
          .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
@@ -932,19 +1474,58 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
          .offset = mem->shadow_dirty_offset,
          .size = mem->shadow_dirty_size,
       };
-      VkResult dirty_result = vk->FlushMappedMemoryRanges(
-         mem->device->base.handle.device, 1, &dirty_range);
+      if (vkr_ohos_shadow_msync_enabled()) {
+         const uintptr_t page_size = (uintptr_t)getpagesize();
+         const uintptr_t begin =
+            (uintptr_t)mem->host_map + (uintptr_t)mem->shadow_dirty_offset;
+         const uintptr_t end = begin + (uintptr_t)mem->shadow_dirty_size;
+         const uintptr_t page_begin = begin & ~(page_size - 1u);
+         const uintptr_t page_end = (end + page_size - 1u) & ~(page_size - 1u);
+         errno = 0;
+         const int msync_result = msync((void *)page_begin,
+                                        page_end - page_begin, MS_SYNC);
+         vkr_log("OHOS shadow dirty msync guestMemory=%" PRIu64
+                 " offset=%" PRIu64 " size=%" PRIu64
+                 " pageBytes=%" PRIuPTR " result=%d errno=%d",
+                 (uint64_t)mem->base.id,
+                 (uint64_t)mem->shadow_dirty_offset,
+                 (uint64_t)mem->shadow_dirty_size,
+                 page_end - page_begin, msync_result,
+                 msync_result ? errno : 0);
+      }
+      VkResult dirty_result = host_flush_prepared ? VK_SUCCESS :
+         vk->FlushMappedMemoryRanges(mem->device->base.handle.device, 1,
+                                     &dirty_range);
       if (dirty_result != VK_SUCCESS)
          vkr_log("OHOS shadow dirty flush failed result=%d offset=%" PRIu64
                  " size=%" PRIu64,
                  dirty_result, (uint64_t)mem->shadow_dirty_offset,
                  (uint64_t)mem->shadow_dirty_size);
+      if (vkr_ohos_shadow_submit_unmap_large_enabled() &&
+          mem->allocation_size >= 1024u * 1024u) {
+         void *old_host_map = mem->host_map;
+         vk->UnmapMemory(mem->device->base.handle.device,
+                         mem->base.handle.device_memory);
+         mem->host_map = NULL;
+         vkr_log("OHOS shadow submit unmap-large guestMemory=%" PRIu64
+                 " hostMemory=0x%" PRIxPTR " bytes=%" PRIu64
+                 " oldMap=%p",
+                 (uint64_t)mem->base.id,
+                 (uintptr_t)mem->base.handle.device_memory,
+                 (uint64_t)mem->shadow_dirty_size,
+                 old_host_map);
+      }
       stats.bytes = mem->shadow_pending_copy_bytes;
       stats.copies = mem->shadow_pending_copy_count;
       stats.cache_ops = 1;
       mem->shadow_pending_copy_bytes = 0;
       mem->shadow_pending_copy_count = 0;
       mem->shadow_host_dirty = false;
+      mem->shadow_dirty_range_count = 0;
+      mem->shadow_dirty_range_overflow = false;
+      mem->shadow_host_copy_deferred = false;
+      mem->shadow_gpu_upload_full_coverage = false;
+      vkr_ohos_shadow_dirty_list_remove(mem);
       return stats;
    }
 
@@ -1030,11 +1611,17 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host)
          vkr_log("OHOS shadow invalidate failed result=%d coherent=%d size=%zu",
                  result, coherent, copy_size);
       memcpy(mem->shadow_map, mem->host_map, copy_size);
+      if (mem->shadow_upload_snapshot)
+         memcpy(mem->shadow_upload_snapshot, mem->host_map, copy_size);
       stats.bytes = copy_size;
       stats.copies = copy_size ? 1 : 0;
       stats.cache_ops = 1;
-      if (mem->shadow_remote_active)
+      if (mem->shadow_remote_active) {
          mem->shadow_host_dirty = false;
+         mem->shadow_dirty_range_count = 0;
+         mem->shadow_dirty_range_overflow = false;
+         vkr_ohos_shadow_dirty_list_remove(mem);
+      }
    }
 #else
    (void)mem;
@@ -1058,14 +1645,39 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
    if (offset > mem->allocation_size)
       return VK_ERROR_MEMORY_MAP_FAILED;
 
-   const VkDeviceSize available = mem->allocation_size - offset;
+   const VkDeviceSize available = MIN2(
+      mem->allocation_size - offset,
+      mem->shadow_size > offset ? mem->shadow_size - offset : 0);
    const VkDeviceSize copy_size = size == VK_WHOLE_SIZE
       ? available
       : MIN2(size, available);
 
-   memcpy((uint8_t *)mem->host_map + offset,
-          (const uint8_t *)mem->shadow_map + offset,
-          (size_t)copy_size);
+   bool deferred_copy = false;
+   if (copy_size && vkr_ohos_shadow_defer_host_copy_enabled(mem->device)) {
+      if (!mem->shadow_upload_snapshot) {
+         const size_t snapshot_size = (size_t)MIN2(
+            mem->shadow_size, mem->allocation_size);
+         mem->shadow_upload_snapshot = malloc(snapshot_size);
+         if (mem->shadow_upload_snapshot)
+            memcpy(mem->shadow_upload_snapshot, mem->host_map,
+                   snapshot_size);
+         else
+            vkr_log("OHOS shadow upload snapshot allocation failed bytes=%" PRIu64,
+                    mem->shadow_size);
+      }
+      if (mem->shadow_upload_snapshot) {
+         memcpy((uint8_t *)mem->shadow_upload_snapshot + offset,
+                (const uint8_t *)mem->shadow_map + offset,
+                (size_t)copy_size);
+         mem->shadow_host_copy_deferred = true;
+         deferred_copy = true;
+      }
+   }
+   if (!deferred_copy)
+      memcpy((uint8_t *)mem->host_map + offset,
+             (const uint8_t *)mem->shadow_map + offset,
+             (size_t)copy_size);
+   vkr_ohos_record_shadow_dirty_range(mem, offset, copy_size);
    mem->shadow_pending_copy_bytes += copy_size;
    if (copy_size)
       mem->shadow_pending_copy_count++;
@@ -1083,6 +1695,7 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
       mem->shadow_dirty_offset = dirtyBegin;
       mem->shadow_dirty_size = dirtyEnd - dirtyBegin;
    }
+   vkr_ohos_shadow_dirty_list_add(mem);
 
    if (mem->shadow_guest_write_depth)
       mem->shadow_guest_write_depth--;
@@ -1109,8 +1722,8 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
 
 static VkResult
 vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
-                                          VkDeviceSize offset,
-                                          VkDeviceSize size)
+                                           VkDeviceSize offset,
+                                           VkDeviceSize size)
 {
 #ifdef __OHOS__
    if (!mem->host_map || !mem->shadow_map || !mem->shadow_size)
@@ -1138,10 +1751,30 @@ vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
    VkResult result = vk->InvalidateMappedMemoryRanges(
       mem->device->base.handle.device, 1, &range);
    if (result == VK_SUCCESS) {
+      const uint32_t host_hash = vkr_ohos_shadow_trace_enabled()
+         ? vkr_ohos_fnv1a32((const uint8_t *)mem->host_map + offset,
+                            (size_t)copy_size)
+         : 0;
       memcpy((uint8_t *)mem->shadow_map + offset,
              (const uint8_t *)mem->host_map + offset,
              (size_t)copy_size);
+      if (mem->shadow_upload_snapshot)
+         memcpy((uint8_t *)mem->shadow_upload_snapshot + offset,
+                (const uint8_t *)mem->host_map + offset,
+                (size_t)copy_size);
       mem->shadow_remote_active = true;
+      if (vkr_ohos_shadow_trace_enabled()) {
+         const uint32_t shadow_hash = vkr_ohos_fnv1a32(
+            (const uint8_t *)mem->shadow_map + offset, (size_t)copy_size);
+         vkr_log("OHOS shadow invalidate-output guestMemory=%" PRIu64
+                 " hostMemory=0x%" PRIxPTR " offset=%" PRIu64
+                 " size=%" PRIu64 " hostFnv=0x%08x shadowFnv=0x%08x"
+                 " equal=%u",
+                 (uint64_t)mem->base.id,
+                 (uintptr_t)mem->base.handle.device_memory,
+                 (uint64_t)offset, (uint64_t)copy_size,
+                 host_hash, shadow_hash, host_hash == shadow_hash);
+      }
    }
 
    const uint32_t count = mem->shadow_remote_invalidate_count++;
@@ -1159,24 +1792,525 @@ vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
    return VK_SUCCESS;
 #endif
 }
-static void
-vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
+
+#ifdef __OHOS__
+static VkResult
+vkr_device_memory_init_shadow_upload(struct vkr_queue *queue,
+                                     struct vkr_shadow_upload_slot *slot)
+{
+   struct vkr_device *dev = queue->device;
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   VkDevice device = dev->base.handle.device;
+
+   if (queue->shadow_upload_inline && !queue->shadow_upload_timeline) {
+      if (!vk->WaitSemaphores)
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+
+      const VkSemaphoreTypeCreateInfo type_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+         .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+         .initialValue = 0,
+      };
+      const VkSemaphoreCreateInfo semaphore_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+         .pNext = &type_info,
+      };
+      VkResult result = vk->CreateSemaphore(
+         device, &semaphore_info, NULL, &queue->shadow_upload_timeline);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   if (!slot->pool) {
+      const VkCommandPoolCreateInfo pool_info = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+         .queueFamilyIndex = queue->family,
+      };
+      VkResult result = vk->CreateCommandPool(
+         device, &pool_info, NULL, &slot->pool);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   if (!slot->command) {
+      const VkCommandBufferAllocateInfo alloc_info = {
+         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+         .commandPool = slot->pool,
+         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+         .commandBufferCount = 1,
+      };
+      VkResult result = vk->AllocateCommandBuffers(
+         device, &alloc_info, &slot->command);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   if (!slot->fence) {
+      const VkFenceCreateInfo fence_info = {
+         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+      };
+      VkResult result = vk->CreateFence(
+         device, &fence_info, NULL, &slot->fence);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   return VK_SUCCESS;
+}
+#endif
+
+VkResult
+vkr_device_memory_prepare_shadow_upload(struct vkr_context *ctx,
+                                        struct vkr_queue *queue,
+                                        bool perf_timing)
 {
 #ifdef __OHOS__
-   const uint64_t start_ns = vkr_ohos_now_ns();
-   struct vkr_shadow_sync_stats total = { 0 };
-   uint32_t scanned = 0;
+   queue->shadow_upload_prepared = false;
+   queue->shadow_upload_bytes = 0;
+   queue->shadow_upload_updates = 0;
+   queue->shadow_upload_ranges = 0;
+   if (perf_timing) {
+      queue->shadow_upload_wait_us = 0;
+      queue->shadow_upload_reset_begin_us = 0;
+      queue->shadow_upload_dirty_scan_us = 0;
+      queue->shadow_upload_buffer_record_us = 0;
+      queue->shadow_upload_uncovered_scan_us = 0;
+      queue->shadow_upload_end_us = 0;
+   }
+   if (!vkr_device_memory_gpu_upload_enabled(queue->device))
+      return VK_SUCCESS;
+
+   struct vkr_device *dev = queue->device;
+   const bool use_dirty_list = vkr_ohos_shadow_dirty_list_enabled();
+   if (use_dirty_list) {
+      bool has_dirty = false;
+      mtx_lock(&ctx->object_mutex);
+      list_for_each_entry (struct vkr_device_memory, mem,
+                           &ctx->shadow_dirty_memories,
+                           shadow_dirty_head) {
+         if (mem->device == dev && mem->shadow_host_dirty) {
+            has_dirty = true;
+            break;
+         }
+      }
+      mtx_unlock(&ctx->object_mutex);
+      if (!has_dirty)
+         return VK_SUCCESS;
+   }
+
+   struct vn_device_proc_table *vk = &dev->proc_table;
+   VkDevice device = dev->base.handle.device;
+   struct vkr_shadow_upload_slot *slot =
+      &queue->shadow_upload_slots[queue->shadow_upload_slot];
+   VkResult result = vkr_device_memory_init_shadow_upload(queue, slot);
+   if (result != VK_SUCCESS) {
+      vkr_log("OHOS shadow GPU upload init failed result=%d", result);
+      return result;
+   }
+
+   uint64_t phase_start_ns = perf_timing ? vkr_ohos_now_ns() : 0;
+   if (slot->in_flight) {
+      if (queue->shadow_upload_inline && slot->retire_value) {
+         const VkSemaphoreWaitInfo wait_info = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .semaphoreCount = 1,
+            .pSemaphores = &queue->shadow_upload_timeline,
+            .pValues = &slot->retire_value,
+         };
+         result = vk->WaitSemaphores(device, &wait_info, 3000000000ull);
+      } else {
+         result = vk->WaitForFences(device, 1, &slot->fence,
+                                    true, 3000000000ull);
+      }
+      const uint64_t wait_end_ns = perf_timing ? vkr_ohos_now_ns() : 0;
+      if (perf_timing) {
+         queue->shadow_upload_wait_us = wait_end_ns >= phase_start_ns
+            ? (wait_end_ns - phase_start_ns) / 1000 : 0;
+         phase_start_ns = wait_end_ns;
+      }
+      if (result != VK_SUCCESS) {
+         vkr_log("OHOS shadow GPU upload wait failed result=%d", result);
+         return result;
+      }
+      slot->in_flight = false;
+      if (!queue->shadow_upload_inline || !slot->retire_value) {
+         result = vk->ResetFences(device, 1, &slot->fence);
+         if (result != VK_SUCCESS) {
+            vkr_log("OHOS shadow GPU upload fence reset failed result=%d", result);
+            return result;
+         }
+      }
+      slot->retire_value = 0;
+   }
+
+   result = vk->ResetCommandPool(device, slot->pool, 0);
+   if (result != VK_SUCCESS) {
+      vkr_log("OHOS shadow GPU upload pool reset failed result=%d", result);
+      return result;
+   }
+
+   const VkCommandBufferBeginInfo begin_info = {
+      .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+      .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+   };
+   result = vk->BeginCommandBuffer(slot->command, &begin_info);
+   if (result != VK_SUCCESS) {
+      vkr_log("OHOS shadow GPU upload begin failed result=%d", result);
+      return result;
+   }
+   uint64_t phase_end_ns = perf_timing ? vkr_ohos_now_ns() : 0;
+   if (perf_timing) {
+      queue->shadow_upload_reset_begin_us = phase_end_ns >= phase_start_ns
+         ? (phase_end_ns - phase_start_ns) / 1000 : 0;
+      phase_start_ns = phase_end_ns;
+   }
+
+   struct vkr_ohos_shadow_dirty_summary dirty = { 0 };
+   uint32_t uncovered_allocation_count = 0;
+   mtx_lock(&ctx->object_mutex);
+   if (use_dirty_list) {
+      list_for_each_entry (struct vkr_device_memory, mem,
+                           &ctx->shadow_dirty_memories,
+                           shadow_dirty_head) {
+         vkr_ohos_prepare_shadow_dirty_memory(mem, dev, &dirty);
+      }
+   } else {
+      hash_table_foreach (ctx->object_table, entry) {
+         struct vkr_object *obj = entry->data;
+         if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY)
+            vkr_ohos_prepare_shadow_dirty_memory(
+               (struct vkr_device_memory *)obj, dev, &dirty);
+      }
+   }
+
+   if (dirty.allocation_count) {
+      const VkMemoryBarrier barrier = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                          VK_ACCESS_MEMORY_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+      };
+      /* The upload command is inserted between Guest submissions on the same
+       * queue.  Order prior GPU reads before overwriting a reused dynamic
+       * buffer; submission order alone does not resolve the memory hazard. */
+      vk->CmdPipelineBarrier(slot->command,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &barrier, 0, NULL, 0, NULL);
+   }
+   phase_end_ns = perf_timing ? vkr_ohos_now_ns() : 0;
+   if (perf_timing) {
+      queue->shadow_upload_dirty_scan_us = phase_end_ns >= phase_start_ns
+         ? (phase_end_ns - phase_start_ns) / 1000 : 0;
+      phase_start_ns = phase_end_ns;
+   }
+
+   struct vkr_ohos_shadow_upload_record record = {
+      .vk = vk,
+      .command = slot->command,
+      .device = dev,
+      .merge_ranges = vkr_ohos_shadow_merge_ranges_enabled(),
+   };
+   if (use_dirty_list && vkr_ohos_shadow_bound_buffer_list_enabled()) {
+      list_for_each_entry (struct vkr_device_memory, mem,
+                           &ctx->shadow_dirty_memories,
+                           shadow_dirty_head) {
+         if (mem->device != dev || !mem->shadow_host_dirty)
+            continue;
+         list_for_each_entry (struct vkr_buffer, buffer,
+                              &mem->bound_buffers, memory_head) {
+            vkr_ohos_record_shadow_upload_buffer(&record, buffer);
+         }
+      }
+   } else {
+      hash_table_foreach (ctx->object_table, entry) {
+         struct vkr_object *obj = entry->data;
+         if (obj->type == VK_OBJECT_TYPE_BUFFER)
+            vkr_ohos_record_shadow_upload_buffer(
+               &record, (struct vkr_buffer *)obj);
+      }
+   }
+   phase_end_ns = perf_timing ? vkr_ohos_now_ns() : 0;
+   if (perf_timing) {
+      queue->shadow_upload_buffer_record_us = phase_end_ns >= phase_start_ns
+         ? (phase_end_ns - phase_start_ns) / 1000 : 0;
+      phase_start_ns = phase_end_ns;
+   }
+
+   if (use_dirty_list) {
+      list_for_each_entry (struct vkr_device_memory, mem,
+                           &ctx->shadow_dirty_memories,
+                           shadow_dirty_head) {
+         if (mem->device == dev && mem->shadow_host_dirty &&
+             mem->shadow_gpu_upload_full_coverage &&
+             !mem->shadow_gpu_upload_covered)
+            mem->shadow_gpu_upload_full_coverage = false;
+         if (mem->device == dev && mem->shadow_host_dirty &&
+             !mem->shadow_gpu_upload_covered)
+            uncovered_allocation_count++;
+      }
+   } else {
+      hash_table_foreach (ctx->object_table, entry) {
+         struct vkr_object *obj = entry->data;
+         if (obj->type != VK_OBJECT_TYPE_DEVICE_MEMORY)
+            continue;
+         struct vkr_device_memory *mem = (struct vkr_device_memory *)obj;
+         if (mem->device == dev && mem->shadow_host_dirty &&
+             mem->shadow_gpu_upload_full_coverage &&
+             !mem->shadow_gpu_upload_covered)
+            mem->shadow_gpu_upload_full_coverage = false;
+         if (mem->device == dev && mem->shadow_host_dirty &&
+             !mem->shadow_gpu_upload_covered)
+            uncovered_allocation_count++;
+      }
+   }
+   mtx_unlock(&ctx->object_mutex);
+   phase_end_ns = perf_timing ? vkr_ohos_now_ns() : 0;
+   if (perf_timing) {
+      queue->shadow_upload_uncovered_scan_us = phase_end_ns >= phase_start_ns
+         ? (phase_end_ns - phase_start_ns) / 1000 : 0;
+      phase_start_ns = phase_end_ns;
+   }
+
+   if (record.update_count) {
+      const VkMemoryBarrier barrier = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+         .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT |
+                          VK_ACCESS_MEMORY_WRITE_BIT,
+      };
+      vk->CmdPipelineBarrier(slot->command,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             0, 1, &barrier, 0, NULL, 0, NULL);
+   }
+
+   result = vk->EndCommandBuffer(slot->command);
+   phase_end_ns = perf_timing ? vkr_ohos_now_ns() : 0;
+   if (perf_timing)
+      queue->shadow_upload_end_us = phase_end_ns >= phase_start_ns
+         ? (phase_end_ns - phase_start_ns) / 1000 : 0;
+   if (result != VK_SUCCESS) {
+      vkr_log("OHOS shadow GPU upload end failed result=%d", result);
+      return result;
+   }
+
+   queue->shadow_upload_bytes = record.upload_bytes;
+   queue->shadow_upload_updates = record.update_count;
+   queue->shadow_upload_ranges = record.upload_range_count;
+   queue->shadow_upload_prepared = record.update_count > 0;
+   if (vkr_ohos_shadow_trace_enabled() && dirty.allocation_count)
+      vkr_log("OHOS shadow GPU upload prepared ranges=%u updates=%u bytes=%" PRIu64
+              " dirty_allocations=%u dirty_ranges=%u dirty_bytes=%" PRIu64
+              " uncovered_allocations=%u overflow_allocations=%u",
+              record.upload_range_count, record.update_count,
+              record.upload_bytes, dirty.allocation_count, dirty.range_count,
+              dirty.bytes, uncovered_allocation_count,
+              dirty.range_overflow_count);
+   return VK_SUCCESS;
+#else
+   (void)ctx;
+   (void)queue;
+   (void)perf_timing;
+   return VK_SUCCESS;
+#endif
+}
+
+VkResult
+vkr_device_memory_submit_shadow_upload(struct vkr_queue *queue)
+{
+#ifdef __OHOS__
+   if (!queue->shadow_upload_prepared)
+      return VK_SUCCESS;
+
+   struct vn_device_proc_table *vk = &queue->device->proc_table;
+   const uint32_t slot_index = queue->shadow_upload_slot;
+   struct vkr_shadow_upload_slot *slot =
+      &queue->shadow_upload_slots[slot_index];
+   const VkSubmitInfo submit_info = {
+      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .commandBufferCount = 1,
+      .pCommandBuffers = &slot->command,
+   };
+   VkResult result = vk->QueueSubmit(queue->base.handle.queue, 1,
+                                     &submit_info,
+                                     slot->fence);
+   queue->shadow_upload_prepared = false;
+   if (result == VK_SUCCESS) {
+      slot->in_flight = true;
+      queue->shadow_upload_slot =
+         (slot_index + 1) % VKR_WINEHUA_SHADOW_UPLOAD_SLOT_COUNT;
+      if (vkr_ohos_shadow_upload_wait_enabled()) {
+         const uint64_t wait_start_ns = vkr_ohos_now_ns();
+         result = vk->WaitForFences(queue->device->base.handle.device, 1,
+                                    &slot->fence, true,
+                                    3000000000ull);
+         vkr_log("OHOS shadow GPU upload diagnostic wait result=%d elapsed_us=%"
+                 PRIu64 " updates=%u bytes=%" PRIu64,
+                 result, (vkr_ohos_now_ns() - wait_start_ns) / 1000,
+                 queue->shadow_upload_updates, queue->shadow_upload_bytes);
+      }
+   }
+   if (vkr_ohos_shadow_trace_enabled() || result != VK_SUCCESS)
+      vkr_log("OHOS shadow GPU upload submit result=%d updates=%u bytes=%" PRIu64,
+              result, queue->shadow_upload_updates,
+              queue->shadow_upload_bytes);
+   return result;
+#else
+   (void)queue;
+   return VK_SUCCESS;
+#endif
+}
+
+void
+vkr_device_memory_disable_shadow_upload_coverage(struct vkr_context *ctx)
+{
+#ifdef __OHOS__
+   if (!ctx)
+      return;
    mtx_lock(&ctx->object_mutex);
    hash_table_foreach (ctx->object_table, entry) {
       struct vkr_object *obj = entry->data;
-      if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY) {
+      if (obj->type != VK_OBJECT_TYPE_DEVICE_MEMORY)
+         continue;
+      struct vkr_device_memory *mem = (struct vkr_device_memory *)obj;
+      if (mem->shadow_host_dirty)
+         mem->shadow_gpu_upload_full_coverage = false;
+   }
+   mtx_unlock(&ctx->object_mutex);
+#else
+   (void)ctx;
+#endif
+}
+
+bool
+vkr_device_memory_requires_deferred_host_wait(struct vkr_context *ctx,
+                                              struct vkr_device *dev)
+{
+#ifdef __OHOS__
+   if (!ctx || !dev)
+      return false;
+
+   bool required = false;
+   mtx_lock(&ctx->object_mutex);
+   if (vkr_ohos_shadow_dirty_list_enabled()) {
+      list_for_each_entry (struct vkr_device_memory, mem,
+                           &ctx->shadow_dirty_memories,
+                           shadow_dirty_head) {
+         if (mem->device == dev && mem->shadow_host_dirty &&
+             mem->shadow_host_copy_deferred &&
+             !mem->shadow_gpu_upload_full_coverage) {
+            required = true;
+            break;
+         }
+      }
+   } else {
+      hash_table_foreach (ctx->object_table, entry) {
+         struct vkr_object *obj = entry->data;
+         if (obj->type != VK_OBJECT_TYPE_DEVICE_MEMORY)
+            continue;
+         struct vkr_device_memory *mem =
+            (struct vkr_device_memory *)obj;
+         if (mem->device == dev && mem->shadow_host_dirty &&
+             mem->shadow_host_copy_deferred &&
+             !mem->shadow_gpu_upload_full_coverage) {
+            required = true;
+            break;
+         }
+      }
+   }
+   mtx_unlock(&ctx->object_mutex);
+   return required;
+#else
+   (void)ctx;
+   (void)dev;
+   return false;
+#endif
+}
+
+static struct vkr_shadow_sync_stats
+vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
+{
+   struct vkr_shadow_sync_stats total = { 0 };
+#ifdef __OHOS__
+   const uint64_t start_ns = vkr_ohos_now_ns();
+   mtx_lock(&ctx->object_mutex);
+   const char *to_host_mode = os_get_option("VKR_WINEHUA_SHADOW_TO_HOST");
+   const bool explicit_to_host =
+      to_host_mode && (!strcmp(to_host_mode, "explicit") ||
+                       !strcmp(to_host_mode, "explicit-only"));
+   const bool use_dirty_list = to_host && !explicit_to_host &&
+      vkr_ohos_shadow_dirty_list_enabled();
+   struct vkr_ohos_shadow_flush_batch flush_batch = { 0 };
+   bool host_flush_prepared = false;
+
+   const char *inline_upload =
+      os_get_option("VKR_WINEHUA_GPU_UPLOAD_INLINE");
+   const bool defer_host_copy = inline_upload &&
+      inline_upload[0] == '1' && !inline_upload[1];
+   if (to_host && vkr_ohos_shadow_batch_flush_enabled() &&
+       !defer_host_copy) {
+      if (use_dirty_list) {
+         list_for_each_entry (struct vkr_device_memory, mem,
+                              &ctx->shadow_dirty_memories,
+                              shadow_dirty_head) {
+            if (!vkr_ohos_shadow_flush_batch_add(&flush_batch, mem))
+               break;
+         }
+      } else {
+         hash_table_foreach (ctx->object_table, entry) {
+            struct vkr_object *obj = entry->data;
+            if (obj->type != VK_OBJECT_TYPE_DEVICE_MEMORY)
+               continue;
+            if (!vkr_ohos_shadow_flush_batch_add(
+                   &flush_batch, (struct vkr_device_memory *)obj))
+               break;
+         }
+      }
+
+      if (!flush_batch.overflow && flush_batch.count) {
+         const VkResult batch_result =
+            vkr_ohos_shadow_flush_batch_submit(&flush_batch);
+         if (batch_result == VK_SUCCESS) {
+            host_flush_prepared = true;
+            total.cache_ops++;
+         } else {
+            vkr_log("OHOS shadow batch flush failed result=%d ranges=%u; "
+                    "falling back to per-allocation flush",
+                    batch_result, flush_batch.count);
+         }
+      }
+   }
+
+   if (use_dirty_list) {
+      list_for_each_entry_safe (struct vkr_device_memory, mem,
+                                &ctx->shadow_dirty_memories,
+                                shadow_dirty_head) {
          const struct vkr_shadow_sync_stats stats =
-            vkr_device_memory_sync_shadow((struct vkr_device_memory *)obj,
-                                          to_host);
-         scanned++;
+            vkr_device_memory_sync_shadow(mem, to_host,
+                                          host_flush_prepared);
+         total.scanned++;
          total.bytes += stats.bytes;
          total.copies += stats.copies;
          total.cache_ops += stats.cache_ops;
+         total.gpu_upload_skipped_bytes += stats.gpu_upload_skipped_bytes;
+         total.gpu_upload_skipped_copies += stats.gpu_upload_skipped_copies;
+      }
+   } else {
+      hash_table_foreach (ctx->object_table, entry) {
+         struct vkr_object *obj = entry->data;
+         if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY) {
+            const struct vkr_shadow_sync_stats stats =
+               vkr_device_memory_sync_shadow((struct vkr_device_memory *)obj,
+                                             to_host, host_flush_prepared);
+            total.scanned++;
+            total.bytes += stats.bytes;
+            total.copies += stats.copies;
+            total.cache_ops += stats.cache_ops;
+            total.gpu_upload_skipped_bytes += stats.gpu_upload_skipped_bytes;
+            total.gpu_upload_skipped_copies += stats.gpu_upload_skipped_copies;
+         }
       }
    }
    mtx_unlock(&ctx->object_mutex);
@@ -1189,24 +2323,26 @@ vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
    const uint64_t end_ns = vkr_ohos_now_ns();
    const uint64_t elapsed_us = start_ns && end_ns >= start_ns
       ? (end_ns - start_ns) / 1000 : 0;
+   total.elapsed_us = elapsed_us;
    if (vkr_ohos_shadow_trace_enabled() &&
        (call_id <= 8 || !(call_id % 120) || elapsed_us >= 20000)) {
       vkr_log("OHOS shadow sync direction=%s call=%" PRIu64
               " scanned=%u copies=%u bytes=%" PRIu64
               " cache_ops=%u elapsed_us=%" PRIu64,
-              to_host ? "to-host" : "from-host", call_id, scanned,
+              to_host ? "to-host" : "from-host", call_id, total.scanned,
               total.copies, total.bytes, total.cache_ops, elapsed_us);
    }
 #else
    (void)ctx;
    (void)to_host;
 #endif
+   return total;
 }
 
-void
+struct vkr_shadow_sync_stats
 vkr_device_memory_sync_shadows_to_host(struct vkr_context *ctx)
 {
-   vkr_device_memory_sync_shadows(ctx, true);
+   return vkr_device_memory_sync_shadows(ctx, true);
 }
 
 void

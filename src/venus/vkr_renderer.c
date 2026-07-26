@@ -32,8 +32,17 @@ struct vkr_renderer_state {
 struct vkr_renderer_state vkr_state;
 static struct vkr_context *vkr_context_cache[64];
 
+static uint64_t
+vkr_winehua_now_us(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000ull +
+          (uint64_t)ts.tv_nsec / 1000ull;
+}
+
 static void
-vkr_winehua_stage(const char *stage)
+vkr_winehua_stage(const char *stage, uint32_t serial)
 {
    const char *trace = getenv("WINEHUA_VKR_PRESENT_STAGE_TRACE");
    if (!trace || trace[0] != '1')
@@ -44,13 +53,14 @@ vkr_winehua_stage(const char *stage)
    FILE *file = fopen(path, "a");
    if (!file)
       return;
-   fprintf(file, "[vkr-present] %s\n", stage);
+   fprintf(file, "[%llu] [vkr-present] serial=%u stage=%s\n",
+           (unsigned long long)vkr_winehua_now_us(), serial, stage);
    fflush(file);
    fclose(file);
 }
 
 static bool
-vkr_winehua_trylock(mtx_t *mutex, const char *busy_stage)
+vkr_winehua_trylock(mtx_t *mutex, const char *busy_stage, uint32_t serial)
 {
    /* Queue submit and the present command are serviced by different Venus
     * workers.  Returning EAGAIN on the first object-mutex collision drops the
@@ -63,7 +73,7 @@ vkr_winehua_trylock(mtx_t *mutex, const char *busy_stage)
       const struct timespec delay = {0, 1000000};
       nanosleep(&delay, NULL);
    }
-   vkr_winehua_stage(busy_stage);
+   vkr_winehua_stage(busy_stage, serial);
    return false;
 }
 
@@ -74,6 +84,7 @@ static void *vkr_winehua_present_callback_data;
 struct vkr_winehua_queue_guard {
    mtx_t *mutex;
    bool locked;
+   uint32_t serial;
 };
 
 static void
@@ -85,7 +96,7 @@ vkr_winehua_release_queue(void *data)
 
    guard->locked = false;
    mtx_unlock(guard->mutex);
-   vkr_winehua_stage("queue-released-by-present");
+   vkr_winehua_stage("queue-released-by-present", guard->serial);
 }
 
 size_t
@@ -137,6 +148,13 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs)
       return false;
 
    vkr_debug_init();
+
+   /* Keep the pipeline diagnostic self-describing.  The render server is a
+    * separate native child, so a guest-process environment record alone does
+    * not prove that this process received the option. */
+   if (getenv("WINEHUA_VKR_TRACE_PIPELINE"))
+      vkr_log("WineHuaPipeline: renderer trace enabled value=%s",
+              getenv("WINEHUA_VKR_TRACE_PIPELINE"));
 
    if (cbs->debug_logger)
       virgl_log_set_handler(cbs->debug_logger, NULL, NULL);
@@ -258,7 +276,7 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
                              uint32_t flags,
                              uint64_t *next_present_deadline_ns)
 {
-   vkr_winehua_stage("enter");
+   vkr_winehua_stage("enter", serial);
    if (next_present_deadline_ns)
       *next_present_deadline_ns = 0;
    if (!ctx_id || !queue_id || !image_id || !width || !height ||
@@ -275,26 +293,26 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
       return -EINVAL;
    }
 
-   vkr_winehua_stage("context-lock");
-   if (!vkr_winehua_trylock(&vkr_state.context_mutex, "context-busy")) {
-      vkr_winehua_stage("context-busy");
+   vkr_winehua_stage("context-lock", serial);
+   if (!vkr_winehua_trylock(&vkr_state.context_mutex, "context-busy", serial)) {
+      vkr_winehua_stage("context-busy", serial);
       return -EAGAIN;
    }
-   vkr_winehua_stage("context-locked");
+   vkr_winehua_stage("context-locked", serial);
    struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
    if (!ctx) {
-      vkr_winehua_stage("context-missing");
+      vkr_winehua_stage("context-missing", serial);
       mtx_unlock(&vkr_state.context_mutex);
       return -ESRCH;
    }
 
-   vkr_winehua_stage("object-lock");
-   if (!vkr_winehua_trylock(&ctx->object_mutex, "object-busy")) {
-      vkr_winehua_stage("object-busy");
+   vkr_winehua_stage("object-lock", serial);
+   if (!vkr_winehua_trylock(&ctx->object_mutex, "object-busy", serial)) {
+      vkr_winehua_stage("object-busy", serial);
       mtx_unlock(&vkr_state.context_mutex);
       return -EAGAIN;
    }
-   vkr_winehua_stage("object-locked");
+   vkr_winehua_stage("object-locked", serial);
    const struct hash_entry *queue_entry =
       _mesa_hash_table_search(ctx->object_table, &queue_id);
    const struct hash_entry *image_entry =
@@ -304,7 +322,8 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
    if (!queue_obj || queue_obj->type != VK_OBJECT_TYPE_QUEUE ||
        !image_obj || image_obj->type != VK_OBJECT_TYPE_IMAGE) {
       vkr_winehua_stage(!queue_obj ? "queue-missing" :
-                        !image_obj ? "image-missing" : "object-type-mismatch");
+                        !image_obj ? "image-missing" : "object-type-mismatch",
+                        serial);
       mtx_unlock(&ctx->object_mutex);
       mtx_unlock(&vkr_state.context_mutex);
       /* Object commands and the private socket command are asynchronous.  A
@@ -339,13 +358,13 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
       return -ENOSYS;
    }
 
-   vkr_winehua_stage("queue-lock");
-   if (!vkr_winehua_trylock(&queue->vk_mutex, "queue-busy")) {
+   vkr_winehua_stage("queue-lock", serial);
+   if (!vkr_winehua_trylock(&queue->vk_mutex, "queue-busy", serial)) {
       mtx_unlock(&ctx->object_mutex);
       mtx_unlock(&vkr_state.context_mutex);
       return -EAGAIN;
    }
-   vkr_winehua_stage("queue-locked");
+   vkr_winehua_stage("queue-locked", serial);
 
    const uintptr_t instance_handle = (uintptr_t)instance->base.handle.instance;
    const uintptr_t physical_device_handle =
@@ -354,7 +373,7 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
    const uintptr_t queue_handle = (uintptr_t)queue->base.handle.queue;
    const uint64_t image_handle = (uint64_t)(uintptr_t)image->base.handle.image;
    const uint32_t queue_family = queue->family;
-   vkr_winehua_stage("handles-ready");
+   vkr_winehua_stage("handles-ready", serial);
 
    /* Keep the queue externally synchronized with renderer QueueSubmit,
     * QueueSubmit2, QueueBindSparse and sync submissions. The callback calls
@@ -363,11 +382,12 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
     * while the platform compositor blocks in vkQueuePresentKHR. */
    mtx_unlock(&ctx->object_mutex);
    mtx_unlock(&vkr_state.context_mutex);
-   vkr_winehua_stage("object-locks-released");
+   vkr_winehua_stage("object-locks-released", serial);
 
    struct vkr_winehua_queue_guard queue_guard = {
       .mutex = &queue->vk_mutex,
       .locked = true,
+      .serial = serial,
    };
    const int ret = vkr_winehua_present_callback(
       ctx_id, instance_handle, physical_device_handle, device_handle,
@@ -376,7 +396,7 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
       vkr_winehua_release_queue, &queue_guard,
       vkr_winehua_present_callback_data);
    vkr_winehua_release_queue(&queue_guard);
-   vkr_winehua_stage("queue-unlocked");
+   vkr_winehua_stage("queue-unlocked", serial);
    return ret;
 }
 

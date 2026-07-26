@@ -6,6 +6,7 @@
 #include "vkr_buffer.h"
 
 #include "vkr_buffer_gen.h"
+#include "vkr_context.h"
 #include "vkr_device_memory.h"
 #include "vkr_physical_device.h"
 
@@ -15,6 +16,30 @@ struct vkr_winehua_buffer_binding {
    struct vkr_device_memory *memory;
    VkDeviceSize offset;
 };
+
+static void
+vkr_winehua_set_buffer_memory(struct vkr_context *ctx,
+                              struct vkr_buffer *buffer,
+                              struct vkr_device_memory *memory,
+                              VkDeviceSize offset)
+{
+   if (!buffer)
+      return;
+
+   mtx_lock(&ctx->object_mutex);
+   if (buffer->memory_listed) {
+      list_del(&buffer->memory_head);
+      list_inithead(&buffer->memory_head);
+      buffer->memory_listed = false;
+   }
+   buffer->bound_memory = memory;
+   buffer->bound_memory_offset = offset;
+   if (memory) {
+      list_addtail(&buffer->memory_head, &memory->bound_buffers);
+      buffer->memory_listed = true;
+   }
+   mtx_unlock(&ctx->object_mutex);
+}
 #endif
 
 static void
@@ -46,13 +71,37 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
     * vkr_physical_device_init_memory_properties as well.
     */
 
+#ifdef __OHOS__
+   const VkBufferCreateInfo *guest_info = args->pCreateInfo;
+   VkBufferCreateInfo host_info = *guest_info;
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   if (vkr_device_memory_gpu_upload_enabled(dev))
+      host_info.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+   args->pCreateInfo = &host_info;
+
+   struct vkr_buffer *buffer = vkr_buffer_create_and_add(dispatch->data, args);
+   if (buffer) {
+      buffer->bound_memory = NULL;
+      buffer->bound_memory_offset = 0;
+      buffer->size = guest_info->size;
+      buffer->guest_usage = guest_info->usage;
+      buffer->host_usage = host_info.usage;
+      list_inithead(&buffer->memory_head);
+      buffer->memory_listed = false;
+   }
+#else
    vkr_buffer_create_and_add(dispatch->data, args);
+#endif
 }
 
 static void
 vkr_dispatch_vkDestroyBuffer(struct vn_dispatch_context *dispatch,
                              struct vn_command_vkDestroyBuffer *args)
 {
+#ifdef __OHOS__
+   struct vkr_buffer *buffer = vkr_buffer_from_handle(args->buffer);
+   vkr_winehua_set_buffer_memory(dispatch->data, buffer, NULL, 0);
+#endif
    vkr_buffer_destroy_and_remove(dispatch->data, args);
 }
 
@@ -81,7 +130,7 @@ vkr_dispatch_vkGetBufferMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindBufferMemory(struct vn_dispatch_context *dispatch,
                                  struct vn_command_vkBindBufferMemory *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -97,14 +146,14 @@ vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
 #ifdef __OHOS__
    if (args->ret == VK_SUCCESS && buffer) {
-      buffer->bound_memory = memory;
-      buffer->bound_memory_offset = memory_offset;
+      vkr_winehua_set_buffer_memory(
+         dispatch->data, buffer, memory, memory_offset);
    }
 #endif
 }
 
 static void
-vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindBufferMemory2(struct vn_dispatch_context *dispatch,
                                  struct vn_command_vkBindBufferMemory2 *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -127,8 +176,9 @@ vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
    if (args->ret == VK_SUCCESS && bindings) {
       for (uint32_t i = 0; i < args->bindInfoCount; i++) {
          if (bindings[i].buffer) {
-            bindings[i].buffer->bound_memory = bindings[i].memory;
-            bindings[i].buffer->bound_memory_offset = bindings[i].offset;
+            vkr_winehua_set_buffer_memory(
+               dispatch->data, bindings[i].buffer, bindings[i].memory,
+               bindings[i].offset);
          }
       }
    }

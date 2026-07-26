@@ -10,12 +10,26 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 static bool
 vkr_winehua_option_enabled(const char *name)
 {
    const char *value = os_get_option(name);
    return value && !strcmp(value, "1");
+}
+
+static uint32_t
+vkr_winehua_fnv1a32(const void *data, size_t size)
+{
+   const uint8_t *bytes = data;
+   uint32_t hash = 2166136261u;
+
+   for (size_t i = 0; i < size; i++) {
+      hash ^= bytes[i];
+      hash *= 16777619u;
+   }
+   return hash;
 }
 
 /* Maleoon's Vulkan compiler mis-handles DXVK's binding-presence
@@ -113,6 +127,8 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
    VkShaderModuleCreateInfo frozen_info;
    uint32_t *frozen_code = NULL;
    bool frozen = false;
+   struct vkr_shader_module *obj;
+   const bool trace = vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_PIPELINE");
 
    /* Reject invalid codeSize.
     *
@@ -151,7 +167,29 @@ vkr_dispatch_vkCreateShaderModule(struct vn_dispatch_context *dispatch,
       }
    }
 
-   vkr_shader_module_create_and_add(dispatch->data, args);
+   const VkShaderModuleCreateInfo *effective = args->pCreateInfo;
+   const uint32_t word_count = (uint32_t)(effective->codeSize / sizeof(uint32_t));
+   const uint32_t code_hash = vkr_winehua_fnv1a32(effective->pCode,
+                                                   effective->codeSize);
+   const uint32_t first_word = word_count ? effective->pCode[0] : 0;
+   const uint32_t last_word = word_count ? effective->pCode[word_count - 1] : 0;
+
+   obj = vkr_shader_module_create_and_add(dispatch->data, args);
+   if (obj) {
+      obj->winehua_code_hash = code_hash;
+      obj->winehua_code_size = (uint32_t)effective->codeSize;
+      obj->winehua_first_word = first_word;
+      obj->winehua_last_word = last_word;
+   }
+   if (trace) {
+      vkr_log("WineHuaShader: create result=%d objectId=%" PRIu64
+              " hostModule=0x%" PRIxPTR " codeSize=%zu fnv1a32=0x%08x"
+              " first=0x%08x last=0x%08x frozen=%u",
+              args->ret, obj ? obj->base.id : 0,
+              obj ? (uintptr_t)obj->base.handle.shader_module : 0,
+              effective->codeSize, code_hash, first_word, last_word,
+              frozen ? 1u : 0u);
+   }
    args->pCreateInfo = original;
    free(frozen_code);
 }
@@ -225,9 +263,79 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct object_array arr;
+   const bool trace = vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_PIPELINE");
 
-   if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
+   if (trace) {
+      for (uint32_t i = 0; i < args->createInfoCount; i++) {
+         const VkGraphicsPipelineCreateInfo *info = &args->pCreateInfos[i];
+         vkr_log("WineHuaPipeline: create[%u] stages=%u layout=%llu renderPass=%llu subpass=%u vertexInput=%p inputAssembly=%p viewport=%p raster=%p multisample=%p blend=%p dynamic=%p",
+                 i, info->stageCount,
+                 (unsigned long long)(uintptr_t)info->layout,
+                 (unsigned long long)(uintptr_t)info->renderPass,
+                 info->subpass, (const void *)info->pVertexInputState,
+                 (const void *)info->pInputAssemblyState,
+                 (const void *)info->pViewportState,
+                 (const void *)info->pRasterizationState,
+                 (const void *)info->pMultisampleState,
+                 (const void *)info->pColorBlendState,
+                 (const void *)info->pDynamicState);
+         for (uint32_t j = 0; j < info->stageCount; j++) {
+            const struct vkr_shader_module *shader =
+               vkr_shader_module_from_handle(info->pStages[j].module);
+            const VkSpecializationInfo *spec =
+               info->pStages[j].pSpecializationInfo;
+            vkr_log("WineHuaPipeline: create[%u].stage[%u] flags=0x%x"
+                    " objectId=%" PRIu64 " hostModule=0x%" PRIxPTR
+                    " codeSize=%u fnv1a32=0x%08x first=0x%08x last=0x%08x"
+                    " entry=%s spec=%p",
+                    i, j, info->pStages[j].stage,
+                    shader ? shader->base.id : 0,
+                    shader ? (uintptr_t)shader->base.handle.shader_module : 0,
+                    shader ? shader->winehua_code_size : 0,
+                    shader ? shader->winehua_code_hash : 0,
+                    shader ? shader->winehua_first_word : 0,
+                    shader ? shader->winehua_last_word : 0,
+                    info->pStages[j].pName ? info->pStages[j].pName : "",
+                    (const void *)spec);
+            if (!spec) {
+               vkr_log("WineHuaPipeline: create[%u].stage[%u] specialization=null",
+                       i, j);
+               continue;
+            }
+            vkr_log("WineHuaPipeline: create[%u].stage[%u] specialization mapEntryCount=%u dataSize=%zu pData=%p",
+                    i, j, spec->mapEntryCount, spec->dataSize, spec->pData);
+            if (spec->mapEntryCount && !spec->pMapEntries) {
+               vkr_log("WineHuaPipeline: create[%u].stage[%u] specialization mapEntries=null",
+                       i, j);
+               continue;
+            }
+            for (uint32_t k = 0; k < spec->mapEntryCount; k++) {
+               const VkSpecializationMapEntry *entry = &spec->pMapEntries[k];
+               uint64_t value = 0;
+               const bool valid = spec->pData && entry->size <= sizeof(value) &&
+                  entry->offset <= spec->dataSize &&
+                  entry->size <= spec->dataSize - entry->offset;
+               if (valid)
+                  memcpy(&value, (const uint8_t *)spec->pData + entry->offset,
+                         entry->size);
+               vkr_log("WineHuaPipeline: create[%u].stage[%u] specialization[%u] constantID=%u offset=%u size=%zu value=0x%016" PRIx64 " valid=%u",
+                       i, j, k, entry->constantID, entry->offset, entry->size,
+                       value, valid ? 1u : 0u);
+            }
+         }
+      }
+   }
+
+   if (vkr_graphics_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS) {
+      if (trace)
+         vkr_log("WineHuaPipeline: vkCreateGraphicsPipelines returned %d",
+                 args->ret);
       return;
+   }
+
+   if (trace)
+      vkr_log("WineHuaPipeline: vkCreateGraphicsPipelines returned %d",
+              args->ret);
 
    vkr_pipeline_add_array(ctx, dev, &arr, args->pPipelines);
 }

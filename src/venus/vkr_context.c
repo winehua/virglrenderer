@@ -748,6 +748,10 @@ vkr_context_create(uint32_t ctx_id,
    if (mtx_init(&ctx->object_mutex, mtx_plain) != thrd_success)
       goto err_ctx_object_mutex;
 
+#ifdef __OHOS__
+   list_inithead(&ctx->shadow_dirty_memories);
+#endif
+
    ctx->object_table = _mesa_hash_table_create(NULL, vkr_hash_u64, vkr_key_u64_equal);
    if (!ctx->object_table)
       goto err_ctx_object_table;

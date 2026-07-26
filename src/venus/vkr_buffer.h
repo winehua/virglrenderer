@@ -12,10 +12,16 @@ struct vkr_buffer {
    struct vkr_object base;
 
 #ifdef __OHOS__
-   /* Diagnostic ownership only. Vulkan requires bound memory to outlive the
-    * buffer, so this non-owning pointer is valid for the buffer lifetime. */
+   /* Vulkan requires bound memory to outlive the buffer, so this non-owning
+    * pointer is valid for the buffer lifetime.  Size and usage are retained
+    * for the Maleoon shadow-memory GPU upload compatibility path. */
    struct vkr_device_memory *bound_memory;
    VkDeviceSize bound_memory_offset;
+   VkDeviceSize size;
+   VkBufferUsageFlags guest_usage;
+   VkBufferUsageFlags host_usage;
+   struct list_head memory_head;
+   bool memory_listed;
 #endif
 };
 VKR_DEFINE_OBJECT_CAST(buffer, VK_OBJECT_TYPE_BUFFER, VkBuffer)

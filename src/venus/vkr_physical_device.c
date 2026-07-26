@@ -172,6 +172,19 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
 
    VkPhysicalDevice handle = physical_dev->base.handle.physical_device;
    vk->GetPhysicalDeviceMemoryProperties(handle, &physical_dev->memory_properties);
+#ifdef __OHOS__
+   const char *capture_trace = os_get_option("WINEHUA_VKR_TRACE_CAPTURE");
+   if (capture_trace && capture_trace[0] == '1' && !capture_trace[1]) {
+      const VkPhysicalDeviceMemoryProperties *memory =
+         &physical_dev->memory_properties;
+      vkr_log("WineHuaCapture: memory-properties types=%u heaps=%u",
+              memory->memoryTypeCount, memory->memoryHeapCount);
+      for (uint32_t i = 0; i < memory->memoryTypeCount; i++)
+         vkr_log("WineHuaCapture: memory-type index=%u flags=0x%x heap=%u",
+                 i, memory->memoryTypes[i].propertyFlags,
+                 memory->memoryTypes[i].heapIndex);
+   }
+#endif
 
    /* XXX When a VkMemoryType has VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, we
     * assume any VkDeviceMemory with the memory type can be made external and
@@ -354,6 +367,13 @@ vkr_physical_device_init_properties(struct vkr_physical_device *physical_dev)
 
    VkPhysicalDeviceProperties *props = &physical_dev->properties;
    props->apiVersion = vkr_api_version_cap_minor(props->apiVersion, VKR_MAX_API_VERSION);
+#ifdef __OHOS__
+   physical_dev->winehua_shadow_gpu_upload_quirk =
+      props->vendorID == 0x19e5 && strstr(props->deviceName, "Maleoon");
+   vkr_log("WineHua shadow GPU upload auto=%u vendor=0x%x device=0x%x name=%s",
+           physical_dev->winehua_shadow_gpu_upload_quirk,
+           props->vendorID, props->deviceID, props->deviceName);
+#endif
 }
 
 static inline void

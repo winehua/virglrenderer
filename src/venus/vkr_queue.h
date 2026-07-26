@@ -19,6 +19,18 @@ struct vkr_queue_sync {
    struct list_head head;
 };
 
+#ifdef __OHOS__
+#define VKR_WINEHUA_SHADOW_UPLOAD_SLOT_COUNT 8
+
+struct vkr_shadow_upload_slot {
+   VkCommandPool pool;
+   VkCommandBuffer command;
+   VkFence fence;
+   bool in_flight;
+   uint64_t retire_value;
+};
+#endif
+
 struct vkr_queue {
    struct vkr_object base;
 
@@ -36,6 +48,30 @@ struct vkr_queue {
     * thread and ring thread.
     */
    mtx_t vk_mutex;
+
+#ifdef __OHOS__
+   /* A private transfer command runs immediately before a guest submit when
+    * mapped Host memory is not reliably visible to the Maleoon GPU. */
+   mtx_t shadow_upload_mutex;
+   struct vkr_shadow_upload_slot
+      shadow_upload_slots[VKR_WINEHUA_SHADOW_UPLOAD_SLOT_COUNT];
+   uint32_t shadow_upload_slot;
+   VkSemaphore shadow_upload_timeline;
+   uint64_t shadow_upload_next_value;
+   bool shadow_upload_inline;
+   bool shadow_upload_prepared;
+   uint64_t shadow_upload_bytes;
+   uint32_t shadow_upload_updates;
+   uint32_t shadow_upload_ranges;
+   bool winehua_perf_summary;
+   atomic_uint_fast64_t winehua_perf_last_submit_end_ns;
+   uint64_t shadow_upload_wait_us;
+   uint64_t shadow_upload_reset_begin_us;
+   uint64_t shadow_upload_dirty_scan_us;
+   uint64_t shadow_upload_buffer_record_us;
+   uint64_t shadow_upload_uncovered_scan_us;
+   uint64_t shadow_upload_end_us;
+#endif
 
    /* Submitted fences are added to sync_thread.syncs first. With required
     * VKR_RENDERER_THREAD_SYNC and VKR_RENDERER_ASYNC_FENCE_CB in render server, the sync
