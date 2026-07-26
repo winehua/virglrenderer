@@ -81,6 +81,9 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
 
    struct vkr_buffer *buffer = vkr_buffer_create_and_add(dispatch->data, args);
    if (buffer) {
+      buffer->winehua_ubo_watches = NULL;
+      atomic_init(&buffer->winehua_ubo_watch_count, 0);
+      buffer->winehua_ubo_watch_overflow = false;
       buffer->bound_memory = NULL;
       buffer->bound_memory_offset = 0;
       buffer->size = guest_info->size;
@@ -101,6 +104,12 @@ vkr_dispatch_vkDestroyBuffer(struct vn_dispatch_context *dispatch,
 #ifdef __OHOS__
    struct vkr_buffer *buffer = vkr_buffer_from_handle(args->buffer);
    vkr_winehua_set_buffer_memory(dispatch->data, buffer, NULL, 0);
+   if (buffer) {
+      free(buffer->winehua_ubo_watches);
+      buffer->winehua_ubo_watches = NULL;
+      atomic_store_explicit(&buffer->winehua_ubo_watch_count, 0,
+                            memory_order_release);
+   }
 #endif
    vkr_buffer_destroy_and_remove(dispatch->data, args);
 }

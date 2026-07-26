@@ -10,6 +10,17 @@
 
 #include "vkr_context.h"
 
+#ifdef __OHOS__
+struct vkr_winehua_ubo_binding {
+   uint64_t buffer_id;
+   VkDeviceSize offset;
+   VkDeviceSize size;
+   uint32_t array_element;
+   VkDescriptorType descriptor_type;
+   bool valid;
+};
+#endif
+
 struct vkr_descriptor_set_layout {
    struct vkr_object base;
 };
@@ -30,6 +41,9 @@ struct vkr_descriptor_set {
    struct vkr_object base;
 
    struct vkr_device *device;
+#ifdef __OHOS__
+   struct vkr_winehua_ubo_binding winehua_ubo_bindings[2];
+#endif
 };
 VKR_DEFINE_OBJECT_CAST(descriptor_set, VK_OBJECT_TYPE_DESCRIPTOR_SET, VkDescriptorSet)
 

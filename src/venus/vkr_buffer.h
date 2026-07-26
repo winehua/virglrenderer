@@ -8,10 +8,28 @@
 
 #include "vkr_common.h"
 
+#ifdef __OHOS__
+#include <stdatomic.h>
+
+#define VKR_WINEHUA_UBO_WATCH_COUNT 256u
+
+struct vkr_winehua_ubo_watch {
+   VkDeviceSize offset;
+   VkDeviceSize size;
+   atomic_uint_fast64_t last_update_hash;
+   uint32_t binding;
+   atomic_bool last_update_hash_valid;
+};
+#endif
+
 struct vkr_buffer {
    struct vkr_object base;
 
 #ifdef __OHOS__
+   struct vkr_winehua_ubo_watch *winehua_ubo_watches;
+   atomic_uint winehua_ubo_watch_count;
+   bool winehua_ubo_watch_overflow;
+
    /* Vulkan requires bound memory to outlive the buffer, so this non-owning
     * pointer is valid for the buffer lifetime.  Size and usage are retained
     * for the Maleoon shadow-memory GPU upload compatibility path. */

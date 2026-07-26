@@ -43,6 +43,7 @@ static atomic_uint_fast64_t vkr_ohos_shadow_generation_wait_us;
 static atomic_uint vkr_ohos_ubo_flush_trace_count;
 static atomic_uint vkr_ohos_ubo_range_trace_count;
 static atomic_uint vkr_ohos_ubo_update_trace_count;
+static atomic_uint vkr_ohos_ubo_watched_update_trace_count;
 
 #define VKR_WINEHUA_UBO_TRACE_LIMIT 200000u
 #define VKR_WINEHUA_FNV64_OFFSET UINT64_C(1469598103934665603)
@@ -57,6 +58,13 @@ vkr_ohos_shadow_trace_enabled(void)
 
 static bool
 vkr_ohos_ubo_identity_trace_enabled(void)
+{
+   const char *value = os_get_option("WINEHUA_VKR_TRACE_UBO_IDENTITY");
+   return value && value[0] && !(value[0] == '0' && !value[1]);
+}
+
+static bool
+vkr_ohos_ubo_identity_trace_verbose(void)
 {
    const char *value = os_get_option("WINEHUA_VKR_TRACE_UBO_IDENTITY");
    return value && value[0] == '1' && !value[1];
@@ -191,7 +199,7 @@ vkr_ohos_record_shadow_upload_range(struct vn_device_proc_table *vk,
          break;
       vk->CmdUpdateBuffer(command, buffer->base.handle.buffer, dst_offset,
                           chunk, data);
-      if (vkr_ohos_ubo_identity_trace_enabled() &&
+      if (vkr_ohos_ubo_identity_trace_verbose() &&
           vkr_ohos_ubo_identity_trace_allow(
              &vkr_ohos_ubo_update_trace_count, "update")) {
          vkr_log("WineHuaUboHost: phase=update submit=%" PRIu64
@@ -208,6 +216,57 @@ vkr_ohos_record_shadow_upload_range(struct vn_device_proc_table *vk,
                  (uint64_t)dst_offset,
                  (uint64_t)(buffer->bound_memory_offset + dst_offset),
                  (uint64_t)chunk, vkr_ohos_fnv1a64(data, (size_t)chunk));
+      }
+      if (vkr_ohos_ubo_identity_trace_enabled()) {
+         const uint32_t watch_count = atomic_load_explicit(
+            &buffer->winehua_ubo_watch_count, memory_order_acquire);
+         for (uint32_t i = 0; i < watch_count; i++) {
+            struct vkr_winehua_ubo_watch *watch =
+               &buffer->winehua_ubo_watches[i];
+            const VkDeviceSize watch_offset =
+               watch->offset;
+            const VkDeviceSize watch_size =
+               watch->size;
+            if (watch_offset < dst_offset || watch_size > chunk ||
+                watch_offset - dst_offset > chunk - watch_size)
+               continue;
+            const uint8_t *watch_data = data + watch_offset - dst_offset;
+            const uint64_t source_hash =
+               vkr_ohos_fnv1a64(watch_data, (size_t)watch_size);
+            const bool hash_valid = atomic_load_explicit(
+               &watch->last_update_hash_valid, memory_order_acquire);
+            const uint64_t previous_hash = atomic_load_explicit(
+               &watch->last_update_hash, memory_order_relaxed);
+            if (hash_valid && previous_hash == source_hash)
+               continue;
+            atomic_store_explicit(&watch->last_update_hash, source_hash,
+                                  memory_order_relaxed);
+            atomic_store_explicit(&watch->last_update_hash_valid, true,
+                                  memory_order_release);
+            if (!vkr_ohos_ubo_identity_trace_allow(
+                   &vkr_ohos_ubo_watched_update_trace_count,
+                   "watched-update"))
+               continue;
+            vkr_log("WineHuaUboHost: phase=watched-update submit=%" PRIu64
+                    " binding=%u bufferId=%" PRIu64
+                    " hostBuffer=0x%" PRIxPTR " memoryId=%" PRIu64
+                    " hostMemory=0x%" PRIxPTR
+                    " bufferMemoryOffset=%" PRIu64
+                    " descriptorOffset=%" PRIu64
+                    " absoluteOffset=%" PRIu64 " bytes=%" PRIu64
+                    " updateOffset=%" PRIu64 " updateBytes=%" PRIu64
+                    " sourceHash=%016" PRIx64,
+                    submit_id, watch->binding,
+                    (uint64_t)buffer->base.id,
+                    (uintptr_t)buffer->base.handle.buffer,
+                    (uint64_t)mem->base.id,
+                    (uintptr_t)mem->base.handle.device_memory,
+                    (uint64_t)buffer->bound_memory_offset,
+                    (uint64_t)watch_offset,
+                    (uint64_t)(buffer->bound_memory_offset + watch_offset),
+                    (uint64_t)watch_size, (uint64_t)dst_offset,
+                    (uint64_t)chunk, source_hash);
+         }
       }
       (*update_count)++;
       *upload_bytes += chunk;
@@ -352,7 +411,7 @@ vkr_ohos_record_shadow_upload_buffer(
       if (relative_end <= relative_begin)
          continue;
 
-      if (vkr_ohos_ubo_identity_trace_enabled() &&
+      if (vkr_ohos_ubo_identity_trace_verbose() &&
           vkr_ohos_ubo_identity_trace_allow(
              &vkr_ohos_ubo_range_trace_count, "upload-range")) {
          const uint8_t *source = mem->shadow_host_copy_deferred &&
@@ -1825,7 +1884,7 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
       memcpy((uint8_t *)mem->host_map + offset,
              (const uint8_t *)mem->shadow_map + offset,
              (size_t)copy_size);
-   if (vkr_ohos_ubo_identity_trace_enabled() &&
+   if (vkr_ohos_ubo_identity_trace_verbose() &&
        (copy_size == 48 || copy_size == 1536) &&
        vkr_ohos_ubo_identity_trace_allow(
           &vkr_ohos_ubo_flush_trace_count, "flush")) {
