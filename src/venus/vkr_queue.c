@@ -802,10 +802,12 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
                vkr_command_buffer_from_handle(submit->pCommandBuffers[j]);
             vkr_log("WineHuaFrameAssoc: queue-submit submit=%" PRIu64
                     " queueId=%" PRIu64 " hostQueue=0x%" PRIxPTR
-                    " batch=%u cmdIndex=%u cmdId=%" PRIu64
+                    " batch=%u cmdIndex=%u guestCmd=0x%" PRIxPTR
+                    " cmdId=%" PRIu64
                     " hostCmd=0x%" PRIxPTR,
                     submit_id, queue->base.id,
                     (uintptr_t)queue->base.handle.queue, i, j,
+                    (uintptr_t)submit->pCommandBuffers[j],
                     cmd ? cmd->base.id : 0,
                     cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0);
          }

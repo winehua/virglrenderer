@@ -693,10 +693,35 @@ vkr_dispatch_vkCmdPipelineBarrier(UNUSED struct vn_dispatch_context *dispatch,
       struct vkr_command_buffer *cmd =
          vkr_command_buffer_from_handle(args->commandBuffer);
       for (uint32_t i = 0; i < args->imageMemoryBarrierCount; i++) {
-         if (!vkr_winehua_capture_trace_allow())
-            break;
          const VkImageMemoryBarrier *barrier = &args->pImageMemoryBarriers[i];
          const struct vkr_image *image = vkr_image_from_handle(barrier->image);
+
+         /* DXVK's private-present source images transition from color output
+          * to GENERAL before the Wine Vulkan present bridge consumes them.
+          * Keep this narrow identity record independent from the broad command
+          * capture limit so a long Heaven run still joins frame -> command ->
+          * source image -> present without changing Vulkan behavior. */
+         if (image &&
+             (image->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) ==
+                (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
+             barrier->oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+             barrier->newLayout == VK_IMAGE_LAYOUT_GENERAL) {
+            vkr_log("WineHuaFrameAssoc: source-transition guestCmd=0x%" PRIxPTR
+                    " cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR
+                    " imageId=%" PRIu64 " hostImage=0x%" PRIxPTR
+                    " size=%ux%u format=%u oldLayout=%u newLayout=%u",
+                    (uintptr_t)args->commandBuffer,
+                    cmd ? cmd->base.id : 0,
+                    cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+                    image->base.id, (uintptr_t)image->base.handle.image,
+                    image->extent.width, image->extent.height, image->format,
+                    barrier->oldLayout, barrier->newLayout);
+         }
+
+         if (!vkr_winehua_capture_trace_allow())
+            continue;
          vkr_log("WineHuaCapture: image-barrier cmdId=%" PRIu64
                  " hostCmd=0x%" PRIxPTR " imageId=%" PRIu64
                  " hostImage=0x%" PRIxPTR " srcStage=0x%x dstStage=0x%x"
