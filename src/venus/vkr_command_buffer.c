@@ -404,6 +404,15 @@ vkr_dispatch_vkCmdBindDescriptorSets(UNUSED struct vn_dispatch_context *dispatch
                  set ? (uintptr_t)set->base.handle.descriptor_set : 0,
                  args->pipelineBindPoint, args->dynamicOffsetCount);
       }
+      for (uint32_t i = 0; i < args->dynamicOffsetCount; i++) {
+         if (!vkr_winehua_capture_trace_allow())
+            break;
+         vkr_log("WineHuaFrameAssoc: dynamic-offset cmdId=%" PRIu64
+                 " hostCmd=0x%" PRIxPTR " index=%u value=%u",
+                 cmd ? cmd->base.id : 0,
+                 cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
+                 i, args->pDynamicOffsets[i]);
+      }
    }
 
    vn_replace_vkCmdBindDescriptorSets_args_handle(args);

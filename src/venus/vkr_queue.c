@@ -8,6 +8,7 @@
 #include "venus-protocol/vn_protocol_renderer_queue.h"
 
 #include "vkr_context.h"
+#include "vkr_command_buffer.h"
 #include "vkr_device_memory.h"
 #include "vkr_physical_device.h"
 #include "vkr_queue_gen.h"
@@ -101,6 +102,13 @@ vkr_ohos_perf_summary_enabled(void)
 {
    static atomic_int cached = ATOMIC_VAR_INIT(-1);
    return vkr_ohos_cached_option_enabled("VKR_WINEHUA_PERF_SUMMARY", &cached);
+}
+
+static bool
+vkr_ohos_frame_assoc_trace_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   return vkr_ohos_cached_option_enabled("WINEHUA_VKR_TRACE_CAPTURE", &cached);
 }
 
 static void
@@ -783,10 +791,30 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
    struct vn_device_proc_table *vk = &queue->device->proc_table;
 
-   vn_replace_vkQueueSubmit_args_handle(args);
 #ifdef __OHOS__
    const uint64_t submit_id =
       atomic_fetch_add_explicit(&vkr_ohos_queue_submit_count, 1, memory_order_relaxed) + 1;
+   if (vkr_ohos_frame_assoc_trace_enabled()) {
+      for (uint32_t i = 0; i < args->submitCount; i++) {
+         const VkSubmitInfo *submit = &args->pSubmits[i];
+         for (uint32_t j = 0; j < submit->commandBufferCount; j++) {
+            const struct vkr_command_buffer *cmd =
+               vkr_command_buffer_from_handle(submit->pCommandBuffers[j]);
+            vkr_log("WineHuaFrameAssoc: queue-submit submit=%" PRIu64
+                    " queueId=%" PRIu64 " hostQueue=0x%" PRIxPTR
+                    " batch=%u cmdIndex=%u cmdId=%" PRIu64
+                    " hostCmd=0x%" PRIxPTR,
+                    submit_id, queue->base.id,
+                    (uintptr_t)queue->base.handle.queue, i, j,
+                    cmd ? cmd->base.id : 0,
+                    cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0);
+         }
+      }
+   }
+#endif
+
+   vn_replace_vkQueueSubmit_args_handle(args);
+#ifdef __OHOS__
    const bool perf_trace = vkr_ohos_perf_trace_enabled();
    const bool perf_summary = queue->winehua_perf_summary;
    const bool perf_timing = perf_trace || perf_summary;

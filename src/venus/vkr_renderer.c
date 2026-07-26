@@ -41,6 +41,13 @@ vkr_winehua_now_us(void)
           (uint64_t)ts.tv_nsec / 1000ull;
 }
 
+static bool
+vkr_winehua_frame_assoc_trace_enabled(void)
+{
+   const char *trace = getenv("WINEHUA_VKR_TRACE_CAPTURE");
+   return trace && trace[0] == '1' && !trace[1];
+}
+
 static void
 vkr_winehua_stage(const char *stage, uint32_t serial)
 {
@@ -374,6 +381,13 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
    const uint64_t image_handle = (uint64_t)(uintptr_t)image->base.handle.image;
    const uint32_t queue_family = queue->family;
    vkr_winehua_stage("handles-ready", serial);
+   if (vkr_winehua_frame_assoc_trace_enabled()) {
+      vkr_log("WineHuaFrameAssoc: present serial=%u ctx=%u queueId=%" PRIu64
+              " hostQueue=0x%" PRIxPTR " imageId=%" PRIu64
+              " hostImage=0x%" PRIx64 " size=%ux%u format=%u layout=%u",
+              serial, ctx_id, queue_id, queue_handle, image_id, image_handle,
+              width, height, format, layout);
+   }
 
    /* Keep the queue externally synchronized with renderer QueueSubmit,
     * QueueSubmit2, QueueBindSparse and sync submissions. The callback calls
