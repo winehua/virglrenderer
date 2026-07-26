@@ -842,7 +842,7 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       vkr_device_memory_shadow_generation_begin(dispatch->data, true);
       upload_prepare_result =
          vkr_device_memory_prepare_shadow_upload(dispatch->data, queue,
-                                                 perf_summary);
+                                                 perf_summary, submit_id);
       if (perf_summary)
          vkr_ohos_perf_record_prepare_phases(queue);
    }
@@ -1139,6 +1139,9 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
 
    vn_replace_vkQueueSubmit2_args_handle(args);
 #ifdef __OHOS__
+   const uint64_t submit_id =
+      atomic_fetch_add_explicit(&vkr_ohos_queue_submit_count, 1,
+                                memory_order_relaxed) + 1;
    const bool gpu_upload = vkr_device_memory_gpu_upload_enabled(queue->device);
    const bool perf_summary = queue->winehua_perf_summary;
    VkResult upload_prepare_result = VK_SUCCESS;
@@ -1146,7 +1149,7 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
       mtx_lock(&queue->shadow_upload_mutex);
       upload_prepare_result =
          vkr_device_memory_prepare_shadow_upload(dispatch->data, queue,
-                                                 perf_summary);
+                                                 perf_summary, submit_id);
       if (perf_summary)
          vkr_ohos_perf_record_prepare_phases(queue);
    }

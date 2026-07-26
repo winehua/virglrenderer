@@ -40,12 +40,50 @@ static atomic_uint_fast64_t vkr_ohos_shadow_generation_submit_count;
 static atomic_uint_fast64_t vkr_ohos_shadow_generation_flush_count;
 static atomic_uint_fast64_t vkr_ohos_shadow_generation_contended_count;
 static atomic_uint_fast64_t vkr_ohos_shadow_generation_wait_us;
+static atomic_uint vkr_ohos_ubo_flush_trace_count;
+static atomic_uint vkr_ohos_ubo_range_trace_count;
+static atomic_uint vkr_ohos_ubo_update_trace_count;
+
+#define VKR_WINEHUA_UBO_TRACE_LIMIT 200000u
+#define VKR_WINEHUA_FNV64_OFFSET UINT64_C(1469598103934665603)
+#define VKR_WINEHUA_FNV64_PRIME UINT64_C(1099511628211)
 
 static bool
 vkr_ohos_shadow_trace_enabled(void)
 {
    const char *value = os_get_option("VKR_WINEHUA_SHADOW_TRACE");
    return value && value[0] == '1' && !value[1];
+}
+
+static bool
+vkr_ohos_ubo_identity_trace_enabled(void)
+{
+   const char *value = os_get_option("WINEHUA_VKR_TRACE_UBO_IDENTITY");
+   return value && value[0] == '1' && !value[1];
+}
+
+static bool
+vkr_ohos_ubo_identity_trace_allow(atomic_uint *counter, const char *phase)
+{
+   const unsigned index =
+      atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
+   if (index < VKR_WINEHUA_UBO_TRACE_LIMIT)
+      return true;
+   if (index == VKR_WINEHUA_UBO_TRACE_LIMIT)
+      vkr_log("WineHuaUboHost: phase=%s trace limit reached", phase);
+   return false;
+}
+
+static uint64_t
+vkr_ohos_fnv1a64(const void *data, size_t size)
+{
+   const uint8_t *bytes = data;
+   uint64_t hash = VKR_WINEHUA_FNV64_OFFSET;
+   for (size_t i = 0; i < size; i++) {
+      hash ^= bytes[i];
+      hash *= VKR_WINEHUA_FNV64_PRIME;
+   }
+   return hash;
 }
 
 static bool
@@ -132,6 +170,7 @@ vkr_ohos_record_shadow_upload_range(struct vn_device_proc_table *vk,
                                     VkCommandBuffer command,
                                     const struct vkr_buffer *buffer,
                                     const struct vkr_device_memory *mem,
+                                    uint64_t submit_id,
                                     VkDeviceSize relative_begin,
                                     VkDeviceSize relative_end,
                                     uint32_t *update_count,
@@ -152,6 +191,24 @@ vkr_ohos_record_shadow_upload_range(struct vn_device_proc_table *vk,
          break;
       vk->CmdUpdateBuffer(command, buffer->base.handle.buffer, dst_offset,
                           chunk, data);
+      if (vkr_ohos_ubo_identity_trace_enabled() &&
+          vkr_ohos_ubo_identity_trace_allow(
+             &vkr_ohos_ubo_update_trace_count, "update")) {
+         vkr_log("WineHuaUboHost: phase=update submit=%" PRIu64
+                 " uploadCmd=0x%" PRIxPTR " bufferId=%" PRIu64
+                 " hostBuffer=0x%" PRIxPTR " memoryId=%" PRIu64
+                 " hostMemory=0x%" PRIxPTR " bufferMemoryOffset=%" PRIu64
+                 " dstOffset=%" PRIu64 " absoluteOffset=%" PRIu64
+                 " bytes=%" PRIu64 " sourceHash=%016" PRIx64,
+                 submit_id, (uintptr_t)command, (uint64_t)buffer->base.id,
+                 (uintptr_t)buffer->base.handle.buffer,
+                 (uint64_t)mem->base.id,
+                 (uintptr_t)mem->base.handle.device_memory,
+                 (uint64_t)buffer->bound_memory_offset,
+                 (uint64_t)dst_offset,
+                 (uint64_t)(buffer->bound_memory_offset + dst_offset),
+                 (uint64_t)chunk, vkr_ohos_fnv1a64(data, (size_t)chunk));
+      }
       (*update_count)++;
       *upload_bytes += chunk;
       remaining -= chunk;
@@ -164,6 +221,7 @@ struct vkr_ohos_shadow_upload_record {
    struct vn_device_proc_table *vk;
    VkCommandBuffer command;
    struct vkr_device *device;
+   uint64_t submit_id;
    bool merge_ranges;
    uint32_t update_count;
    uint32_t upload_range_count;
@@ -294,11 +352,38 @@ vkr_ohos_record_shadow_upload_buffer(
       if (relative_end <= relative_begin)
          continue;
 
+      if (vkr_ohos_ubo_identity_trace_enabled() &&
+          vkr_ohos_ubo_identity_trace_allow(
+             &vkr_ohos_ubo_range_trace_count, "upload-range")) {
+         const uint8_t *source = mem->shadow_host_copy_deferred &&
+            mem->shadow_upload_snapshot ? mem->shadow_upload_snapshot :
+            mem->shadow_map;
+         const VkDeviceSize absolute_offset =
+            buffer->bound_memory_offset + relative_begin;
+         const VkDeviceSize byte_count = relative_end - relative_begin;
+         vkr_log("WineHuaUboHost: phase=upload-range submit=%" PRIu64
+                 " bufferId=%" PRIu64 " hostBuffer=0x%" PRIxPTR
+                 " memoryId=%" PRIu64 " hostMemory=0x%" PRIxPTR
+                 " bufferMemoryOffset=%" PRIu64 " dstOffset=%" PRIu64
+                 " absoluteOffset=%" PRIu64 " bytes=%" PRIu64
+                 " sourceHash=%016" PRIx64,
+                 record->submit_id, (uint64_t)buffer->base.id,
+                 (uintptr_t)buffer->base.handle.buffer,
+                 (uint64_t)mem->base.id,
+                 (uintptr_t)mem->base.handle.device_memory,
+                 (uint64_t)buffer->bound_memory_offset,
+                 (uint64_t)relative_begin, (uint64_t)absolute_offset,
+                 (uint64_t)byte_count,
+                 vkr_ohos_fnv1a64((const uint8_t *)source + absolute_offset,
+                                  (size_t)byte_count));
+      }
+
       mem->shadow_gpu_upload_covered = true;
       record->upload_range_count++;
       if (!record->merge_ranges) {
          vkr_ohos_record_shadow_upload_range(
-            record->vk, record->command, buffer, mem, relative_begin,
+            record->vk, record->command, buffer, mem, record->submit_id,
+            relative_begin,
             relative_end, &record->update_count, &record->upload_bytes);
          continue;
       }
@@ -311,7 +396,8 @@ vkr_ohos_record_shadow_upload_buffer(
          pending_end = MAX2(pending_end, relative_end);
       } else {
          vkr_ohos_record_shadow_upload_range(
-            record->vk, record->command, buffer, mem, pending_begin,
+            record->vk, record->command, buffer, mem, record->submit_id,
+            pending_begin,
             pending_end, &record->update_count, &record->upload_bytes);
          pending_begin = relative_begin;
          pending_end = relative_end;
@@ -319,7 +405,8 @@ vkr_ohos_record_shadow_upload_buffer(
    }
    if (pending)
       vkr_ohos_record_shadow_upload_range(
-         record->vk, record->command, buffer, mem, pending_begin,
+         record->vk, record->command, buffer, mem, record->submit_id,
+         pending_begin,
          pending_end, &record->update_count, &record->upload_bytes);
 }
 
@@ -1738,6 +1825,23 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
       memcpy((uint8_t *)mem->host_map + offset,
              (const uint8_t *)mem->shadow_map + offset,
              (size_t)copy_size);
+   if (vkr_ohos_ubo_identity_trace_enabled() &&
+       (copy_size == 48 || copy_size == 1536) &&
+       vkr_ohos_ubo_identity_trace_allow(
+          &vkr_ohos_ubo_flush_trace_count, "flush")) {
+      const uint8_t *source = deferred_copy && mem->shadow_upload_snapshot
+         ? mem->shadow_upload_snapshot : mem->shadow_map;
+      vkr_log("WineHuaUboHost: phase=flush submitGeneration=%" PRIu64
+              " memoryId=%" PRIu64 " hostMemory=0x%" PRIxPTR
+              " absoluteOffset=%" PRIu64 " bytes=%" PRIu64
+              " sourceHash=%016" PRIx64 " deferred=%u",
+              vkr_winehua_queue_submit_generation(),
+              (uint64_t)mem->base.id,
+              (uintptr_t)mem->base.handle.device_memory,
+              (uint64_t)offset, (uint64_t)copy_size,
+              vkr_ohos_fnv1a64(source + offset, (size_t)copy_size),
+              deferred_copy);
+   }
    vkr_ohos_record_shadow_dirty_range(mem, offset, copy_size);
    mem->shadow_pending_copy_bytes += copy_size;
    if (copy_size)
@@ -1924,7 +2028,8 @@ vkr_device_memory_init_shadow_upload(struct vkr_queue *queue,
 VkResult
 vkr_device_memory_prepare_shadow_upload(struct vkr_context *ctx,
                                         struct vkr_queue *queue,
-                                        bool perf_timing)
+                                        bool perf_timing,
+                                        uint64_t submit_id)
 {
 #ifdef __OHOS__
    queue->shadow_upload_prepared = false;
@@ -2071,6 +2176,7 @@ vkr_device_memory_prepare_shadow_upload(struct vkr_context *ctx,
       .vk = vk,
       .command = slot->command,
       .device = dev,
+      .submit_id = submit_id,
       .merge_ranges = vkr_ohos_shadow_merge_ranges_enabled(),
    };
    if (use_dirty_list && vkr_ohos_shadow_bound_buffer_list_enabled()) {
@@ -2174,6 +2280,7 @@ vkr_device_memory_prepare_shadow_upload(struct vkr_context *ctx,
    (void)ctx;
    (void)queue;
    (void)perf_timing;
+   (void)submit_id;
    return VK_SUCCESS;
 #endif
 }

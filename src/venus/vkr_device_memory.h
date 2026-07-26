@@ -100,7 +100,8 @@ vkr_device_memory_requires_deferred_host_wait(struct vkr_context *ctx,
 VkResult
 vkr_device_memory_prepare_shadow_upload(struct vkr_context *ctx,
                                         struct vkr_queue *queue,
-                                        bool perf_timing);
+                                        bool perf_timing,
+                                        uint64_t submit_id);
 
 VkResult
 vkr_device_memory_submit_shadow_upload(struct vkr_queue *queue);

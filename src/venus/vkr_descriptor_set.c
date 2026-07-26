@@ -71,6 +71,28 @@ vkr_winehua_capture_trace_allow(void)
 }
 
 #ifdef __OHOS__
+#define VKR_WINEHUA_UBO_DESCRIPTOR_TRACE_LIMIT 200000u
+
+static bool
+vkr_winehua_ubo_identity_trace_enabled(void)
+{
+   const char *value = os_get_option("WINEHUA_VKR_TRACE_UBO_IDENTITY");
+   return value && value[0] == '1' && !value[1];
+}
+
+static bool
+vkr_winehua_ubo_identity_trace_allow(void)
+{
+   static atomic_uint emitted = ATOMIC_VAR_INIT(0);
+   const unsigned index =
+      atomic_fetch_add_explicit(&emitted, 1, memory_order_relaxed);
+   if (index < VKR_WINEHUA_UBO_DESCRIPTOR_TRACE_LIMIT)
+      return true;
+   if (index == VKR_WINEHUA_UBO_DESCRIPTOR_TRACE_LIMIT)
+      vkr_log("WineHuaUboHost: phase=descriptor trace limit reached");
+   return false;
+}
+
 static bool
 vkr_winehua_descriptor_update_serialize_enabled(void)
 {
@@ -298,14 +320,42 @@ vkr_winehua_log_guest_descriptor_objects(uint32_t write_count,
 #ifdef __OHOS__
       if (buffer_descriptor) {
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            if (!vkr_winehua_sample_trace_allow())
-               continue;
             const VkDescriptorBufferInfo *info = &write->pBufferInfo[j];
             struct vkr_buffer *buffer = info->buffer
                ? vkr_buffer_from_handle(info->buffer) : NULL;
             struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
             const struct vkr_winehua_buffer_hashes hashes =
                vkr_winehua_hash_buffer_descriptor(buffer, info);
+
+            if ((write->dstBinding == 3 || write->dstBinding == 4) &&
+                vkr_winehua_ubo_identity_trace_enabled() &&
+                vkr_winehua_ubo_identity_trace_allow()) {
+               vkr_log("WineHuaUboHost: phase=descriptor submitGeneration=%" PRIu64
+                       " setId=%" PRIu64 " hostSet=0x%" PRIxPTR
+                       " binding=%u bufferId=%" PRIu64
+                       " hostBuffer=0x%" PRIxPTR " memoryId=%" PRIu64
+                       " hostMemory=0x%" PRIxPTR
+                       " descriptorOffset=%" PRIu64
+                       " descriptorRange=%" PRIu64
+                       " bufferMemoryOffset=%" PRIu64
+                       " absoluteOffset=%" PRIu64 " hashBytes=%zu"
+                       " shadowHash=%016" PRIx64 " hostHash=%016" PRIx64
+                       " hashEqual=%d",
+                       vkr_winehua_queue_submit_generation(),
+                       set ? set->base.id : 0,
+                       set ? (uintptr_t)set->base.handle.descriptor_set : 0,
+                       write->dstBinding, buffer ? buffer->base.id : 0,
+                       buffer ? (uintptr_t)buffer->base.handle.buffer : 0,
+                       mem ? mem->base.id : 0,
+                       mem ? (uintptr_t)mem->base.handle.device_memory : 0,
+                       (uint64_t)info->offset, (uint64_t)info->range,
+                       buffer ? (uint64_t)buffer->bound_memory_offset : 0,
+                       (uint64_t)hashes.absolute_offset, hashes.byte_count,
+                       hashes.shadow_hash, hashes.host_hash, hashes.equal);
+            }
+
+            if (!vkr_winehua_sample_trace_allow())
+               continue;
 
             vkr_winehua_log_buffer_preview(set, write, buffer, &hashes);
 
