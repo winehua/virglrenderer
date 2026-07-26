@@ -72,7 +72,6 @@ vkr_winehua_capture_trace_allow(void)
 
 #ifdef __OHOS__
 #define VKR_WINEHUA_UBO_DESCRIPTOR_TRACE_LIMIT 200000u
-static atomic_uint_fast64_t vkr_winehua_ubo_descriptor_sequence;
 
 static bool
 vkr_winehua_ubo_identity_trace_enabled(void)
@@ -245,9 +244,9 @@ vkr_winehua_hash_buffer_descriptor(const struct vkr_buffer *buffer,
 }
 
 static void
-vkr_winehua_register_ubo_watches(struct vkr_context *ctx,
-                                 uint32_t write_count,
-                                 const VkWriteDescriptorSet *writes)
+vkr_winehua_track_ubo_mappings(struct vkr_context *ctx,
+                               uint32_t write_count,
+                               const VkWriteDescriptorSet *writes)
 {
    if (!vkr_winehua_ubo_identity_trace_enabled())
       return;
@@ -272,61 +271,6 @@ vkr_winehua_register_ubo_watches(struct vkr_context *ctx,
              (info->range != 48 && info->range != 1536))
             continue;
 
-         if (!buffer->winehua_ubo_watches) {
-            buffer->winehua_ubo_watches = calloc(
-               VKR_WINEHUA_UBO_WATCH_COUNT,
-               sizeof(*buffer->winehua_ubo_watches));
-            if (!buffer->winehua_ubo_watches) {
-               if (!buffer->winehua_ubo_watch_overflow) {
-                  buffer->winehua_ubo_watch_overflow = true;
-                  vkr_log("WineHuaUboHost: phase=watch-allocation-failed "
-                          "bufferId=%" PRIu64,
-                          (uint64_t)buffer->base.id);
-               }
-               continue;
-            }
-         }
-
-         uint32_t watch_count = atomic_load_explicit(
-            &buffer->winehua_ubo_watch_count, memory_order_relaxed);
-         uint32_t watch_index = watch_count;
-         for (uint32_t k = 0; k < watch_count; k++) {
-            const struct vkr_winehua_ubo_watch *watch =
-               &buffer->winehua_ubo_watches[k];
-            if (watch->offset == info->offset && watch->size == info->range &&
-                watch->binding == write->dstBinding) {
-               watch_index = k;
-               break;
-            }
-         }
-         if (watch_index == watch_count) {
-            if (watch_count == VKR_WINEHUA_UBO_WATCH_COUNT) {
-               if (!buffer->winehua_ubo_watch_overflow) {
-                  buffer->winehua_ubo_watch_overflow = true;
-                  vkr_log("WineHuaUboHost: phase=watch-overflow bufferId=%" PRIu64
-                          " capacity=%u",
-                          (uint64_t)buffer->base.id,
-                          VKR_WINEHUA_UBO_WATCH_COUNT);
-               }
-               continue;
-            }
-            struct vkr_winehua_ubo_watch *watch =
-               &buffer->winehua_ubo_watches[watch_count];
-            watch->offset = info->offset;
-            watch->size = info->range;
-            watch->binding = write->dstBinding;
-            atomic_init(&watch->last_update_hash, 0);
-            atomic_init(&watch->last_update_hash_valid, false);
-            atomic_store_explicit(&buffer->winehua_ubo_watch_count,
-                                  watch_count + 1, memory_order_release);
-            vkr_log("WineHuaUboHost: phase=watch binding=%u bufferId=%" PRIu64
-                    " hostBuffer=0x%" PRIxPTR " descriptorOffset=%" PRIu64
-                    " descriptorRange=%" PRIu64,
-                    write->dstBinding, (uint64_t)buffer->base.id,
-                    (uintptr_t)buffer->base.handle.buffer,
-                    (uint64_t)info->offset, (uint64_t)info->range);
-         }
-
          const uint32_t binding_index = write->dstBinding - 3;
          const uint32_t array_element = write->dstArrayElement + j;
          struct vkr_winehua_ubo_binding *state =
@@ -337,37 +281,24 @@ vkr_winehua_register_ubo_watches(struct vkr_context *ctx,
             state->array_element != array_element ||
             state->descriptor_type != write->descriptorType;
          if (mapping_changed) {
-            const struct vkr_winehua_buffer_hashes hashes =
-               vkr_winehua_hash_buffer_descriptor(buffer, info);
-            const uint64_t sequence = atomic_fetch_add_explicit(
-               &vkr_winehua_ubo_descriptor_sequence, 1,
-               memory_order_relaxed) + 1;
-            vkr_log("WineHuaUboHost: phase=watched-descriptor"
-                    " descriptorSequence=%" PRIu64
-                    " submitGeneration=%" PRIu64
-                    " setId=%" PRIu64 " hostSet=0x%" PRIxPTR
-                    " binding=%u arrayElement=%u type=%u"
-                    " bufferId=%" PRIu64 " hostBuffer=0x%" PRIxPTR
-                    " memoryId=%" PRIu64 " hostMemory=0x%" PRIxPTR
-                    " descriptorOffset=%" PRIu64
-                    " descriptorRange=%" PRIu64
-                    " bufferMemoryOffset=%" PRIu64
-                    " absoluteOffset=%" PRIu64 " hashBytes=%zu"
-                    " shadowHash=%016" PRIx64,
-                    sequence, vkr_winehua_queue_submit_generation(),
-                    (uint64_t)set->base.id,
-                    (uintptr_t)set->base.handle.descriptor_set,
-                    write->dstBinding, array_element, write->descriptorType,
-                    (uint64_t)buffer->base.id,
-                    (uintptr_t)buffer->base.handle.buffer,
-                    (uint64_t)mem->base.id,
-                    (uintptr_t)mem->base.handle.device_memory,
-                    (uint64_t)info->offset, (uint64_t)info->range,
-                    (uint64_t)buffer->bound_memory_offset,
-                    (uint64_t)hashes.absolute_offset, hashes.byte_count,
-                    hashes.shadow_hash);
+            if (state->valid && state->last_bound_mapping_sequence ==
+                state->mapping_sequence) {
+               vkr_log("WineHuaUboHost: phase=descriptor-remap-after-bind"
+                       " submitGeneration=%" PRIu64
+                       " setId=%" PRIu64 " binding=%u"
+                       " oldMappingSequence=%" PRIu64
+                       " newBufferId=%" PRIu64
+                       " newDescriptorOffset=%" PRIu64
+                       " newDescriptorRange=%" PRIu64,
+                       vkr_winehua_queue_submit_generation(),
+                       (uint64_t)set->base.id, write->dstBinding,
+                       state->mapping_sequence, (uint64_t)buffer->base.id,
+                       (uint64_t)info->offset, (uint64_t)info->range);
+            }
+            state->mapping_sequence++;
          }
 
+         state->buffer = buffer;
          state->buffer_id = buffer->base.id;
          state->offset = info->offset;
          state->size = info->range;
@@ -713,9 +644,9 @@ vkr_dispatch_vkUpdateDescriptorSets(struct vn_dispatch_context *dispatch,
 
 #ifdef __OHOS__
    vkr_winehua_wait_descriptor_update_queues(dev);
-   vkr_winehua_register_ubo_watches(dispatch->data,
-                                    args->descriptorWriteCount,
-                                    args->pDescriptorWrites);
+   vkr_winehua_track_ubo_mappings(dispatch->data,
+                                  args->descriptorWriteCount,
+                                  args->pDescriptorWrites);
 #endif
    vkr_winehua_log_guest_descriptor_objects(args->descriptorWriteCount,
                                              args->pDescriptorWrites);

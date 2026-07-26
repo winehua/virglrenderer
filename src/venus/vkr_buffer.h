@@ -52,6 +52,14 @@ VKR_DEFINE_OBJECT_CAST(buffer_view, VK_OBJECT_TYPE_BUFFER_VIEW, VkBufferView)
 void
 vkr_context_init_buffer_dispatch(struct vkr_context *ctx);
 
+#ifdef __OHOS__
+bool
+vkr_winehua_buffer_add_ubo_watch_locked(struct vkr_buffer *buffer,
+                                        uint32_t binding,
+                                        VkDeviceSize offset,
+                                        VkDeviceSize size);
+#endif
+
 void
 vkr_context_init_buffer_view_dispatch(struct vkr_context *ctx);
 

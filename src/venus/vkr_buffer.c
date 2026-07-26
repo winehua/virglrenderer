@@ -40,6 +40,69 @@ vkr_winehua_set_buffer_memory(struct vkr_context *ctx,
    }
    mtx_unlock(&ctx->object_mutex);
 }
+
+bool
+vkr_winehua_buffer_add_ubo_watch_locked(struct vkr_buffer *buffer,
+                                        uint32_t binding,
+                                        VkDeviceSize offset,
+                                        VkDeviceSize size)
+{
+   if (!buffer)
+      return false;
+
+   if (!buffer->winehua_ubo_watches) {
+      buffer->winehua_ubo_watches = calloc(
+         VKR_WINEHUA_UBO_WATCH_COUNT,
+         sizeof(*buffer->winehua_ubo_watches));
+      if (!buffer->winehua_ubo_watches) {
+         if (!buffer->winehua_ubo_watch_overflow) {
+            buffer->winehua_ubo_watch_overflow = true;
+            vkr_log("WineHuaUboHost: phase=watch-allocation-failed "
+                    "bufferId=%" PRIu64,
+                    (uint64_t)buffer->base.id);
+         }
+         return false;
+      }
+   }
+
+   uint32_t watch_count = atomic_load_explicit(
+      &buffer->winehua_ubo_watch_count, memory_order_relaxed);
+   for (uint32_t i = 0; i < watch_count; i++) {
+      const struct vkr_winehua_ubo_watch *watch =
+         &buffer->winehua_ubo_watches[i];
+      if (watch->offset == offset && watch->size == size &&
+          watch->binding == binding)
+         return true;
+   }
+
+   if (watch_count == VKR_WINEHUA_UBO_WATCH_COUNT) {
+      if (!buffer->winehua_ubo_watch_overflow) {
+         buffer->winehua_ubo_watch_overflow = true;
+         vkr_log("WineHuaUboHost: phase=watch-overflow bufferId=%" PRIu64
+                 " capacity=%u",
+                 (uint64_t)buffer->base.id,
+                 VKR_WINEHUA_UBO_WATCH_COUNT);
+      }
+      return false;
+   }
+
+   struct vkr_winehua_ubo_watch *watch =
+      &buffer->winehua_ubo_watches[watch_count];
+   watch->offset = offset;
+   watch->size = size;
+   watch->binding = binding;
+   atomic_init(&watch->last_update_hash, 0);
+   atomic_init(&watch->last_update_hash_valid, false);
+   atomic_store_explicit(&buffer->winehua_ubo_watch_count,
+                         watch_count + 1, memory_order_release);
+   vkr_log("WineHuaUboHost: phase=watch binding=%u bufferId=%" PRIu64
+           " hostBuffer=0x%" PRIxPTR " descriptorOffset=%" PRIu64
+           " descriptorRange=%" PRIu64,
+           binding, (uint64_t)buffer->base.id,
+           (uintptr_t)buffer->base.handle.buffer,
+           (uint64_t)offset, (uint64_t)size);
+   return true;
+}
 #endif
 
 static void

@@ -31,6 +31,9 @@
    } while (0)
 
 #define VKR_WINEHUA_CAPTURE_TRACE_LIMIT 512u
+#ifdef __OHOS__
+#define VKR_WINEHUA_UBO_BOUND_TRACE_LIMIT 50000u
+#endif
 
 static bool
 vkr_winehua_capture_trace_enabled(void)
@@ -71,6 +74,77 @@ vkr_winehua_capture_trace_allow(void)
       vkr_log("WineHuaCapture: command capture limit reached; further records suppressed");
    return false;
 }
+
+#ifdef __OHOS__
+static bool
+vkr_winehua_ubo_identity_trace_enabled(void)
+{
+   const char *value = os_get_option("WINEHUA_VKR_TRACE_UBO_IDENTITY");
+   return value && value[0] && !(value[0] == '0' && !value[1]);
+}
+
+static bool
+vkr_winehua_ubo_bound_trace_allow(void)
+{
+   static atomic_uint emitted = ATOMIC_VAR_INIT(0);
+   const unsigned index =
+      atomic_fetch_add_explicit(&emitted, 1, memory_order_relaxed);
+   if (index < VKR_WINEHUA_UBO_BOUND_TRACE_LIMIT)
+      return true;
+   if (index == VKR_WINEHUA_UBO_BOUND_TRACE_LIMIT)
+      vkr_log("WineHuaUboHost: phase=bound-descriptor trace limit reached");
+   return false;
+}
+
+static void
+vkr_winehua_log_bound_ubo(struct vkr_command_buffer *cmd,
+                          struct vkr_descriptor_set *set)
+{
+   if (!cmd || !set)
+      return;
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(set->winehua_ubo_bindings); i++) {
+      struct vkr_winehua_ubo_binding *state =
+         &set->winehua_ubo_bindings[i];
+      struct vkr_buffer *buffer = state->buffer;
+      struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
+      if (!state->valid || !buffer || !mem ||
+          (state->size != 48 && state->size != 1536) ||
+          state->offset > UINT64_MAX - buffer->bound_memory_offset)
+         continue;
+
+      vkr_winehua_buffer_add_ubo_watch_locked(
+         buffer, i + 3, state->offset, state->size);
+      state->last_bound_mapping_sequence = state->mapping_sequence;
+      if (!vkr_winehua_ubo_bound_trace_allow())
+         continue;
+
+      vkr_log("WineHuaUboHost: phase=bound-descriptor"
+              " cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR
+              " setId=%" PRIu64 " hostSet=0x%" PRIxPTR
+              " mappingSequence=%" PRIu64
+              " binding=%u arrayElement=%u type=%u"
+              " bufferId=%" PRIu64 " hostBuffer=0x%" PRIxPTR
+              " memoryId=%" PRIu64 " hostMemory=0x%" PRIxPTR
+              " bufferMemoryOffset=%" PRIu64
+              " descriptorOffset=%" PRIu64
+              " absoluteOffset=%" PRIu64 " bytes=%" PRIu64,
+              (uint64_t)cmd->base.id,
+              (uintptr_t)cmd->base.handle.command_buffer,
+              (uint64_t)set->base.id,
+              (uintptr_t)set->base.handle.descriptor_set,
+              state->mapping_sequence, i + 3, state->array_element,
+              state->descriptor_type, (uint64_t)buffer->base.id,
+              (uintptr_t)buffer->base.handle.buffer,
+              (uint64_t)mem->base.id,
+              (uintptr_t)mem->base.handle.device_memory,
+              (uint64_t)buffer->bound_memory_offset,
+              (uint64_t)state->offset,
+              (uint64_t)(buffer->bound_memory_offset + state->offset),
+              (uint64_t)state->size);
+   }
+}
+#endif
 
 static void
 vkr_winehua_log_buffer_binding(const char *kind,
@@ -384,10 +458,25 @@ vkr_dispatch_vkCmdSetStencilReference(UNUSED struct vn_dispatch_context *dispatc
 }
 
 static void
-vkr_dispatch_vkCmdBindDescriptorSets(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkCmdBindDescriptorSets(struct vn_dispatch_context *dispatch,
                                      struct vn_command_vkCmdBindDescriptorSets *args)
 {
    struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+
+#ifdef __OHOS__
+   if (vkr_winehua_ubo_identity_trace_enabled()) {
+      struct vkr_context *ctx = dispatch->data;
+      mtx_lock(&ctx->object_mutex);
+      for (uint32_t i = 0; i < args->descriptorSetCount; i++) {
+         struct vkr_descriptor_set *set =
+            vkr_descriptor_set_from_handle(args->pDescriptorSets[i]);
+         vkr_winehua_log_bound_ubo(cmd, set);
+      }
+      mtx_unlock(&ctx->object_mutex);
+   }
+#else
+   (void)dispatch;
+#endif
 
    if (vkr_winehua_capture_trace_enabled()) {
       for (uint32_t i = 0; i < args->descriptorSetCount; i++) {

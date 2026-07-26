@@ -11,8 +11,13 @@
 #include "vkr_context.h"
 
 #ifdef __OHOS__
+struct vkr_buffer;
+
 struct vkr_winehua_ubo_binding {
+   struct vkr_buffer *buffer;
    uint64_t buffer_id;
+   uint64_t mapping_sequence;
+   uint64_t last_bound_mapping_sequence;
    VkDeviceSize offset;
    VkDeviceSize size;
    uint32_t array_element;
