@@ -800,11 +800,12 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
          for (uint32_t j = 0; j < submit->commandBufferCount; j++) {
             const struct vkr_command_buffer *cmd =
                vkr_command_buffer_from_handle(submit->pCommandBuffers[j]);
-            vkr_log("WineHuaFrameAssoc: queue-submit submit=%" PRIu64
+            vkr_log("WineHuaFrameAssoc: queue-submit ctx=%u submit=%" PRIu64
                     " queueId=%" PRIu64 " hostQueue=0x%" PRIxPTR
                     " batch=%u cmdIndex=%u guestCmd=0x%" PRIxPTR
                     " cmdId=%" PRIu64
                     " hostCmd=0x%" PRIxPTR,
+                    queue->context ? queue->context->ctx_id : 0,
                     submit_id, queue->base.id,
                     (uintptr_t)queue->base.handle.queue, i, j,
                     (uintptr_t)submit->pCommandBuffers[j],

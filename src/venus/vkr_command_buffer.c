@@ -686,7 +686,7 @@ vkr_dispatch_vkCmdWaitEvents(UNUSED struct vn_dispatch_context *dispatch,
 }
 
 static void
-vkr_dispatch_vkCmdPipelineBarrier(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkCmdPipelineBarrier(struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkCmdPipelineBarrier *args)
 {
    if (vkr_winehua_capture_trace_enabled()) {
@@ -708,11 +708,12 @@ vkr_dispatch_vkCmdPipelineBarrier(UNUSED struct vn_dispatch_context *dispatch,
                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT) &&
              barrier->oldLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
              barrier->newLayout == VK_IMAGE_LAYOUT_GENERAL) {
-            vkr_log("WineHuaFrameAssoc: source-transition guestCmd=0x%" PRIxPTR
+            const struct vkr_context *ctx = dispatch->data;
+            vkr_log("WineHuaFrameAssoc: source-transition ctx=%u guestCmd=0x%" PRIxPTR
                     " cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR
                     " imageId=%" PRIu64 " hostImage=0x%" PRIxPTR
                     " size=%ux%u format=%u oldLayout=%u newLayout=%u",
-                    (uintptr_t)args->commandBuffer,
+                    ctx ? ctx->ctx_id : 0, (uintptr_t)args->commandBuffer,
                     cmd ? cmd->base.id : 0,
                     cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0,
                     image->base.id, (uintptr_t)image->base.handle.image,
