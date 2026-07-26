@@ -48,6 +48,13 @@ vkr_winehua_frame_assoc_trace_enabled(void)
    return trace && trace[0] == '1' && !trace[1];
 }
 
+static bool
+vkr_winehua_present_image_trace_enabled(void)
+{
+   const char *trace = getenv("WINEHUA_VKR_TRACE_PRESENT_IMAGE");
+   return trace && trace[0] == '1' && !trace[1];
+}
+
 static void
 vkr_winehua_stage(const char *stage, uint32_t serial)
 {
@@ -385,6 +392,14 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
       vkr_log("WineHuaFrameAssoc: present serial=%u ctx=%u queueId=%" PRIu64
               " hostQueue=0x%" PRIxPTR " imageId=%" PRIu64
               " hostImage=0x%" PRIx64 " size=%ux%u format=%u layout=%u",
+              serial, ctx_id, queue_id, queue_handle, image_id, image_handle,
+              width, height, format, layout);
+   }
+   if (vkr_winehua_present_image_trace_enabled()) {
+      vkr_log("WineHuaPresentImage: layer=host event=present serial=%u "
+              "ctx=%u queueId=%" PRIu64 " hostQueue=0x%" PRIxPTR
+              " imageId=%" PRIu64 " hostImage=0x%" PRIx64
+              " size=%ux%u format=%u layout=%u",
               serial, ctx_id, queue_id, queue_handle, image_id, image_handle,
               width, height, format, layout);
    }
