@@ -106,6 +106,13 @@ VkResult
 vkr_device_memory_submit_shadow_upload(struct vkr_queue *queue);
 
 void
+vkr_device_memory_shadow_generation_begin(struct vkr_context *ctx,
+                                          bool submit);
+
+void
+vkr_device_memory_shadow_generation_end(struct vkr_context *ctx);
+
+void
 vkr_device_memory_disable_shadow_upload_coverage(struct vkr_context *ctx);
 
 struct vkr_shadow_sync_stats {

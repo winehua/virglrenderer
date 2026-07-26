@@ -675,6 +675,10 @@ vkr_context_destroy(struct vkr_context *ctx)
    _mesa_hash_table_destroy(ctx->resource_table, vkr_context_free_resource);
    mtx_destroy(&ctx->resource_mutex);
 
+#ifdef __OHOS__
+   mtx_destroy(&ctx->shadow_generation_mutex);
+#endif
+
    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
    mtx_destroy(&ctx->object_mutex);
 
@@ -749,6 +753,8 @@ vkr_context_create(uint32_t ctx_id,
       goto err_ctx_object_mutex;
 
 #ifdef __OHOS__
+   if (mtx_init(&ctx->shadow_generation_mutex, mtx_plain) != thrd_success)
+      goto err_ctx_shadow_generation_mutex;
    list_inithead(&ctx->shadow_dirty_memories);
 #endif
 
@@ -791,6 +797,10 @@ err_ctx_resource_table:
 err_ctx_resource_mutex:
    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
 err_ctx_object_table:
+#ifdef __OHOS__
+   mtx_destroy(&ctx->shadow_generation_mutex);
+err_ctx_shadow_generation_mutex:
+#endif
    mtx_destroy(&ctx->object_mutex);
 err_ctx_object_mutex:
    vkr_context_wait_ring_fini(ctx);

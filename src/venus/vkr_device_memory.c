@@ -36,6 +36,10 @@ vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
 #ifdef __OHOS__
 static atomic_uint_fast64_t vkr_ohos_shadow_to_host_sync_count;
 static atomic_uint_fast64_t vkr_ohos_shadow_from_host_sync_count;
+static atomic_uint_fast64_t vkr_ohos_shadow_generation_submit_count;
+static atomic_uint_fast64_t vkr_ohos_shadow_generation_flush_count;
+static atomic_uint_fast64_t vkr_ohos_shadow_generation_contended_count;
+static atomic_uint_fast64_t vkr_ohos_shadow_generation_wait_us;
 
 static bool
 vkr_ohos_shadow_trace_enabled(void)
@@ -399,6 +403,61 @@ vkr_ohos_now_ns(void)
    if (clock_gettime(CLOCK_MONOTONIC, &ts))
       return 0;
    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static bool
+vkr_ohos_shadow_generation_serialize_enabled(void)
+{
+   const char *value = os_get_option(
+      "VKR_WINEHUA_SHADOW_GENERATION_SERIALIZE");
+   return value && value[0] == '1' && !value[1];
+}
+
+void
+vkr_device_memory_shadow_generation_begin(struct vkr_context *ctx,
+                                          bool submit)
+{
+   if (!ctx || !vkr_ohos_shadow_generation_serialize_enabled())
+      return;
+
+   const uint64_t start_ns = vkr_ohos_now_ns();
+   const int try_result = mtx_trylock(&ctx->shadow_generation_mutex);
+   const bool contended = try_result != thrd_success;
+   if (contended)
+      mtx_lock(&ctx->shadow_generation_mutex);
+   const uint64_t end_ns = vkr_ohos_now_ns();
+   const uint64_t waited_us = start_ns && end_ns >= start_ns
+      ? (end_ns - start_ns) / 1000 : 0;
+
+   atomic_uint_fast64_t *role_counter = submit
+      ? &vkr_ohos_shadow_generation_submit_count
+      : &vkr_ohos_shadow_generation_flush_count;
+   const uint64_t role_count = atomic_fetch_add_explicit(
+      role_counter, 1, memory_order_relaxed) + 1;
+   const uint64_t total_wait_us = atomic_fetch_add_explicit(
+      &vkr_ohos_shadow_generation_wait_us, waited_us,
+      memory_order_relaxed) + waited_us;
+   const uint64_t contended_count = contended
+      ? atomic_fetch_add_explicit(
+           &vkr_ohos_shadow_generation_contended_count, 1,
+           memory_order_relaxed) + 1
+      : atomic_load_explicit(&vkr_ohos_shadow_generation_contended_count,
+                             memory_order_relaxed);
+
+   if (role_count <= 8 || !(role_count % 120) ||
+       (contended && (contended_count <= 8 || !(contended_count % 60))))
+      vkr_log("OHOS shadow generation lock role=%s count=%" PRIu64
+              " contended=%u contended_total=%" PRIu64
+              " waited_us=%" PRIu64 " wait_total_us=%" PRIu64,
+              submit ? "submit" : "flush", role_count, contended,
+              contended_count, waited_us, total_wait_us);
+}
+
+void
+vkr_device_memory_shadow_generation_end(struct vkr_context *ctx)
+{
+   if (ctx && vkr_ohos_shadow_generation_serialize_enabled())
+      mtx_unlock(&ctx->shadow_generation_mutex);
 }
 
 static uint32_t
@@ -981,6 +1040,7 @@ vkr_dispatch_vkFlushMappedMemoryRanges(
    struct vkr_context *ctx = dispatch->data;
    args->ret = VK_SUCCESS;
 
+   vkr_device_memory_shadow_generation_begin(ctx, false);
    mtx_lock(&ctx->object_mutex);
    for (uint32_t i = 0; i < args->memoryRangeCount; i++) {
       const VkMappedMemoryRange *range = &args->pMemoryRanges[i];
@@ -996,6 +1056,7 @@ vkr_dispatch_vkFlushMappedMemoryRanges(
          break;
    }
    mtx_unlock(&ctx->object_mutex);
+   vkr_device_memory_shadow_generation_end(ctx);
 }
 
 static void

@@ -839,6 +839,7 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
    VkResult upload_prepare_result = VK_SUCCESS;
    if (gpu_upload) {
       mtx_lock(&queue->shadow_upload_mutex);
+      vkr_device_memory_shadow_generation_begin(dispatch->data, true);
       upload_prepare_result =
          vkr_device_memory_prepare_shadow_upload(dispatch->data, queue,
                                                  perf_summary);
@@ -852,8 +853,10 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       vkr_ohos_wait_deferred_shadow_host_copy(
          dispatch->data, queue, vk);
    if (deferred_host_wait_result != VK_SUCCESS) {
-      if (gpu_upload)
+      if (gpu_upload) {
+         vkr_device_memory_shadow_generation_end(dispatch->data);
          mtx_unlock(&queue->shadow_upload_mutex);
+      }
       args->ret = deferred_host_wait_result;
       return;
    }
@@ -861,6 +864,8 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
 #ifdef __OHOS__
    struct vkr_shadow_sync_stats shadow_stats =
       vkr_device_memory_sync_shadows_to_host(dispatch->data);
+   if (gpu_upload)
+      vkr_device_memory_shadow_generation_end(dispatch->data);
    const uint64_t sync_end_ns = perf_summary ? vkr_ohos_queue_now_ns() : 0;
    const bool upload_prepared = gpu_upload && queue->shadow_upload_prepared;
    const bool inline_upload = upload_prepared && queue->shadow_upload_inline &&
