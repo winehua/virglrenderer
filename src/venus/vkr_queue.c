@@ -63,6 +63,13 @@ static atomic_uint_fast64_t vkr_ohos_perf_total_max_us;
 static atomic_uint_fast64_t vkr_ohos_perf_submit_gap_total_us;
 static atomic_uint_fast64_t vkr_ohos_perf_submit_gap_max_us;
 
+uint64_t
+vkr_winehua_queue_submit_generation(void)
+{
+   return atomic_load_explicit(&vkr_ohos_queue_submit_count,
+                               memory_order_acquire);
+}
+
 static bool
 vkr_ohos_gpu_upload_inline_enabled(void)
 {

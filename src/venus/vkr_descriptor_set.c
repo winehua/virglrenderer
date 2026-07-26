@@ -90,6 +90,14 @@ vkr_winehua_wait_descriptor_update_queues(struct vkr_device *dev)
    if (!dev || !vkr_winehua_descriptor_update_serialize_enabled())
       return;
 
+   const uint64_t submit_generation =
+      vkr_winehua_queue_submit_generation();
+   if (!submit_generation ||
+       atomic_load_explicit(
+          &dev->winehua_descriptor_wait_submit_generation,
+          memory_order_acquire) == submit_generation)
+      return;
+
    static atomic_uint_fast64_t wait_count = ATOMIC_VAR_INIT(0);
    uint32_t queue_count = 0;
    VkResult first_error = VK_SUCCESS;
@@ -102,10 +110,14 @@ vkr_winehua_wait_descriptor_update_queues(struct vkr_device *dev)
          first_error = result;
    }
 
-   const uint64_t count = atomic_fetch_add_explicit(&wait_count, 1, memory_order_relaxed) + 1;
+   const uint64_t count = atomic_fetch_add_explicit(
+      &wait_count, 1, memory_order_relaxed) + 1;
+   atomic_store_explicit(&dev->winehua_descriptor_wait_submit_generation,
+                         submit_generation, memory_order_release);
    if (count <= 8 || !(count % 120) || first_error != VK_SUCCESS)
       vkr_log("WineHua descriptor update queue wait count=%" PRIu64
-              " queues=%u result=%d", count, queue_count, first_error);
+              " submit_generation=%" PRIu64 " queues=%u result=%d",
+              count, submit_generation, queue_count, first_error);
 }
 #endif
 

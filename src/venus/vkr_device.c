@@ -190,6 +190,9 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    }
 
    dev->physical_device = physical_dev;
+#ifdef __OHOS__
+   atomic_init(&dev->winehua_descriptor_wait_submit_generation, 0);
+#endif
 
    vkr_device_init_proc_table(dev, physical_dev->api_version,
                               args->pCreateInfo->ppEnabledExtensionNames,

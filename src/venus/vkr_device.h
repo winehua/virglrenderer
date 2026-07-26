@@ -27,6 +27,14 @@ struct vkr_device {
    mtx_t object_mutex;
    struct list_head objects;
 
+#ifdef __OHOS__
+   /* Diagnostic descriptor serialization waits at most once for each Host
+    * queue-submit generation. Waiting before every descriptor write makes a
+    * real game effectively single-step and can mask the ordering failure the
+    * A/B is intended to isolate. */
+   atomic_uint_fast64_t winehua_descriptor_wait_submit_generation;
+#endif
+
    void *mtl_device;
 };
 VKR_DEFINE_OBJECT_CAST(device, VK_OBJECT_TYPE_DEVICE, VkDevice)

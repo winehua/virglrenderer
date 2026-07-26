@@ -125,6 +125,11 @@ vkr_queue_create(struct vkr_context *ctx,
 void
 vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
 
+#ifdef __OHOS__
+uint64_t
+vkr_winehua_queue_submit_generation(void);
+#endif
+
 bool
 vkr_queue_sync_submit(struct vkr_queue *queue,
                       uint32_t flags,
