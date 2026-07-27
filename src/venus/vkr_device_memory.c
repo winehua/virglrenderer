@@ -126,7 +126,13 @@ static bool
 vkr_ohos_shadow_bound_buffer_list_enabled(void)
 {
    const char *value = os_get_option("VKR_WINEHUA_BOUND_BUFFER_LIST");
-   return value && value[0] == '1' && !value[1];
+   const bool enabled = value && value[0] == '1' && !value[1];
+   if (enabled) {
+      static atomic_flag logged = ATOMIC_FLAG_INIT;
+      if (!atomic_flag_test_and_set_explicit(&logged, memory_order_relaxed))
+         vkr_log("WineHua shadow bound-buffer dirty iteration enabled");
+   }
+   return enabled;
 }
 
 static bool
