@@ -17,6 +17,11 @@ struct vkr_ohos_shadow_dirty_range {
    VkDeviceSize offset;
    VkDeviceSize size;
 };
+
+struct vkr_ohos_shadow_coverage_range {
+   VkDeviceSize begin;
+   VkDeviceSize end;
+};
 #endif
 
 struct vkr_device_memory {
@@ -68,6 +73,8 @@ struct vkr_device_memory {
    struct list_head shadow_dirty_head;
    bool shadow_dirty_listed;
    struct list_head bound_buffers;
+   struct vkr_ohos_shadow_coverage_range *shadow_coverage_ranges;
+   uint32_t shadow_coverage_range_capacity;
    void *shadow_upload_snapshot;
    bool shadow_host_copy_deferred;
    bool shadow_gpu_upload_covered;
