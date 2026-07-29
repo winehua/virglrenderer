@@ -38,6 +38,7 @@ struct vkr_buffer {
    VkDeviceSize size;
    VkBufferUsageFlags guest_usage;
    VkBufferUsageFlags host_usage;
+   uint64_t winehua_shadow_record_submit_id;
    struct list_head memory_head;
    bool memory_listed;
 #endif

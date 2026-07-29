@@ -176,6 +176,23 @@ vkr_ohos_shadow_merge_ranges_enabled(void)
    return !(value && value[0] == '0' && !value[1]);
 }
 
+/* A dirty VkDeviceMemory range can be visible through several VkBuffer
+ * aliases.  Updating every alias writes the same backing memory repeatedly.
+ * Keep this opt-in until the exact-cover implementation has completed device
+ * A/B validation; the normal path remains the conservative per-buffer walk. */
+static bool
+vkr_ohos_shadow_cover_upload_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_COVER_UPLOAD");
+   const bool enabled = value && value[0] == '1' && !value[1];
+   if (enabled) {
+      static atomic_flag logged = ATOMIC_FLAG_INIT;
+      if (!atomic_flag_test_and_set_explicit(&logged, memory_order_relaxed))
+         vkr_log("WineHua shadow exact alias-cover upload A/B enabled");
+   }
+   return enabled;
+}
+
 static int
 vkr_ohos_shadow_dirty_range_compare(const void *lhs_ptr, const void *rhs_ptr)
 {
@@ -320,6 +337,9 @@ struct vkr_ohos_shadow_upload_record {
    bool merge_ranges;
    uint32_t update_count;
    uint32_t upload_range_count;
+   uint32_t buffer_count;
+   uint32_t uniform_buffer_count;
+   uint32_t storage_buffer_count;
    uint64_t upload_bytes;
 };
 
@@ -329,6 +349,22 @@ struct vkr_ohos_shadow_dirty_summary {
    uint32_t range_count;
    uint32_t range_overflow_count;
 };
+
+static void
+vkr_ohos_shadow_upload_record_buffer(
+   struct vkr_ohos_shadow_upload_record *record,
+   struct vkr_buffer *buffer)
+{
+   if (buffer->winehua_shadow_record_submit_id == record->submit_id)
+      return;
+
+   buffer->winehua_shadow_record_submit_id = record->submit_id;
+   record->buffer_count++;
+   if (buffer->host_usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)
+      record->uniform_buffer_count++;
+   if (buffer->host_usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)
+      record->storage_buffer_count++;
+}
 
 static bool
 vkr_ohos_shadow_dirty_ranges_buffer_covered_legacy(
@@ -389,72 +425,80 @@ vkr_ohos_shadow_dirty_ranges_buffer_covered_sorted(
    if (!has_nonempty_dirty_range)
       return mem->shadow_dirty_range_count > 0;
 
-   uint32_t buffer_count = 0;
-   list_for_each_entry (struct vkr_buffer, buffer,
-                        &mem->bound_buffers, memory_head) {
-      if (buffer->bound_memory == mem &&
-          (buffer->host_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
-         buffer_count++;
-   }
-
-   if (!buffer_count)
-      return false;
-
-   if (mem->shadow_coverage_range_capacity < buffer_count) {
-      struct vkr_ohos_shadow_coverage_range *ranges = realloc(
-         mem->shadow_coverage_ranges, sizeof(*ranges) * buffer_count);
-      if (!ranges) {
-         static atomic_flag logged = ATOMIC_FLAG_INIT;
-         if (!atomic_flag_test_and_set_explicit(&logged,
-                                                memory_order_relaxed))
-            vkr_log("WineHua shadow coverage scratch allocation failed; "
-                    "using legacy coverage scan");
-         return vkr_ohos_shadow_dirty_ranges_buffer_covered_legacy(mem);
+   if (!mem->shadow_coverage_valid) {
+      uint32_t buffer_count = 0;
+      list_for_each_entry (struct vkr_buffer, buffer,
+                           &mem->bound_buffers, memory_head) {
+         if (buffer->bound_memory == mem &&
+             (buffer->host_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+            buffer_count++;
       }
-      mem->shadow_coverage_ranges = ranges;
-      mem->shadow_coverage_range_capacity = buffer_count;
+
+      if (!buffer_count)
+         return false;
+
+      if (mem->shadow_coverage_range_capacity < buffer_count) {
+         struct vkr_ohos_shadow_coverage_range *ranges = realloc(
+            mem->shadow_coverage_ranges, sizeof(*ranges) * buffer_count);
+         if (!ranges) {
+            static atomic_flag logged = ATOMIC_FLAG_INIT;
+            if (!atomic_flag_test_and_set_explicit(&logged,
+                                                   memory_order_relaxed))
+               vkr_log("WineHua shadow coverage scratch allocation failed; "
+                       "using legacy coverage scan");
+            return vkr_ohos_shadow_dirty_ranges_buffer_covered_legacy(mem);
+         }
+         mem->shadow_coverage_ranges = ranges;
+         mem->shadow_coverage_range_capacity = buffer_count;
+      }
+
+      uint32_t range_count = 0;
+      list_for_each_entry (struct vkr_buffer, buffer,
+                           &mem->bound_buffers, memory_head) {
+         if (buffer->bound_memory != mem ||
+             !(buffer->host_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+            continue;
+
+         const VkDeviceSize begin = MIN2(
+            buffer->bound_memory_offset, allocation_size);
+         const VkDeviceSize size = MIN2(
+            buffer->size, allocation_size - begin);
+         if (!size)
+            continue;
+         mem->shadow_coverage_ranges[range_count++] =
+            (struct vkr_ohos_shadow_coverage_range) {
+               .begin = begin,
+               .end = begin + size,
+            };
+      }
+      if (!range_count)
+         return false;
+
+      if (range_count > 1)
+         qsort(mem->shadow_coverage_ranges, range_count,
+               sizeof(*mem->shadow_coverage_ranges),
+               vkr_ohos_shadow_coverage_range_compare);
+
+      uint32_t merged_count = 0;
+      for (uint32_t i = 0; i < range_count; i++) {
+         const struct vkr_ohos_shadow_coverage_range current =
+            mem->shadow_coverage_ranges[i];
+         if (merged_count && current.begin <=
+                mem->shadow_coverage_ranges[merged_count - 1].end) {
+            mem->shadow_coverage_ranges[merged_count - 1].end = MAX2(
+               mem->shadow_coverage_ranges[merged_count - 1].end,
+               current.end);
+         } else {
+            mem->shadow_coverage_ranges[merged_count++] = current;
+         }
+      }
+      mem->shadow_coverage_range_count = merged_count;
+      mem->shadow_coverage_valid = true;
    }
 
-   uint32_t range_count = 0;
-   list_for_each_entry (struct vkr_buffer, buffer,
-                        &mem->bound_buffers, memory_head) {
-      if (buffer->bound_memory != mem ||
-          !(buffer->host_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
-         continue;
-
-      const VkDeviceSize begin = MIN2(
-         buffer->bound_memory_offset, allocation_size);
-      const VkDeviceSize size = MIN2(
-         buffer->size, allocation_size - begin);
-      if (!size)
-         continue;
-      mem->shadow_coverage_ranges[range_count++] =
-         (struct vkr_ohos_shadow_coverage_range) {
-            .begin = begin,
-            .end = begin + size,
-         };
-   }
+   const uint32_t range_count = mem->shadow_coverage_range_count;
    if (!range_count)
       return false;
-
-   if (range_count > 1)
-      qsort(mem->shadow_coverage_ranges, range_count,
-            sizeof(*mem->shadow_coverage_ranges),
-            vkr_ohos_shadow_coverage_range_compare);
-
-   uint32_t merged_count = 0;
-   for (uint32_t i = 0; i < range_count; i++) {
-      const struct vkr_ohos_shadow_coverage_range current =
-         mem->shadow_coverage_ranges[i];
-      if (merged_count && current.begin <=
-             mem->shadow_coverage_ranges[merged_count - 1].end) {
-         mem->shadow_coverage_ranges[merged_count - 1].end = MAX2(
-            mem->shadow_coverage_ranges[merged_count - 1].end,
-            current.end);
-      } else {
-         mem->shadow_coverage_ranges[merged_count++] = current;
-      }
-   }
 
    uint32_t coverage_index = 0;
    for (uint32_t i = 0; i < mem->shadow_dirty_range_count; i++) {
@@ -467,10 +511,10 @@ vkr_ohos_shadow_dirty_ranges_buffer_covered_sorted(
       if (!dirty_size)
          continue;
 
-      while (coverage_index < merged_count &&
+      while (coverage_index < range_count &&
              mem->shadow_coverage_ranges[coverage_index].end <= dirty_begin)
          coverage_index++;
-      if (coverage_index == merged_count ||
+      if (coverage_index == range_count ||
           mem->shadow_coverage_ranges[coverage_index].begin > dirty_begin ||
           mem->shadow_coverage_ranges[coverage_index].end < dirty_end)
          return false;
@@ -485,6 +529,16 @@ vkr_ohos_shadow_dirty_ranges_buffer_covered(
    if (vkr_ohos_shadow_coverage_sort_enabled())
       return vkr_ohos_shadow_dirty_ranges_buffer_covered_sorted(mem);
    return vkr_ohos_shadow_dirty_ranges_buffer_covered_legacy(mem);
+}
+
+void
+vkr_device_memory_invalidate_shadow_coverage(struct vkr_device_memory *mem)
+{
+   if (!mem)
+      return;
+
+   mem->shadow_coverage_range_count = 0;
+   mem->shadow_coverage_valid = false;
 }
 
 static void
@@ -564,6 +618,8 @@ vkr_ohos_record_shadow_upload_buffer(
       if (relative_end <= relative_begin)
          continue;
 
+      vkr_ohos_shadow_upload_record_buffer(record, buffer);
+
       if (vkr_ohos_ubo_identity_trace_verbose() &&
           vkr_ohos_ubo_identity_trace_allow(
              &vkr_ohos_ubo_range_trace_count, "upload-range")) {
@@ -620,6 +676,100 @@ vkr_ohos_record_shadow_upload_buffer(
          record->vk, record->command, buffer, mem, record->submit_id,
          pending_begin,
          pending_end, &record->update_count, &record->upload_bytes);
+}
+
+/* Record every dirty byte exactly once through a buffer that covers its
+ * backing-memory address.  VkBuffer aliases share the same VkDeviceMemory,
+ * so this is equivalent to the conservative per-buffer path without its
+ * repeated writes.  Callers use it only after the existing coverage proof has
+ * established complete TRANSFER_DST coverage. */
+static bool
+vkr_ohos_record_shadow_upload_memory_cover(
+   struct vkr_ohos_shadow_upload_record *record,
+   struct vkr_device_memory *mem)
+{
+   const VkDeviceSize allocation_size = MIN2(
+      mem->allocation_size, mem->shadow_size);
+   VkDeviceSize prior_dirty_end = 0;
+   bool have_prior_dirty_end = false;
+
+   for (uint32_t range_index = 0;
+        range_index < mem->shadow_dirty_range_count;
+        range_index++) {
+      const struct vkr_ohos_shadow_dirty_range *range =
+         &mem->shadow_dirty_ranges[range_index];
+      VkDeviceSize dirty_begin = MIN2(range->offset, allocation_size);
+      const VkDeviceSize dirty_size = MIN2(
+         range->size, allocation_size - dirty_begin);
+      const VkDeviceSize dirty_end = dirty_begin + dirty_size;
+      if (!dirty_size)
+         continue;
+
+      /* Dirty ranges are sorted by prepare_shadow_dirty_memory.  Coalesce
+       * overlaps here so a repeated flush does not recreate a duplicate
+       * command through a different buffer alias. */
+      if (have_prior_dirty_end) {
+         if (dirty_end <= prior_dirty_end)
+            continue;
+         dirty_begin = MAX2(dirty_begin, prior_dirty_end);
+      }
+
+      VkDeviceSize cursor = dirty_begin;
+      while (cursor < dirty_end) {
+         struct vkr_buffer *best_buffer = NULL;
+         VkDeviceSize best_buffer_begin = 0;
+         VkDeviceSize best_buffer_end = cursor;
+
+         list_for_each_entry (struct vkr_buffer, buffer,
+                              &mem->bound_buffers, memory_head) {
+            if (buffer->bound_memory != mem ||
+                !(buffer->host_usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT))
+               continue;
+
+            const VkDeviceSize buffer_begin = MIN2(
+               buffer->bound_memory_offset, allocation_size);
+            const VkDeviceSize buffer_size = MIN2(
+               buffer->size, allocation_size - buffer_begin);
+            const VkDeviceSize buffer_end = buffer_begin + buffer_size;
+            if (buffer_begin <= cursor && buffer_end > best_buffer_end) {
+               best_buffer = buffer;
+               best_buffer_begin = buffer_begin;
+               best_buffer_end = buffer_end;
+            }
+         }
+
+         if (!best_buffer) {
+            vkr_log("WineHua shadow alias-cover unexpectedly uncovered "
+                    "memoryId=%" PRIu64 " offset=%" PRIu64,
+                    (uint64_t)mem->base.id, (uint64_t)cursor);
+            mem->shadow_gpu_upload_covered = false;
+            return false;
+         }
+
+         const VkDeviceSize segment_end = MIN2(best_buffer_end, dirty_end);
+         VkDeviceSize relative_begin = cursor - best_buffer_begin;
+         VkDeviceSize relative_end = segment_end - best_buffer_begin;
+         const VkDeviceSize buffer_size = best_buffer_end - best_buffer_begin;
+         relative_begin &= ~(VkDeviceSize)3;
+         relative_end = MIN2(ALIGN(relative_end, 4), buffer_size);
+         relative_end &= ~(VkDeviceSize)3;
+         if (relative_end > relative_begin) {
+            vkr_ohos_shadow_upload_record_buffer(record, best_buffer);
+            mem->shadow_gpu_upload_covered = true;
+            record->upload_range_count++;
+            vkr_ohos_record_shadow_upload_range(
+               record->vk, record->command, best_buffer, mem,
+               record->submit_id, relative_begin, relative_end,
+               &record->update_count, &record->upload_bytes);
+         }
+         cursor = segment_end;
+      }
+
+      prior_dirty_end = dirty_end;
+      have_prior_dirty_end = true;
+   }
+
+   return true;
 }
 
 #define VKR_OHOS_SHADOW_BATCH_MAX_RANGES 256u
@@ -1285,7 +1435,9 @@ vkr_dispatch_vkAllocateMemory(struct vn_dispatch_context *dispatch,
    mem->shadow_dirty_listed = false;
    list_inithead(&mem->bound_buffers);
    mem->shadow_coverage_ranges = NULL;
+   mem->shadow_coverage_range_count = 0;
    mem->shadow_coverage_range_capacity = 0;
+   mem->shadow_coverage_valid = false;
    mem->shadow_upload_snapshot = NULL;
    mem->shadow_host_copy_deferred = false;
    mem->shadow_gpu_upload_covered = false;
@@ -1510,7 +1662,9 @@ vkr_device_memory_release(struct vkr_device_memory *mem)
    mem->shadow_host_copy_deferred = false;
    mem->shadow_dirty_range_count = 0;
    mem->shadow_dirty_range_capacity = 0;
+   mem->shadow_coverage_range_count = 0;
    mem->shadow_coverage_range_capacity = 0;
+   mem->shadow_coverage_valid = false;
 #endif
    vkr_mtl_shm_free(mem->mtl_shm);
    if (mem->gbm_bo)
@@ -2253,6 +2407,9 @@ vkr_device_memory_prepare_shadow_upload(struct vkr_context *ctx,
    queue->shadow_upload_bytes = 0;
    queue->shadow_upload_updates = 0;
    queue->shadow_upload_ranges = 0;
+   queue->shadow_upload_buffers = 0;
+   queue->shadow_upload_uniform_buffers = 0;
+   queue->shadow_upload_storage_buffers = 0;
    if (perf_timing) {
       queue->shadow_upload_wait_us = 0;
       queue->shadow_upload_reset_begin_us = 0;
@@ -2396,7 +2553,29 @@ vkr_device_memory_prepare_shadow_upload(struct vkr_context *ctx,
       .submit_id = submit_id,
       .merge_ranges = vkr_ohos_shadow_merge_ranges_enabled(),
    };
-   if (use_dirty_list && vkr_ohos_shadow_bound_buffer_list_enabled()) {
+   const bool cover_upload = use_dirty_list &&
+      vkr_ohos_shadow_cover_upload_enabled();
+   if (cover_upload) {
+      list_for_each_entry (struct vkr_device_memory, mem,
+                           &ctx->shadow_dirty_memories,
+                           shadow_dirty_head) {
+         if (mem->device != dev || !mem->shadow_host_dirty)
+            continue;
+
+         if (mem->shadow_gpu_upload_full_coverage &&
+             vkr_ohos_record_shadow_upload_memory_cover(&record, mem))
+            continue;
+
+         /* The coverage proof is deliberately a hard prerequisite.  An
+          * unexpected gap falls through to the established exact per-buffer
+          * path, after which the normal mapped-memory fallback handles any
+          * still-uncovered bytes. */
+         list_for_each_entry (struct vkr_buffer, buffer,
+                              &mem->bound_buffers, memory_head) {
+            vkr_ohos_record_shadow_upload_buffer(&record, buffer);
+         }
+      }
+   } else if (use_dirty_list && vkr_ohos_shadow_bound_buffer_list_enabled()) {
       list_for_each_entry (struct vkr_device_memory, mem,
                            &ctx->shadow_dirty_memories,
                            shadow_dirty_head) {
@@ -2483,6 +2662,9 @@ vkr_device_memory_prepare_shadow_upload(struct vkr_context *ctx,
    queue->shadow_upload_bytes = record.upload_bytes;
    queue->shadow_upload_updates = record.update_count;
    queue->shadow_upload_ranges = record.upload_range_count;
+   queue->shadow_upload_buffers = record.buffer_count;
+   queue->shadow_upload_uniform_buffers = record.uniform_buffer_count;
+   queue->shadow_upload_storage_buffers = record.storage_buffer_count;
    queue->shadow_upload_prepared = record.update_count > 0;
    if (vkr_ohos_shadow_trace_enabled() && dirty.allocation_count)
       vkr_log("OHOS shadow GPU upload prepared ranges=%u updates=%u bytes=%" PRIu64

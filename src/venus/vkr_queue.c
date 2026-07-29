@@ -14,6 +14,7 @@
 #include "vkr_queue_gen.h"
 
 #ifdef __OHOS__
+#include <stdlib.h>
 #include <time.h>
 
 static atomic_uint_fast64_t vkr_ohos_queue_submit_count;
@@ -50,6 +51,9 @@ static atomic_uint_fast64_t vkr_ohos_perf_sync_max_us;
 static atomic_uint_fast64_t vkr_ohos_perf_lock_total_us;
 static atomic_uint_fast64_t vkr_ohos_perf_lock_max_us;
 static atomic_uint_fast64_t vkr_ohos_perf_upload_submit_count;
+static atomic_uint_fast64_t vkr_ohos_perf_upload_buffers;
+static atomic_uint_fast64_t vkr_ohos_perf_upload_uniform_buffers;
+static atomic_uint_fast64_t vkr_ohos_perf_upload_storage_buffers;
 static atomic_uint_fast64_t vkr_ohos_perf_upload_ranges;
 static atomic_uint_fast64_t vkr_ohos_perf_upload_updates;
 static atomic_uint_fast64_t vkr_ohos_perf_upload_bytes;
@@ -102,6 +106,150 @@ vkr_ohos_perf_summary_enabled(void)
 {
    static atomic_int cached = ATOMIC_VAR_INIT(-1);
    return vkr_ohos_cached_option_enabled("VKR_WINEHUA_PERF_SUMMARY", &cached);
+}
+
+/* The full summary instruments every submit.  This separate mode samples one
+ * submit in a fixed interval, keeping all other submissions on the production
+ * path without extra clocks or aggregate accounting. */
+static uint32_t
+vkr_ohos_perf_sample_interval(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int interval = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (interval < 0) {
+      const char *value = os_get_option("VKR_WINEHUA_PERF_SAMPLE_INTERVAL");
+      char *end = NULL;
+      const unsigned long parsed = value ? strtoul(value, &end, 10) : 0;
+      interval = value && end && !*end && parsed > 0 && parsed <= 1000000
+         ? (int)parsed : 0;
+      atomic_store_explicit(&cached, interval, memory_order_relaxed);
+   }
+   return (uint32_t)interval;
+}
+
+static uint32_t
+vkr_ohos_frame_timeline_interval(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   int interval = atomic_load_explicit(&cached, memory_order_relaxed);
+   if (interval < 0) {
+      const char *value = os_get_option("VKR_WINEHUA_FRAME_TIMELINE_INTERVAL");
+      char *end = NULL;
+      const unsigned long parsed = value ? strtoul(value, &end, 10) : 0;
+      interval = value && end && !*end && parsed > 0 && parsed <= 1000000
+         ? (int)parsed : 0;
+      atomic_store_explicit(&cached, interval, memory_order_relaxed);
+   }
+   return (uint32_t)interval;
+}
+
+static void
+vkr_ohos_frame_timeline_reset(struct vkr_queue *queue, uint32_t serial)
+{
+   queue->winehua_frame_timeline_serial = serial;
+   queue->winehua_frame_submit_count = 0;
+   queue->winehua_frame_submit_infos = 0;
+   queue->winehua_frame_command_buffers = 0;
+   queue->winehua_frame_wait_semaphores = 0;
+   queue->winehua_frame_signal_semaphores = 0;
+   queue->winehua_frame_shadow_bytes = 0;
+   queue->winehua_frame_upload_bytes = 0;
+   queue->winehua_frame_upload_ranges = 0;
+   queue->winehua_frame_prepare_us = 0;
+   queue->winehua_frame_sync_us = 0;
+   queue->winehua_frame_upload_us = 0;
+   queue->winehua_frame_lock_us = 0;
+   queue->winehua_frame_driver_us = 0;
+   queue->winehua_frame_total_us = 0;
+}
+
+static void
+vkr_ohos_frame_timeline_account(struct vkr_queue *queue,
+                                 const struct vn_command_vkQueueSubmit *args,
+                                 const struct vkr_shadow_sync_stats *shadow_stats,
+                                 uint64_t upload_bytes,
+                                 uint32_t upload_ranges,
+                                 uint64_t prepare_us,
+                                 uint64_t sync_us,
+                                 uint64_t upload_us,
+                                 uint64_t lock_us,
+                                 uint64_t driver_us,
+                                 uint64_t total_us)
+{
+   if (!queue->winehua_frame_timeline_active)
+      return;
+
+   uint64_t command_buffers = 0;
+   uint64_t waits = 0;
+   uint64_t signals = 0;
+   for (uint32_t i = 0; i < args->submitCount; i++) {
+      command_buffers += args->pSubmits[i].commandBufferCount;
+      waits += args->pSubmits[i].waitSemaphoreCount;
+      signals += args->pSubmits[i].signalSemaphoreCount;
+   }
+
+   queue->winehua_frame_submit_count++;
+   queue->winehua_frame_submit_infos += args->submitCount;
+   queue->winehua_frame_command_buffers += command_buffers;
+   queue->winehua_frame_wait_semaphores += waits;
+   queue->winehua_frame_signal_semaphores += signals;
+   queue->winehua_frame_shadow_bytes += shadow_stats->bytes;
+   queue->winehua_frame_upload_bytes += upload_bytes;
+   queue->winehua_frame_upload_ranges += upload_ranges;
+   queue->winehua_frame_prepare_us += prepare_us;
+   queue->winehua_frame_sync_us += sync_us;
+   queue->winehua_frame_upload_us += upload_us;
+   queue->winehua_frame_lock_us += lock_us;
+   queue->winehua_frame_driver_us += driver_us;
+   queue->winehua_frame_total_us += total_us;
+}
+
+void
+vkr_winehua_queue_frame_timeline_present(struct vkr_queue *queue,
+                                         uint32_t present_serial)
+{
+   if (!queue || !queue->winehua_frame_timeline_interval)
+      return;
+
+   /* vkr_renderer owns queue->vk_mutex for the duration of this call. */
+   if (queue->winehua_frame_timeline_active) {
+      vkr_log("WineHuaFrameTimeline: layer=host serial=%u "
+              "queue_submits=%" PRIu64 " submit_infos=%" PRIu64
+              " command_buffers=%" PRIu64 " waits=%" PRIu64
+              " signals=%" PRIu64 " shadow_bytes=%" PRIu64
+              " upload_bytes=%" PRIu64 " upload_ranges=%" PRIu64
+              " prepare_us=%" PRIu64 " sync_us=%" PRIu64
+              " upload_us=%" PRIu64 " lock_us=%" PRIu64
+              " driver_us=%" PRIu64 " total_cpu_us=%" PRIu64,
+              queue->winehua_frame_timeline_serial,
+              queue->winehua_frame_submit_count,
+              queue->winehua_frame_submit_infos,
+              queue->winehua_frame_command_buffers,
+              queue->winehua_frame_wait_semaphores,
+              queue->winehua_frame_signal_semaphores,
+              queue->winehua_frame_shadow_bytes,
+              queue->winehua_frame_upload_bytes,
+              queue->winehua_frame_upload_ranges,
+              queue->winehua_frame_prepare_us,
+              queue->winehua_frame_sync_us,
+              queue->winehua_frame_upload_us,
+              queue->winehua_frame_lock_us,
+              queue->winehua_frame_driver_us,
+              queue->winehua_frame_total_us);
+   }
+
+   const uint32_t next_serial = present_serial + 1;
+   queue->winehua_frame_timeline_active =
+      !(next_serial % queue->winehua_frame_timeline_interval);
+   if (queue->winehua_frame_timeline_active)
+      vkr_ohos_frame_timeline_reset(queue, next_serial);
+}
+
+static bool
+vkr_ohos_perf_sample_now(uint64_t id)
+{
+   const uint32_t interval = vkr_ohos_perf_sample_interval();
+   return interval && !(id % interval);
 }
 
 static bool
@@ -519,8 +667,19 @@ vkr_queue_create(struct vkr_context *ctx,
    queue->shadow_upload_prepared = false;
    queue->shadow_upload_bytes = 0;
    queue->shadow_upload_updates = 0;
+   queue->shadow_upload_ranges = 0;
+   queue->shadow_upload_buffers = 0;
+   queue->shadow_upload_uniform_buffers = 0;
+   queue->shadow_upload_storage_buffers = 0;
    queue->winehua_perf_summary = vkr_ohos_perf_summary_enabled();
+   queue->winehua_perf_sample_interval = vkr_ohos_perf_sample_interval();
+   queue->winehua_frame_timeline_interval =
+      vkr_ohos_frame_timeline_interval();
+   queue->winehua_frame_timeline_active = false;
+   vkr_ohos_frame_timeline_reset(queue, 0);
    atomic_init(&queue->winehua_perf_last_submit_end_ns, 0);
+   atomic_init(&queue->winehua_perf_last_sample_end_ns, 0);
+   atomic_init(&queue->winehua_perf_last_sample_submit_id, 0);
    queue->shadow_upload_wait_us = 0;
    queue->shadow_upload_reset_begin_us = 0;
    queue->shadow_upload_dirty_scan_us = 0;
@@ -820,8 +979,12 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
 #ifdef __OHOS__
    const bool perf_trace = vkr_ohos_perf_trace_enabled();
    const bool perf_summary = queue->winehua_perf_summary;
-   const bool perf_timing = perf_trace || perf_summary;
-   const uint64_t submit_start_ns = perf_summary ? vkr_ohos_queue_now_ns() : 0;
+   const bool perf_sample = queue->winehua_perf_sample_interval &&
+      !(submit_id % queue->winehua_perf_sample_interval);
+   const bool frame_timeline = queue->winehua_frame_timeline_active;
+   const bool perf_account = perf_summary || perf_sample || frame_timeline;
+   const bool perf_timing = perf_trace || perf_account;
+   const uint64_t submit_start_ns = perf_account ? vkr_ohos_queue_now_ns() : 0;
    const uint64_t previous_submit_end_ns = perf_summary
       ? atomic_load_explicit(&queue->winehua_perf_last_submit_end_ns,
                              memory_order_relaxed)
@@ -842,11 +1005,11 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       vkr_device_memory_shadow_generation_begin(dispatch->data, true);
       upload_prepare_result =
          vkr_device_memory_prepare_shadow_upload(dispatch->data, queue,
-                                                 perf_summary, submit_id);
+                                                 perf_account, submit_id);
       if (perf_summary)
          vkr_ohos_perf_record_prepare_phases(queue);
    }
-   const uint64_t prepare_end_ns = perf_summary ? vkr_ohos_queue_now_ns() : 0;
+   const uint64_t prepare_end_ns = perf_account ? vkr_ohos_queue_now_ns() : 0;
    if (upload_prepare_result != VK_SUCCESS)
       vkr_device_memory_disable_shadow_upload_coverage(dispatch->data);
    const VkResult deferred_host_wait_result =
@@ -866,7 +1029,7 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       vkr_device_memory_sync_shadows_to_host(dispatch->data);
    if (gpu_upload)
       vkr_device_memory_shadow_generation_end(dispatch->data);
-   const uint64_t sync_end_ns = perf_summary ? vkr_ohos_queue_now_ns() : 0;
+   const uint64_t sync_end_ns = perf_account ? vkr_ohos_queue_now_ns() : 0;
    const bool upload_prepared = gpu_upload && queue->shadow_upload_prepared;
    const bool inline_upload = upload_prepared && queue->shadow_upload_inline &&
       args->submitCount <= VKR_WINEHUA_INLINE_MAX_GUEST_SUBMITS;
@@ -874,6 +1037,12 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       ? queue->shadow_upload_updates : 0;
    const uint32_t upload_ranges = upload_prepared
       ? queue->shadow_upload_ranges : 0;
+   const uint32_t upload_buffers = upload_prepared
+      ? queue->shadow_upload_buffers : 0;
+   const uint32_t upload_uniform_buffers = upload_prepared
+      ? queue->shadow_upload_uniform_buffers : 0;
+   const uint32_t upload_storage_buffers = upload_prepared
+      ? queue->shadow_upload_storage_buffers : 0;
    const uint64_t upload_bytes = upload_prepared
       ? queue->shadow_upload_bytes : 0;
    if (log_submit)
@@ -903,7 +1072,7 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       shadow_stats.scanned += retry_stats.scanned;
       shadow_stats.elapsed_us += retry_stats.elapsed_us;
    }
-   const uint64_t upload_end_ns = perf_summary ? vkr_ohos_queue_now_ns() : 0;
+   const uint64_t upload_end_ns = perf_account ? vkr_ohos_queue_now_ns() : 0;
 #endif
 #ifdef __OHOS__
    if (inline_upload) {
@@ -921,6 +1090,27 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
    if (perf_summary)
       atomic_store_explicit(&queue->winehua_perf_last_submit_end_ns,
                             driver_end_ns, memory_order_relaxed);
+   if (frame_timeline) {
+      const uint64_t frame_lock_wait_us = lock_acquired_ns >= lock_start_ns
+         ? (lock_acquired_ns - lock_start_ns) / 1000 : 0;
+      const uint64_t prepare_us = prepare_end_ns >= prepare_start_ns
+         ? (prepare_end_ns - prepare_start_ns) / 1000 : 0;
+      const uint64_t sync_us = sync_end_ns >= prepare_end_ns
+         ? (sync_end_ns - prepare_end_ns) / 1000 : 0;
+      const uint64_t upload_us = upload_end_ns >= lock_acquired_ns
+         ? (upload_end_ns - lock_acquired_ns) / 1000 : 0;
+      const uint64_t app_driver_us = driver_end_ns >= upload_end_ns
+         ? (driver_end_ns - upload_end_ns) / 1000 : 0;
+      const uint64_t total_us = driver_end_ns >= submit_start_ns
+         ? (driver_end_ns - submit_start_ns) / 1000 : 0;
+      /* The presenter reports and rearms this state under the same mutex.
+       * Account before unlocking so a present cannot publish a partial frame. */
+      vkr_ohos_frame_timeline_account(queue, args, &shadow_stats,
+                                      upload_bytes, upload_ranges,
+                                      prepare_us, sync_us, upload_us,
+                                      frame_lock_wait_us, app_driver_us,
+                                      total_us);
+   }
 #endif
    mtx_unlock(&queue->vk_mutex);
 #ifdef __OHOS__
@@ -969,6 +1159,14 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
       if (upload_prepared) {
          atomic_fetch_add_explicit(&vkr_ohos_perf_upload_submit_count, 1,
                                    memory_order_relaxed);
+         atomic_fetch_add_explicit(&vkr_ohos_perf_upload_buffers,
+                                   upload_buffers, memory_order_relaxed);
+         atomic_fetch_add_explicit(&vkr_ohos_perf_upload_uniform_buffers,
+                                   upload_uniform_buffers,
+                                   memory_order_relaxed);
+         atomic_fetch_add_explicit(&vkr_ohos_perf_upload_storage_buffers,
+                                   upload_storage_buffers,
+                                   memory_order_relaxed);
          atomic_fetch_add_explicit(&vkr_ohos_perf_upload_ranges,
                                    upload_ranges, memory_order_relaxed);
          atomic_fetch_add_explicit(&vkr_ohos_perf_upload_updates,
@@ -1008,6 +1206,9 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
                  " sync_us=%" PRIuFAST64 "/%" PRIuFAST64
                  " lock_us=%" PRIuFAST64 "/%" PRIuFAST64
                  " upload_submits=%" PRIuFAST64
+                 " upload_buffers=%" PRIuFAST64
+                 " upload_uniform_buffers=%" PRIuFAST64
+                 " upload_storage_buffers=%" PRIuFAST64
                  " upload_ranges=%" PRIuFAST64
                  " upload_updates=%" PRIuFAST64
                  " upload_bytes=%" PRIuFAST64
@@ -1042,6 +1243,12 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
                                       memory_order_relaxed),
                  atomic_load_explicit(&vkr_ohos_perf_upload_submit_count,
                                       memory_order_relaxed),
+                 atomic_load_explicit(&vkr_ohos_perf_upload_buffers,
+                                      memory_order_relaxed),
+                 atomic_load_explicit(&vkr_ohos_perf_upload_uniform_buffers,
+                                      memory_order_relaxed),
+                 atomic_load_explicit(&vkr_ohos_perf_upload_storage_buffers,
+                                      memory_order_relaxed),
                  atomic_load_explicit(&vkr_ohos_perf_upload_ranges,
                                       memory_order_relaxed),
                  atomic_load_explicit(&vkr_ohos_perf_upload_updates,
@@ -1073,6 +1280,41 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
                  atomic_load_explicit(&vkr_ohos_fence_wait_max_us,
                                       memory_order_relaxed));
       }
+   } else if (perf_sample) {
+      const uint64_t prepare_us = prepare_end_ns >= submit_start_ns
+         ? (prepare_end_ns - submit_start_ns) / 1000 : 0;
+      const uint64_t sync_us = sync_end_ns >= prepare_end_ns
+         ? (sync_end_ns - prepare_end_ns) / 1000 : 0;
+      const uint64_t upload_us = upload_end_ns >= lock_acquired_ns
+         ? (upload_end_ns - lock_acquired_ns) / 1000 : 0;
+      const uint64_t app_driver_us = driver_end_ns >= upload_end_ns
+         ? (driver_end_ns - upload_end_ns) / 1000 : 0;
+      const uint64_t total_us = driver_end_ns >= submit_start_ns
+         ? (driver_end_ns - submit_start_ns) / 1000 : 0;
+      const uint64_t previous_end_ns = atomic_load_explicit(
+         &queue->winehua_perf_last_sample_end_ns, memory_order_relaxed);
+      const uint64_t previous_submit_id = atomic_load_explicit(
+         &queue->winehua_perf_last_sample_submit_id, memory_order_relaxed);
+      const uint64_t window_us = previous_end_ns && driver_end_ns >= previous_end_ns
+         ? (driver_end_ns - previous_end_ns) / 1000 : 0;
+      const uint64_t window_submits = previous_submit_id
+         ? submit_id - previous_submit_id : 0;
+      atomic_store_explicit(&queue->winehua_perf_last_sample_end_ns,
+                            driver_end_ns, memory_order_relaxed);
+      atomic_store_explicit(&queue->winehua_perf_last_sample_submit_id,
+                            submit_id, memory_order_relaxed);
+      vkr_log("WineHuaPerfSample: submit=%" PRIu64
+              " window_submits=%" PRIu64 " window_us=%" PRIu64
+              " infos=%u shadow_scanned=%" PRIu64
+              " shadow_copies=%" PRIu64 " shadow_bytes=%" PRIu64
+              " prepare_us=%" PRIu64 " sync_us=%" PRIu64
+              " lock_us=%" PRIu64 " upload_us=%" PRIu64
+              " driver_us=%" PRIu64 " total_us=%" PRIu64
+              " upload_bytes=%" PRIu64 " result=%d",
+              submit_id, window_submits, window_us, args->submitCount,
+              shadow_stats.scanned, shadow_stats.copies, shadow_stats.bytes,
+              prepare_us, sync_us, lock_wait_us, upload_us, app_driver_us,
+              total_us, upload_bytes, args->ret);
    }
    const bool slow_submit = perf_trace &&
       (lock_wait_us >= 1000 || driver_us >= 1000);
@@ -1238,7 +1480,10 @@ vkr_dispatch_vkGetFenceStatus(struct vn_dispatch_context *dispatch,
    bool used_wait_fallback = false;
    const bool perf_trace = vkr_ohos_perf_trace_enabled();
    const bool perf_summary = vkr_ohos_perf_summary_enabled();
-   const bool perf_timing = perf_trace || perf_summary;
+   const uint64_t status_id = atomic_fetch_add_explicit(
+      &vkr_ohos_fence_status_count, 1, memory_order_relaxed) + 1;
+   const bool perf_sample = vkr_ohos_perf_sample_now(status_id);
+   const bool perf_timing = perf_trace || perf_summary || perf_sample;
    const uint64_t start_ns = perf_timing ? vkr_ohos_queue_now_ns() : 0;
    args->ret = vkr_ohos_get_fence_status(vk, args->device, args->fence,
                                          &retry_count, &used_wait_fallback);
@@ -1247,8 +1492,6 @@ vkr_dispatch_vkGetFenceStatus(struct vn_dispatch_context *dispatch,
    args->ret = vk->GetFenceStatus(args->device, args->fence);
 #endif
 #ifdef __OHOS__
-   const uint64_t status_id =
-      atomic_fetch_add_explicit(&vkr_ohos_fence_status_count, 1, memory_order_relaxed) + 1;
    const uint64_t elapsed_us = start_ns && end_ns >= start_ns
       ? (end_ns - start_ns) / 1000 : 0;
    uint64_t total_us = 0;
@@ -1278,6 +1521,10 @@ vkr_dispatch_vkGetFenceStatus(struct vn_dispatch_context *dispatch,
               " average_us=%" PRIu64,
               status_id, success_count, not_ready_count, args->ret,
               elapsed_us, status_id ? total_us / status_id : 0);
+   } else if (perf_sample) {
+      vkr_log("WineHuaPerfFenceSample: type=status id=%" PRIu64
+              " result=%d elapsed_us=%" PRIu64,
+              status_id, args->ret, elapsed_us);
    } else if (args->ret < 0)
       vkr_log("OHOS fence status count=%" PRIu64 " result=%d",
               status_id, args->ret);
@@ -1297,16 +1544,17 @@ vkr_dispatch_vkWaitForFences(struct vn_dispatch_context *dispatch,
 #ifdef __OHOS__
    const bool perf_trace = vkr_ohos_perf_trace_enabled();
    const bool perf_summary = vkr_ohos_perf_summary_enabled();
-   const bool perf_timing = perf_trace || perf_summary;
+   const uint64_t wait_id =
+      atomic_fetch_add_explicit(&vkr_ohos_fence_wait_count, 1,
+                                memory_order_relaxed) + 1;
+   const bool perf_sample = vkr_ohos_perf_sample_now(wait_id);
+   const bool perf_timing = perf_trace || perf_summary || perf_sample;
    const uint64_t start_ns = perf_timing ? vkr_ohos_queue_now_ns() : 0;
 #endif
    args->ret = vk->WaitForFences(args->device, args->fenceCount, args->pFences,
                                  args->waitAll, args->timeout);
 #ifdef __OHOS__
    const uint64_t end_ns = perf_timing ? vkr_ohos_queue_now_ns() : 0;
-   const uint64_t wait_id =
-      atomic_fetch_add_explicit(&vkr_ohos_fence_wait_count, 1,
-                                memory_order_relaxed) + 1;
    const uint64_t elapsed_us = start_ns && end_ns >= start_ns
       ? (end_ns - start_ns) / 1000 : 0;
    if (perf_timing) {
@@ -1316,6 +1564,12 @@ vkr_dispatch_vkWaitForFences(struct vn_dispatch_context *dispatch,
    }
    if (perf_trace && (wait_id <= 8 || !(wait_id % 120)))
       vkr_log("OHOS fence wait count=%" PRIu64
+              " fences=%u wait_all=%u timeout_ns=%" PRIu64
+              " result=%d elapsed_us=%" PRIu64,
+              wait_id, args->fenceCount, args->waitAll, args->timeout,
+              args->ret, elapsed_us);
+   else if (perf_sample)
+      vkr_log("WineHuaPerfFenceSample: type=wait id=%" PRIu64
               " fences=%u wait_all=%u timeout_ns=%" PRIu64
               " result=%d elapsed_us=%" PRIu64,
               wait_id, args->fenceCount, args->waitAll, args->timeout,

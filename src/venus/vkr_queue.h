@@ -63,8 +63,35 @@ struct vkr_queue {
    uint64_t shadow_upload_bytes;
    uint32_t shadow_upload_updates;
    uint32_t shadow_upload_ranges;
+   uint32_t shadow_upload_buffers;
+   uint32_t shadow_upload_uniform_buffers;
+   uint32_t shadow_upload_storage_buffers;
    bool winehua_perf_summary;
+   /* Diagnostics only: the production path leaves this at zero. */
+   uint32_t winehua_perf_sample_interval;
+   /* A sampled present-to-present interval.  It is armed by the private
+    * present path while holding vk_mutex, so QueueSubmit can account an
+    * entire rendered frame without adding clocks to production frames. */
+   uint32_t winehua_frame_timeline_interval;
+   bool winehua_frame_timeline_active;
+   uint32_t winehua_frame_timeline_serial;
+   uint64_t winehua_frame_submit_count;
+   uint64_t winehua_frame_submit_infos;
+   uint64_t winehua_frame_command_buffers;
+   uint64_t winehua_frame_wait_semaphores;
+   uint64_t winehua_frame_signal_semaphores;
+   uint64_t winehua_frame_shadow_bytes;
+   uint64_t winehua_frame_upload_bytes;
+   uint64_t winehua_frame_upload_ranges;
+   uint64_t winehua_frame_prepare_us;
+   uint64_t winehua_frame_sync_us;
+   uint64_t winehua_frame_upload_us;
+   uint64_t winehua_frame_lock_us;
+   uint64_t winehua_frame_driver_us;
+   uint64_t winehua_frame_total_us;
    atomic_uint_fast64_t winehua_perf_last_submit_end_ns;
+   atomic_uint_fast64_t winehua_perf_last_sample_end_ns;
+   atomic_uint_fast64_t winehua_perf_last_sample_submit_id;
    uint64_t shadow_upload_wait_us;
    uint64_t shadow_upload_reset_begin_us;
    uint64_t shadow_upload_dirty_scan_us;
@@ -128,6 +155,12 @@ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
 #ifdef __OHOS__
 uint64_t
 vkr_winehua_queue_submit_generation(void);
+
+/* Called with queue->vk_mutex held by the private present implementation.
+ * It reports the completed sampled interval and arms the following one. */
+void
+vkr_winehua_queue_frame_timeline_present(struct vkr_queue *queue,
+                                         uint32_t present_serial);
 #endif
 
 bool

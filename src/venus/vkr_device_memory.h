@@ -74,7 +74,9 @@ struct vkr_device_memory {
    bool shadow_dirty_listed;
    struct list_head bound_buffers;
    struct vkr_ohos_shadow_coverage_range *shadow_coverage_ranges;
+   uint32_t shadow_coverage_range_count;
    uint32_t shadow_coverage_range_capacity;
+   bool shadow_coverage_valid;
    void *shadow_upload_snapshot;
    bool shadow_host_copy_deferred;
    bool shadow_gpu_upload_covered;
@@ -99,6 +101,13 @@ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
 
 bool
 vkr_device_memory_gpu_upload_enabled(const struct vkr_device *dev);
+
+#ifdef __OHOS__
+/* Must be called with the context object mutex held when a bound-buffer
+ * topology change makes the cached coverage intervals stale. */
+void
+vkr_device_memory_invalidate_shadow_coverage(struct vkr_device_memory *mem);
+#endif
 
 bool
 vkr_device_memory_requires_deferred_host_wait(struct vkr_context *ctx,

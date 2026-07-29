@@ -380,6 +380,13 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
    }
    vkr_winehua_stage("queue-locked", serial);
 
+#ifdef __OHOS__
+   /* A sampled timeline is armed for the interval after a present.  Reading
+    * it here, under the same queue mutex as QueueSubmit, gives one complete
+    * rendered interval without changing upload or present ordering. */
+   vkr_winehua_queue_frame_timeline_present(queue, serial);
+#endif
+
    const uintptr_t instance_handle = (uintptr_t)instance->base.handle.instance;
    const uintptr_t physical_device_handle =
       (uintptr_t)physical_dev->base.handle.physical_device;

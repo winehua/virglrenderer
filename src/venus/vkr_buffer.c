@@ -27,6 +27,9 @@ vkr_winehua_set_buffer_memory(struct vkr_context *ctx,
       return;
 
    mtx_lock(&ctx->object_mutex);
+   struct vkr_device_memory *old_memory = buffer->bound_memory;
+   if (old_memory)
+      vkr_device_memory_invalidate_shadow_coverage(old_memory);
    if (buffer->memory_listed) {
       list_del(&buffer->memory_head);
       list_inithead(&buffer->memory_head);
@@ -37,6 +40,7 @@ vkr_winehua_set_buffer_memory(struct vkr_context *ctx,
    if (memory) {
       list_addtail(&buffer->memory_head, &memory->bound_buffers);
       buffer->memory_listed = true;
+      vkr_device_memory_invalidate_shadow_coverage(memory);
    }
    mtx_unlock(&ctx->object_mutex);
 }
@@ -152,6 +156,7 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
       buffer->size = guest_info->size;
       buffer->guest_usage = guest_info->usage;
       buffer->host_usage = host_info.usage;
+      buffer->winehua_shadow_record_submit_id = 0;
       list_inithead(&buffer->memory_head);
       buffer->memory_listed = false;
    }
