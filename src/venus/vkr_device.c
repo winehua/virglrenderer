@@ -14,6 +14,7 @@
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
 #include "vkr_queue.h"
+#include "vkr_renderer.h"
 
 static VkResult
 vkr_device_create_queues(struct vkr_context *ctx,
@@ -338,16 +339,28 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
 {
    struct vn_device_proc_table *vk = &dev->proc_table;
    VkDevice device = dev->base.handle.device;
+   const int presenter_bound = vkr_renderer_winehua_release_device(
+      ctx->ctx_id, (uintptr_t)device,
+      VKR_RENDERER_WINEHUA_DEVICE_RELEASE_PREPARE, VK_NOT_READY);
 
    if (!list_is_empty(&dev->objects))
       vkr_log("destroying device with valid objects");
 
-   /* only wait if on workder thread to prepare for vk obj cleanup */
-   if (ctx->on_worker_thread) {
-      VkResult result = vk->DeviceWaitIdle(device);
-      if (result != VK_SUCCESS)
-         vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)result);
+   /* The private presenter borrows this VkDevice and VkQueue from Venus.  Its
+    * PREPARE callback first stops new presents and waits for an in-flight
+    * callback to leave.  Keep the Host device alive and idle it before the
+    * AFTER_WAIT callback destroys presenter-owned WSI objects. */
+   VkResult wait_result = VK_SUCCESS;
+   if (ctx->on_worker_thread || presenter_bound > 0) {
+      wait_result = vk->DeviceWaitIdle(device);
+      if (wait_result != VK_SUCCESS)
+         vkr_log("vkDeviceWaitIdle(%p) failed(%d)", dev, (int32_t)wait_result);
    }
+
+   vkr_renderer_winehua_release_device(
+      ctx->ctx_id, (uintptr_t)device,
+      VKR_RENDERER_WINEHUA_DEVICE_RELEASE_AFTER_WAIT,
+      (int32_t)wait_result);
 
    mtx_destroy(&dev->object_mutex);
 

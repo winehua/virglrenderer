@@ -233,6 +233,23 @@ static bool winehua_vk_present_trace_enabled(void)
    return value && value[0] == '1';
 }
 
+/*
+ * The presenter summary variable predates the broader vtest counters below.
+ * Keep the public name for compatibility, but use it as the one explicit opt-in
+ * for periodic vtest diagnostics. Error paths deliberately remain logged.
+ */
+static bool winehua_vtest_perf_summary_enabled(void)
+{
+   const char *value = getenv("WINEHUA_VTEST_PRESENT_PERF_SUMMARY");
+   return value && value[0] == '1' && !value[1];
+}
+
+static bool winehua_resource_trace_enabled(void)
+{
+   const char *value = getenv("WINEHUA_RESOURCE_TRACE");
+   return value && value[0] == '1' && !value[1];
+}
+
 static void winehua_diag(const char *fmt, ...)
 {
    va_list args;
@@ -299,7 +316,8 @@ static void vtest_create_implicit_fence(struct vtest_renderer *renderer,
    ctx->implicit_fence_submitted = ++renderer->implicit_fence_submitted;
    virgl_renderer_create_fence(ctx->implicit_fence_submitted, 0);
    winehua_submit_count++;
-   if (winehua_submit_count == 1 || !(winehua_submit_count % 120))
+   if (winehua_vtest_perf_summary_enabled() &&
+       (winehua_submit_count == 1 || !(winehua_submit_count % 120)))
       winehua_diag("fence submit ctx=%d id=%u completed=%u count=%llu",
                    ctx->ctx_id, ctx->implicit_fence_submitted,
                    (uint32_t)renderer->implicit_fence_completed,
@@ -315,7 +333,8 @@ static void vtest_write_implicit_fence(UNUSED void *cookie, uint32_t fence_id_in
                    previous, fence_id_in, (uint32_t)renderer->implicit_fence_submitted);
    renderer->implicit_fence_completed = fence_id_in;
    winehua_complete_count++;
-   if (winehua_complete_count == 1 || !(winehua_complete_count % 120))
+   if (winehua_vtest_perf_summary_enabled() &&
+       (winehua_complete_count == 1 || !(winehua_complete_count % 120)))
       winehua_diag("fence complete id=%u submitted=%u count=%llu",
                    fence_id_in, (uint32_t)renderer->implicit_fence_submitted,
                    (unsigned long long)winehua_complete_count);
@@ -1098,8 +1117,9 @@ int vtest_winehua_present(uint32_t length_dw)
    }
    winehua_present_count++;
 
-   if (winehua_present_count == 1 || !(winehua_present_count % 120) ||
-       info_ret || !payload_matches) {
+   if ((winehua_vtest_perf_summary_enabled() &&
+        (winehua_present_count == 1 || !(winehua_present_count % 120))) ||
+       info_ret || !payload_matches || callback_ret) {
       winehua_diag(
          "present count=%llu ctx=%d serial=%u pid=%u surface=%u drawable=0x%llx "
          "client_handle=%u server_handle=%u tex_id=%u level=%u layer=%u "
@@ -1204,7 +1224,8 @@ int vtest_winehua_vk_present(uint32_t length_dw)
 #endif
 
    winehua_vk_present_count++;
-   if (winehua_vk_present_count == 1 || !(winehua_vk_present_count % 120) ||
+   if ((winehua_vtest_perf_summary_enabled() &&
+        (winehua_vk_present_count == 1 || !(winehua_vk_present_count % 120))) ||
        present_ret < 0) {
       winehua_diag(
          "vk_present count=%llu ctx=%d serial=%u pid=%u surface=%u "
@@ -1758,9 +1779,10 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
 
    args.res_handle = res->res_id;
    args.ctx_id = ctx->ctx_id;
-   winehua_diag("blob create begin ctx=%u res=%u mem=%u flags=0x%x size=%llu blob=%llu",
-                args.ctx_id, args.res_handle, args.blob_mem, args.blob_flags,
-                (unsigned long long)args.size, (unsigned long long)args.blob_id);
+   if (winehua_resource_trace_enabled())
+      winehua_diag("blob create begin ctx=%u res=%u mem=%u flags=0x%x size=%llu blob=%llu",
+                   args.ctx_id, args.res_handle, args.blob_mem, args.blob_flags,
+                   (unsigned long long)args.size, (unsigned long long)args.blob_id);
 
    switch (args.blob_mem) {
    case VIRGL_RENDERER_BLOB_MEM_GUEST:
@@ -1807,8 +1829,9 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
          vtest_unref_resource(res);
          return report_failed_call("virgl_renderer_resource_export_blob", ret);
       }
-      winehua_diag("blob export ctx=%u res=%u fd_type=%u fd=%d",
-                   args.ctx_id, args.res_handle, fd_type, fd);
+      if (winehua_resource_trace_enabled())
+         winehua_diag("blob export ctx=%u res=%u fd_type=%u fd=%d",
+                      args.ctx_id, args.res_handle, fd_type, fd);
       if (fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF &&
           fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_SHM) {
          close(fd);
@@ -1840,7 +1863,8 @@ int vtest_resource_create_blob(UNUSED uint32_t length_dw)
 
    /* Closing the file descriptor does not unmap the region. */
    close(fd);
-   winehua_diag("blob create complete ctx=%u res=%u", args.ctx_id, args.res_handle);
+   if (winehua_resource_trace_enabled())
+      winehua_diag("blob create complete ctx=%u res=%u", args.ctx_id, args.res_handle);
 
    util_hash_table_set(ctx->resource_table, intptr_to_pointer(res->res_id), res);
 
@@ -1861,8 +1885,7 @@ int vtest_resource_unref(UNUSED uint32_t length_dw)
    }
 
    handle = res_unref_buf[VCMD_RES_UNREF_RES_HANDLE];
-   const char *resource_trace = getenv("WINEHUA_RESOURCE_TRACE");
-   if (resource_trace && resource_trace[0] == '1')
+   if (winehua_resource_trace_enabled())
       winehua_diag("resource unref ctx=%u res=%u present=%d",
                    ctx->ctx_id, handle,
                    util_hash_table_get(ctx->resource_table,
@@ -2204,6 +2227,7 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
    uint32_t hdr_buf[VTEST_HDR_SIZE];
    uint32_t reply_buf[1];
    uint64_t wait_started_ms = 0;
+   const bool log_waits = winehua_vtest_perf_summary_enabled();
    bool busy = false;
 
    ret = ctx->input->read(ctx->input, &bw_buf, sizeof(bw_buf));
@@ -2238,7 +2262,7 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
       if (!busy || !(flags & VCMD_BUSY_WAIT_FLAG_WAIT))
          break;
 
-      if (!wait_started_ms) {
+      if (log_waits && !wait_started_ms) {
          wait_started_ms = winehua_diag_now_ms();
          winehua_diag("busy wait begin ctx=%d submitted=%u completed=%u poll_fd=%d",
                       ctx->ctx_id, ctx->implicit_fence_submitted,
@@ -2253,7 +2277,7 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
       virgl_renderer_poll();
    } while (true);
 
-   if (wait_started_ms)
+   if (log_waits && wait_started_ms)
       winehua_diag("busy wait end ctx=%d duration_ms=%llu submitted=%u completed=%u",
                    ctx->ctx_id,
                    (unsigned long long)(winehua_diag_now_ms() - wait_started_ms),
@@ -2737,7 +2761,8 @@ static int vtest_submit_cmd2_batch(struct vtest_context *ctx,
 
    ret = virgl_renderer_submit_cmd((void *)cmds, ctx->ctx_id, batch->cmd_size);
    const uint64_t submit2_count = ++winehua_submit2_count;
-   if (submit2_count <= 8 || !(submit2_count % 256) || ret)
+   if ((winehua_vtest_perf_summary_enabled() &&
+        (submit2_count <= 8 || !(submit2_count % 256))) || ret)
       winehua_diag("submit2 ctx=%d count=%llu cmd_dw=%u syncs=%u ring=%u flags=0x%x ret=%d",
                    ctx->ctx_id, (unsigned long long)submit2_count,
                    batch->cmd_size, batch->sync_count, batch->ring_idx,

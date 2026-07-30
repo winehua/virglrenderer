@@ -70,6 +70,11 @@ virgl_renderer_set_winehua_vk_present_callback(
    vkr_renderer_winehua_present_callback_type callback,
    void *user_data);
 
+VIRGL_EXPORT void
+virgl_renderer_set_winehua_vk_device_release_callback(
+   vkr_renderer_winehua_device_release_callback_type callback,
+   void *user_data);
+
 VIRGL_EXPORT int
 virgl_renderer_winehua_vk_present(uint32_t ctx_id,
                                   uint64_t queue_id,
@@ -1662,6 +1667,14 @@ virgl_renderer_set_winehua_vk_present_callback(
    void *user_data)
 {
    vkr_renderer_set_winehua_present_callback(callback, user_data);
+}
+
+VIRGL_EXPORT void
+virgl_renderer_set_winehua_vk_device_release_callback(
+   vkr_renderer_winehua_device_release_callback_type callback,
+   void *user_data)
+{
+   vkr_renderer_set_winehua_device_release_callback(callback, user_data);
 }
 
 VIRGL_EXPORT int

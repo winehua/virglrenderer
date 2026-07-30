@@ -368,8 +368,13 @@ vkr_physical_device_init_properties(struct vkr_physical_device *physical_dev)
    VkPhysicalDeviceProperties *props = &physical_dev->properties;
    props->apiVersion = vkr_api_version_cap_minor(props->apiVersion, VKR_MAX_API_VERSION);
 #ifdef __OHOS__
-   physical_dev->winehua_shadow_gpu_upload_quirk =
-      props->vendorID == 0x19e5 && strstr(props->deviceName, "Maleoon");
+   /* Host-visible shadow allocations are not an ordinary Vulkan buffer
+    * upload path.  A vendor/name match cannot prove that GPU-side shadow
+    * uploads preserve dynamic mapped-memory visibility.  Keep CPU mapped
+    * flush as the portable default; VKR_WINEHUA_GPU_UPLOAD=1 remains an
+    * explicit, qualification-gated opt-in for devices that pass the D3D11
+    * dynamic-update smoke. */
+   physical_dev->winehua_shadow_gpu_upload_quirk = false;
    vkr_log("WineHua shadow GPU upload auto=%u vendor=0x%x device=0x%x name=%s",
            physical_dev->winehua_shadow_gpu_upload_quirk,
            props->vendorID, props->deviceID, props->deviceName);

@@ -94,6 +94,9 @@ vkr_winehua_trylock(mtx_t *mutex, const char *busy_stage, uint32_t serial)
 static vkr_renderer_winehua_present_callback_type
    vkr_winehua_present_callback;
 static void *vkr_winehua_present_callback_data;
+static vkr_renderer_winehua_device_release_callback_type
+   vkr_winehua_device_release_callback;
+static void *vkr_winehua_device_release_callback_data;
 
 struct vkr_winehua_queue_guard {
    mtx_t *mutex;
@@ -201,6 +204,29 @@ vkr_renderer_set_winehua_present_callback(
 {
    vkr_winehua_present_callback = callback;
    vkr_winehua_present_callback_data = user_data;
+}
+
+void
+vkr_renderer_set_winehua_device_release_callback(
+   vkr_renderer_winehua_device_release_callback_type callback,
+   void *user_data)
+{
+   vkr_winehua_device_release_callback = callback;
+   vkr_winehua_device_release_callback_data = user_data;
+}
+
+int
+vkr_renderer_winehua_release_device(uint32_t ctx_id,
+                                    uintptr_t device,
+                                    uint32_t phase,
+                                    int32_t wait_result)
+{
+   if (!vkr_winehua_device_release_callback)
+      return 0;
+
+   return vkr_winehua_device_release_callback(
+      ctx_id, device, phase, wait_result,
+      vkr_winehua_device_release_callback_data);
 }
 
 static struct vkr_context *

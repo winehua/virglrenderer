@@ -45,6 +45,18 @@ typedef int (*vkr_renderer_winehua_present_callback_type)(
    void *queue_sync_data,
    void *user_data);
 
+enum vkr_renderer_winehua_device_release_phase {
+   VKR_RENDERER_WINEHUA_DEVICE_RELEASE_PREPARE = 0,
+   VKR_RENDERER_WINEHUA_DEVICE_RELEASE_AFTER_WAIT = 1,
+};
+
+typedef int (*vkr_renderer_winehua_device_release_callback_type)(
+   uint32_t ctx_id,
+   uintptr_t device,
+   uint32_t phase,
+   int32_t wait_result,
+   void *user_data);
+
 struct vkr_renderer_callbacks {
    virgl_log_callback_type debug_logger;
    vkr_renderer_retire_fence_callback_type retire_fence;
@@ -63,6 +75,17 @@ void
 vkr_renderer_set_winehua_present_callback(
    vkr_renderer_winehua_present_callback_type callback,
    void *user_data);
+
+void
+vkr_renderer_set_winehua_device_release_callback(
+   vkr_renderer_winehua_device_release_callback_type callback,
+   void *user_data);
+
+int
+vkr_renderer_winehua_release_device(uint32_t ctx_id,
+                                    uintptr_t device,
+                                    uint32_t phase,
+                                    int32_t wait_result);
 
 int
 vkr_renderer_winehua_present(uint32_t ctx_id,
