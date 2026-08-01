@@ -31,6 +31,7 @@
    } while (0)
 
 #define VKR_WINEHUA_CAPTURE_TRACE_LIMIT 512u
+#define VKR_WINEHUA_VIEWPORT_TRACE_LIMIT 4096u
 #ifdef __OHOS__
 #define VKR_WINEHUA_UBO_BOUND_TRACE_LIMIT 50000u
 #endif
@@ -75,6 +76,27 @@ vkr_winehua_capture_trace_allow(void)
    return false;
 }
 
+static bool
+vkr_winehua_viewport_trace_enabled(void)
+{
+   const char *value = os_get_option("WINEHUA_VKR_TRACE_PIPELINE");
+   return value && value[0] == '1';
+}
+
+static bool
+vkr_winehua_viewport_trace_allow(void)
+{
+   static atomic_uint emitted = ATOMIC_VAR_INIT(0);
+   const unsigned index =
+      atomic_fetch_add_explicit(&emitted, 1, memory_order_relaxed);
+
+   if (index < VKR_WINEHUA_VIEWPORT_TRACE_LIMIT)
+      return true;
+   if (index == VKR_WINEHUA_VIEWPORT_TRACE_LIMIT)
+      vkr_log("WineHuaViewportHost: trace limit reached; further records suppressed");
+   return false;
+}
+
 #ifdef __OHOS__
 static bool
 vkr_winehua_ubo_identity_trace_enabled(void)
@@ -109,12 +131,13 @@ vkr_winehua_log_bound_ubo(struct vkr_command_buffer *cmd,
       struct vkr_buffer *buffer = state->buffer;
       struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
       if (!state->valid || !buffer || !mem ||
-          (state->size != 48 && state->size != 1536) ||
+          (state->size != 48 && state->size != 64 &&
+           state->size != 1536) ||
           state->offset > UINT64_MAX - buffer->bound_memory_offset)
          continue;
 
       vkr_winehua_buffer_add_ubo_watch_locked(
-         buffer, i + 3, state->offset, state->size);
+         buffer, state->binding, state->offset, state->size);
       state->last_bound_mapping_sequence = state->mapping_sequence;
       if (!vkr_winehua_ubo_bound_trace_allow())
          continue;
@@ -133,7 +156,7 @@ vkr_winehua_log_bound_ubo(struct vkr_command_buffer *cmd,
               (uintptr_t)cmd->base.handle.command_buffer,
               (uint64_t)set->base.id,
               (uintptr_t)set->base.handle.descriptor_set,
-              state->mapping_sequence, i + 3, state->array_element,
+              state->mapping_sequence, state->binding, state->array_element,
               state->descriptor_type, (uint64_t)buffer->base.id,
               (uintptr_t)buffer->base.handle.buffer,
               (uint64_t)mem->base.id,
@@ -1153,6 +1176,19 @@ static void
 vkr_dispatch_vkCmdSetScissorWithCount(UNUSED struct vn_dispatch_context *dispatch,
                                       struct vn_command_vkCmdSetScissorWithCount *args)
 {
+   if (vkr_winehua_viewport_trace_enabled() && args->pScissors &&
+       vkr_winehua_viewport_trace_allow()) {
+      const struct vkr_command_buffer *cmd =
+         vkr_command_buffer_from_handle(args->commandBuffer);
+      for (uint32_t i = 0; i < args->scissorCount; i++) {
+         const VkRect2D *scissor = &args->pScissors[i];
+         vkr_log("WineHuaViewportHost: type=scissor cmdId=%" PRIu64
+                 " count=%u index=%u value=%d,%d,%u,%u",
+                 cmd ? cmd->base.id : 0, args->scissorCount, i,
+                 scissor->offset.x, scissor->offset.y,
+                 scissor->extent.width, scissor->extent.height);
+      }
+   }
    VKR_CMD_CALL(CmdSetScissorWithCount, args, args->scissorCount, args->pScissors);
 }
 
@@ -1175,6 +1211,20 @@ static void
 vkr_dispatch_vkCmdSetViewportWithCount(UNUSED struct vn_dispatch_context *dispatch,
                                        struct vn_command_vkCmdSetViewportWithCount *args)
 {
+   if (vkr_winehua_viewport_trace_enabled() && args->pViewports &&
+       vkr_winehua_viewport_trace_allow()) {
+      const struct vkr_command_buffer *cmd =
+         vkr_command_buffer_from_handle(args->commandBuffer);
+      for (uint32_t i = 0; i < args->viewportCount; i++) {
+         const VkViewport *viewport = &args->pViewports[i];
+         vkr_log("WineHuaViewportHost: type=viewport cmdId=%" PRIu64
+                 " count=%u index=%u value=%g,%g,%g,%g,%g,%g",
+                 cmd ? cmd->base.id : 0, args->viewportCount, i,
+                 viewport->x, viewport->y,
+                 viewport->width, viewport->height,
+                 viewport->minDepth, viewport->maxDepth);
+      }
+   }
    VKR_CMD_CALL(CmdSetViewportWithCount, args, args->viewportCount, args->pViewports);
 }
 
@@ -1236,6 +1286,64 @@ static void
 vkr_dispatch_vkCmdBeginRendering(UNUSED struct vn_dispatch_context *ctx,
                                  struct vn_command_vkCmdBeginRendering *args)
 {
+   static atomic_uint trace_sequence;
+   const char *trace_value = os_get_option("WINEHUA_VKR_TRACE_PIPELINE");
+
+   if (trace_value && trace_value[0] == '1' && args->pRenderingInfo) {
+      const unsigned sequence = atomic_fetch_add_explicit(
+         &trace_sequence, 1, memory_order_relaxed);
+      const VkRenderingInfo *info = args->pRenderingInfo;
+      if (sequence < 1024u) {
+         vkr_log("WineHuaRendering: begin seq=%u flags=0x%x area=%d,%d,%u,%u layers=%u viewMask=0x%x colors=%u depth=%p stencil=%p",
+                 sequence, info->flags, info->renderArea.offset.x,
+                 info->renderArea.offset.y, info->renderArea.extent.width,
+                 info->renderArea.extent.height, info->layerCount,
+                 info->viewMask, info->colorAttachmentCount,
+                 (const void *)info->pDepthAttachment,
+                 (const void *)info->pStencilAttachment);
+         for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
+            const VkRenderingAttachmentInfo *attachment =
+               &info->pColorAttachments[i];
+            const struct vkr_image_view *view =
+               attachment->imageView
+                  ? vkr_image_view_from_handle(attachment->imageView) : NULL;
+            const struct vkr_image_view *resolve =
+               attachment->resolveImageView
+                  ? vkr_image_view_from_handle(attachment->resolveImageView) : NULL;
+            vkr_log("WineHuaRendering: begin seq=%u color[%u] viewId=%" PRIu64 " hostView=0x%" PRIxPTR " layout=%u resolveMode=0x%x resolveViewId=%" PRIu64 " hostResolveView=0x%" PRIxPTR " resolveLayout=%u load=%u store=%u",
+                    sequence, i, view ? view->base.id : 0,
+                    view ? (uintptr_t)view->base.handle.image_view : 0,
+                    attachment->imageLayout, attachment->resolveMode,
+                    resolve ? resolve->base.id : 0,
+                    resolve ? (uintptr_t)resolve->base.handle.image_view : 0,
+                    attachment->resolveImageLayout, attachment->loadOp,
+                    attachment->storeOp);
+         }
+         if (info->pDepthAttachment) {
+            const VkRenderingAttachmentInfo *attachment = info->pDepthAttachment;
+            const struct vkr_image_view *view =
+               attachment->imageView
+                  ? vkr_image_view_from_handle(attachment->imageView) : NULL;
+            vkr_log("WineHuaRendering: begin seq=%u depth viewId=%" PRIu64 " hostView=0x%" PRIxPTR " layout=%u resolveMode=0x%x load=%u store=%u",
+                    sequence, view ? view->base.id : 0,
+                    view ? (uintptr_t)view->base.handle.image_view : 0,
+                    attachment->imageLayout, attachment->resolveMode,
+                    attachment->loadOp, attachment->storeOp);
+         }
+         if (info->pStencilAttachment &&
+             info->pStencilAttachment != info->pDepthAttachment) {
+            const VkRenderingAttachmentInfo *attachment = info->pStencilAttachment;
+            const struct vkr_image_view *view =
+               attachment->imageView
+                  ? vkr_image_view_from_handle(attachment->imageView) : NULL;
+            vkr_log("WineHuaRendering: begin seq=%u stencil viewId=%" PRIu64 " hostView=0x%" PRIxPTR " layout=%u resolveMode=0x%x load=%u store=%u",
+                    sequence, view ? view->base.id : 0,
+                    view ? (uintptr_t)view->base.handle.image_view : 0,
+                    attachment->imageLayout, attachment->resolveMode,
+                    attachment->loadOp, attachment->storeOp);
+         }
+      }
+   }
    VKR_CMD_CALL(CmdBeginRendering, args, args->pRenderingInfo);
 }
 
@@ -1364,6 +1472,35 @@ vkr_dispatch_vkCmdSetColorBlendEquationEXT(
    UNUSED struct vn_dispatch_context *dispatch,
    struct vn_command_vkCmdSetColorBlendEquationEXT *args)
 {
+   static atomic_uint trace_sequence;
+   const char *trace_value = os_get_option("WINEHUA_VKR_TRACE_PIPELINE");
+
+   if (trace_value && trace_value[0] == '1' && args->pColorBlendEquations) {
+      const unsigned sequence = atomic_fetch_add_explicit(
+         &trace_sequence, 1, memory_order_relaxed);
+      for (uint32_t i = 0; i < args->attachmentCount; i++) {
+         const VkColorBlendEquationEXT *equation = &args->pColorBlendEquations[i];
+         const bool dual_src =
+            (equation->srcColorBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+             equation->srcColorBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+            (equation->dstColorBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+             equation->dstColorBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+            (equation->srcAlphaBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+             equation->srcAlphaBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+            (equation->dstAlphaBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+             equation->dstAlphaBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA);
+         if (sequence < 2048u || dual_src) {
+            vkr_log("WineHuaBlendDynamic: seq=%u first=%u attachment=%u color=%u,%u,%u alpha=%u,%u,%u dualSrc=%u",
+                    sequence, args->firstAttachment, i,
+                    equation->srcColorBlendFactor,
+                    equation->dstColorBlendFactor,
+                    equation->colorBlendOp,
+                    equation->srcAlphaBlendFactor,
+                    equation->dstAlphaBlendFactor,
+                    equation->alphaBlendOp, dual_src ? 1u : 0u);
+         }
+      }
+   }
    VKR_CMD_CALL(CmdSetColorBlendEquationEXT, args, args->firstAttachment,
                 args->attachmentCount, args->pColorBlendEquations);
 }
