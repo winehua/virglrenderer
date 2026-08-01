@@ -1389,6 +1389,7 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
    VkResult upload_prepare_result = VK_SUCCESS;
    if (gpu_upload) {
       mtx_lock(&queue->shadow_upload_mutex);
+      vkr_device_memory_shadow_generation_begin(dispatch->data, true);
       upload_prepare_result =
          vkr_device_memory_prepare_shadow_upload(dispatch->data, queue,
                                                  perf_summary, submit_id);
@@ -1401,14 +1402,18 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
       vkr_ohos_wait_deferred_shadow_host_copy(
          dispatch->data, queue, vk);
    if (deferred_host_wait_result != VK_SUCCESS) {
-      if (gpu_upload)
+      if (gpu_upload) {
+         vkr_device_memory_shadow_generation_end(dispatch->data);
          mtx_unlock(&queue->shadow_upload_mutex);
+      }
       args->ret = deferred_host_wait_result;
       return;
    }
 #endif
    vkr_device_memory_sync_shadows_to_host(dispatch->data);
 #ifdef __OHOS__
+   if (gpu_upload)
+      vkr_device_memory_shadow_generation_end(dispatch->data);
    const bool upload_prepared = gpu_upload && queue->shadow_upload_prepared;
    const bool inline_upload = upload_prepared && queue->shadow_upload_inline &&
       args->submitCount <= VKR_WINEHUA_INLINE_MAX_GUEST_SUBMITS;
@@ -1625,7 +1630,7 @@ vkr_dispatch_vkDestroySemaphore(struct vn_dispatch_context *dispatch,
 }
 
 static void
-vkr_dispatch_vkGetSemaphoreCounterValue(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkGetSemaphoreCounterValue(struct vn_dispatch_context *dispatch,
                                         struct vn_command_vkGetSemaphoreCounterValue *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -1633,10 +1638,16 @@ vkr_dispatch_vkGetSemaphoreCounterValue(UNUSED struct vn_dispatch_context *dispa
 
    vn_replace_vkGetSemaphoreCounterValue_args_handle(args);
    args->ret = vk->GetSemaphoreCounterValue(args->device, args->semaphore, args->pValue);
+   /* Timeline semaphores are a completion boundary just like a fence.  In the
+    * separated Host/Guest shadow transport, visibility of a newly observed
+    * signal must also make preceding Host GPU writes visible to mapped Guest
+    * memory. DXVK 2.x relies on this path rather than fence polling. */
+   if (args->ret == VK_SUCCESS)
+      vkr_device_memory_sync_shadows_from_host(dispatch->data);
 }
 
 static void
-vkr_dispatch_vkWaitSemaphores(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkWaitSemaphores(struct vn_dispatch_context *dispatch,
                               struct vn_command_vkWaitSemaphores *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -1644,6 +1655,10 @@ vkr_dispatch_vkWaitSemaphores(UNUSED struct vn_dispatch_context *dispatch,
 
    vn_replace_vkWaitSemaphores_args_handle(args);
    args->ret = vk->WaitSemaphores(args->device, args->pWaitInfo, args->timeout);
+   /* Successful waits establish completion of all waited timeline values, so
+    * mirror the fence completion path and refresh Host-produced shadow data. */
+   if (args->ret == VK_SUCCESS)
+      vkr_device_memory_sync_shadows_from_host(dispatch->data);
 }
 
 static void
