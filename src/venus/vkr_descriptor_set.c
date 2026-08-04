@@ -530,7 +530,25 @@ vkr_dispatch_vkCreateDescriptorSetLayout(
    struct vn_dispatch_context *dispatch,
    struct vn_command_vkCreateDescriptorSetLayout *args)
 {
+#ifdef __OHOS__
+   const char *gate_c_trace = os_get_option("WINEHUA_VKD3D_GATE_C_TRACE");
+   const bool trace = gate_c_trace && gate_c_trace[0] == '1' && !gate_c_trace[1];
+   const VkDescriptorSetLayout requested =
+      args->pSetLayout ? *args->pSetLayout : VK_NULL_HANDLE;
+   const VkDescriptorSetLayoutCreateInfo *info = args->pCreateInfo;
+
+   if (trace)
+      vkr_log("WineHuaDescriptorSetLayout: create requested object=%" PRIu64
+              " flags=0x%x bindings=%u",
+              (uint64_t)(uintptr_t)requested, info ? info->flags : 0,
+              info ? info->bindingCount : 0);
+#endif
    vkr_descriptor_set_layout_create_and_add(dispatch->data, args);
+#ifdef __OHOS__
+   if (trace)
+      vkr_log("WineHuaDescriptorSetLayout: create result=%d object=%" PRIu64,
+              args->ret, (uint64_t)(uintptr_t)requested);
+#endif
 }
 
 static void

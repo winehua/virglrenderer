@@ -19,6 +19,60 @@ vkr_winehua_option_enabled(const char *name)
    return value && !strcmp(value, "1");
 }
 
+#ifdef __OHOS__
+static bool
+vkr_winehua_gate_c_trace_enabled(void)
+{
+   return vkr_winehua_option_enabled("WINEHUA_VKD3D_GATE_C_TRACE");
+}
+
+static void
+vkr_winehua_remember_failed_compute_pipelines(
+   struct vkr_context *ctx,
+   const VkPipeline *pipelines,
+   uint32_t count)
+{
+   if (!pipelines || !count)
+      return;
+
+   mtx_lock(&ctx->object_mutex);
+   for (uint32_t i = 0; i < count; i++) {
+      const vkr_object_id id = vkr_cs_handle_load_id(
+         (const void **)&pipelines[i], VK_OBJECT_TYPE_PIPELINE);
+      struct vkr_winehua_failed_compute_pipelines *failed =
+         &ctx->winehua_gate_c_failed_compute_pipelines;
+
+      if (!id)
+         continue;
+
+      if (failed->count == failed->capacity) {
+         if (failed->capacity > UINT32_MAX / 2) {
+            vkr_log("WineHuaPipeline: failed compute pipeline record capacity "
+                    "exhausted");
+            break;
+         }
+         const uint32_t capacity = failed->capacity ?
+            failed->capacity * 2 : 8;
+         vkr_object_id *ids =
+            realloc(failed->ids, (size_t)capacity * sizeof(*ids));
+         if (!ids) {
+            vkr_log("WineHuaPipeline: unable to record failed compute pipeline "
+                    "object=%" PRIu64, id);
+            continue;
+         }
+         failed->ids = ids;
+         failed->capacity = capacity;
+      }
+
+      failed->ids[failed->count++] = id;
+      vkr_log("WineHuaPipeline: gate-c failed-compute recorded object=%" PRIu64,
+              id);
+   }
+   mtx_unlock(&ctx->object_mutex);
+}
+
+#endif
+
 static uint32_t
 vkr_winehua_fnv1a32(const void *data, size_t size)
 {
@@ -437,6 +491,32 @@ vkr_dispatch_vkCreateComputePipelines(struct vn_dispatch_context *dispatch,
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct object_array arr;
+   const bool trace = vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_PIPELINE");
+#ifdef __OHOS__
+   const bool gate_c = vkr_winehua_gate_c_trace_enabled();
+   VkPipeline *requested_pipelines = NULL;
+
+   if (gate_c && args->createInfoCount) {
+      requested_pipelines = malloc((size_t)args->createInfoCount *
+                                   sizeof(*requested_pipelines));
+      if (requested_pipelines)
+         memcpy(requested_pipelines, args->pPipelines,
+                (size_t)args->createInfoCount * sizeof(*requested_pipelines));
+      else
+         vkr_log("WineHuaPipeline: unable to retain %u requested compute "
+                 "pipeline IDs", args->createInfoCount);
+   }
+#endif
+
+   if (trace) {
+      for (uint32_t i = 0; i < args->createInfoCount; i++) {
+         const VkComputePipelineCreateInfo *info = &args->pCreateInfos[i];
+         vkr_log("WineHuaPipeline: compute-create[%u] requested=0x%" PRIxPTR
+                 " layout=0x%" PRIxPTR " shader=0x%" PRIxPTR,
+                 i, (uintptr_t)args->pPipelines[i], (uintptr_t)info->layout,
+                 (uintptr_t)info->stage.module);
+      }
+   }
 
    if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
       for (uint32_t i = 0; i < args->createInfoCount; i++) {
@@ -458,16 +538,39 @@ vkr_dispatch_vkCreateComputePipelines(struct vn_dispatch_context *dispatch,
       }
    }
 
-   if (vkr_compute_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
+   const VkResult result = vkr_compute_pipeline_create_array(ctx, args, &arr);
+   if (trace)
+      vkr_log("WineHuaPipeline: vkCreateComputePipelines result=%d count=%u",
+              result, args->createInfoCount);
+   if (result < VK_SUCCESS) {
+#ifdef __OHOS__
+      if (gate_c && requested_pipelines)
+         vkr_winehua_remember_failed_compute_pipelines(
+            ctx, requested_pipelines, args->createInfoCount);
+      free(requested_pipelines);
+#endif
       return;
+   }
+
+#ifdef __OHOS__
+   free(requested_pipelines);
+#endif
 
    vkr_pipeline_add_array(ctx, dev, &arr, args->pPipelines);
+   if (trace) {
+      for (uint32_t i = 0; i < args->createInfoCount; i++)
+         vkr_log("WineHuaPipeline: compute-add[%u] object=0x%" PRIxPTR,
+                 i, (uintptr_t)args->pPipelines[i]);
+   }
 }
 
 static void
 vkr_dispatch_vkDestroyPipeline(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkDestroyPipeline *args)
 {
+   if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_PIPELINE"))
+      vkr_log("WineHuaPipeline: destroy requested=0x%" PRIxPTR,
+              (uintptr_t)args->pipeline);
    vkr_pipeline_destroy_and_remove(dispatch->data, args);
 }
 
