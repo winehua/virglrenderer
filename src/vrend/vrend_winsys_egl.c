@@ -623,6 +623,18 @@ virgl_renderer_gl_context virgl_egl_create_context(struct virgl_egl *egl, struct
 {
    EGLContext egl_ctx;
 
+#ifdef __x86_64__
+   /* HarmonyOS PC emulator express GPU: EGL_CONTEXT_MINOR_VERSION_KHR /
+    * profile-mask attributes corrupt its context state and crash the
+    * emulator (Emulator.exe+0x1B6FCA after "real share context is NULL").
+    * Use the minimal attribute set that the app compositor EGL uses.
+    * Real-device (arm64) keeps the full attributes.
+    */
+   EGLint ctx_att[] = {
+      EGL_CONTEXT_CLIENT_VERSION, vparams->major_ver,
+      EGL_NONE
+   };
+#else
    EGLint ctx_att[] = {
       EGL_CONTEXT_CLIENT_VERSION, vparams->major_ver,
       EGL_CONTEXT_MINOR_VERSION_KHR, vparams->minor_ver,
@@ -634,6 +646,7 @@ virgl_renderer_gl_context virgl_egl_create_context(struct virgl_egl *egl, struct
       ctx_att[4] = EGL_CONTEXT_OPENGL_PROFILE_MASK;
       ctx_att[5] = EGL_CONTEXT_OPENGL_COMPATIBILITY_PROFILE_BIT;
    }
+#endif
 
    egl_ctx = eglCreateContext(egl->egl_display,
                              egl->egl_conf,
