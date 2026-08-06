@@ -50,6 +50,9 @@ static atomic_uint vkr_ohos_ubo_watched_update_trace_count;
 #define VKR_WINEHUA_FNV64_OFFSET UINT64_C(1469598103934665603)
 #define VKR_WINEHUA_FNV64_PRIME UINT64_C(1099511628211)
 
+static uint64_t
+vkr_ohos_fnv1a64(const void *data, size_t size);
+
 static bool
 vkr_ohos_gate_c_trace_enabled(void)
 {
@@ -77,6 +80,21 @@ vkr_ohos_gate_c_trace_memory(const char *phase,
    if (!vkr_ohos_gate_c_trace_enabled() || !mem)
       return;
 
+   const VkDeviceSize available = mem
+      ? MIN2(mem->allocation_size, mem->shadow_size) : 0;
+   const VkDeviceSize sample_offset = MIN2(offset, available);
+   const VkDeviceSize requested_size = size == VK_WHOLE_SIZE
+      ? available - sample_offset : MIN2(size, available - sample_offset);
+   const VkDeviceSize sample_size = MIN2(requested_size, 4096u);
+   const uint64_t host_hash = mem && mem->host_map && sample_size
+      ? vkr_ohos_fnv1a64((const uint8_t *)mem->host_map + sample_offset,
+                         (size_t)sample_size)
+      : 0;
+   const uint64_t shadow_hash = mem && mem->shadow_map && sample_size
+      ? vkr_ohos_fnv1a64((const uint8_t *)mem->shadow_map + sample_offset,
+                         (size_t)sample_size)
+      : 0;
+
    const char *path = getenv("WINEHUA_VIRGL_LOG_PATH");
    if (!path || !path[0])
       return;
@@ -88,10 +106,14 @@ vkr_ohos_gate_c_trace_memory(const char *phase,
    fprintf(file,
            "[%" PRIu64 "] [vkd3d-gate-c] phase=%s memory_id=%" PRIu64
            " allocation_size=%" PRIu64 " offset=%" PRIu64
-           " size=%" PRIu64 " host_map=%u shadow_map=%u complete=%u result=%d\n",
+           " size=%" PRIu64 " host_map=%u shadow_map=%u"
+           " sample_size=%" PRIu64 " host_hash=%016" PRIx64
+           " shadow_hash=%016" PRIx64 " equal=%u complete=%u result=%d\n",
            vkr_ohos_gate_c_trace_now_us(), phase, (uint64_t)mem->base.id,
            (uint64_t)mem->allocation_size, (uint64_t)offset, (uint64_t)size,
-           mem->host_map != NULL, mem->shadow_map != NULL, complete, result);
+           mem->host_map != NULL, mem->shadow_map != NULL,
+           (uint64_t)sample_size, host_hash, shadow_hash,
+           host_hash == shadow_hash, complete, result);
    fflush(file);
    fclose(file);
 }
