@@ -72,6 +72,7 @@
 #define EGL_EXT_DEVICE_ENUMERATION             BIT(10)
 #define EGL_EXT_DEVICE_QUERY                   BIT(11)
 #define EGL_EXT_PLATFORM_DEVICE                BIT(12)
+#define EGL_EXT_IMAGE_GL_COLORSPACE            BIT(13)
 
 static const struct {
    uint32_t bit;
@@ -89,6 +90,7 @@ static const struct {
    { EGL_EXT_DEVICE_ENUMERATION, "EGL_EXT_device_enumeration" },
    { EGL_EXT_DEVICE_QUERY, "EGL_EXT_device_query" },
    { EGL_EXT_PLATFORM_DEVICE, "EGL_EXT_platform_device" },
+   { EGL_EXT_IMAGE_GL_COLORSPACE, "EGL_EXT_image_gl_colorspace" },
 };
 
 struct egl_funcs {
@@ -780,6 +782,11 @@ bool virgl_has_egl_khr_gl_colorspace(struct virgl_egl *egl)
    return has_bit(egl->extension_bits, EGL_KHR_GL_COLORSPACE);
 }
 
+bool virgl_has_egl_image_gl_colorspace(struct virgl_egl *egl)
+{
+   return egl && has_bit(egl->extension_bits, EGL_EXT_IMAGE_GL_COLORSPACE);
+}
+
 #ifdef ENABLE_GBM
 void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   uint32_t width,
@@ -789,9 +796,10 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   uint32_t plane_count,
                                   const int *plane_fds,
                                   const uint32_t *plane_strides,
-                                  const uint32_t *plane_offsets)
+                                  const uint32_t *plane_offsets,
+                                  bool srgb)
 {
-   EGLint attrs[6 + VIRGL_GBM_MAX_PLANES * 10 + 1];
+   EGLint attrs[6 + VIRGL_GBM_MAX_PLANES * 10 + 3];
    uint32_t count;
 
    assert(VIRGL_GBM_MAX_PLANES <= 4);
@@ -832,6 +840,10 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
          }
       }
    }
+   if (srgb && virgl_has_egl_image_gl_colorspace(egl)) {
+      attrs[count++] = EGL_GL_COLORSPACE_KHR;
+      attrs[count++] = EGL_GL_COLORSPACE_SRGB_KHR;
+   }
    attrs[count++] = EGL_NONE;
    assert(count <= ARRAY_SIZE(attrs));
 
@@ -849,7 +861,7 @@ void virgl_egl_image_destroy(struct virgl_egl *egl, void *image)
 #endif
 
 #ifdef ENABLE_GBM_ALLOCATION
-void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo)
+void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo, bool srgb)
 {
    int ret;
    void *image = NULL;
@@ -881,7 +893,8 @@ void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo)
                                        num_planes,
                                        fds,
                                        strides,
-                                       offsets);
+                                       offsets,
+                                       srgb);
 
 out_close:
    for (int plane = 0; plane < num_planes; plane++)
@@ -918,7 +931,8 @@ void *virgl_egl_aux_plane_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo
                                        1,
                                        &fd,
                                        &stride,
-                                       &offset);
+                                       &offset,
+                                       false);
    close(fd);
 
    return image;

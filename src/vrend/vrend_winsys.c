@@ -221,6 +221,17 @@ int vrend_winsys_has_gl_colorspace(void)
          (use_context == CONTEXT_EGL_EXTERNAL && egl_colorspace);
 }
 
+int vrend_winsys_has_egl_image_gl_colorspace(void)
+{
+#ifdef HAVE_EPOXY_EGL_H
+   if (egl)
+      return virgl_has_egl_image_gl_colorspace(egl);
+#endif
+   /* Non-EGL contexts cannot import EGLImages. Their regular GL textures do
+    * not need this import-specific colorspace declaration. */
+   return use_context == CONTEXT_NONE || use_context == CONTEXT_GLX;
+}
+
 int vrend_winsys_get_attrs_for_texture(uint32_t tex_id, uint32_t format, int *fourcc,
                                        bool *has_dmabuf_export,
                                        int *planes, uint64_t *modifier)

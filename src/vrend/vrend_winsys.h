@@ -57,6 +57,7 @@ void vrend_winsys_destroy_context(virgl_renderer_gl_context ctx);
 int vrend_winsys_make_context_current(virgl_renderer_gl_context ctx);
 
 int vrend_winsys_has_gl_colorspace(void);
+int vrend_winsys_has_egl_image_gl_colorspace(void);
 
 int vrend_winsys_get_attrs_for_texture(uint32_t tex_id, uint32_t format, int *fourcc,
                                        bool *has_dmabuf_export,
