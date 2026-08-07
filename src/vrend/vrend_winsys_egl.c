@@ -72,6 +72,7 @@
 #define EGL_EXT_DEVICE_ENUMERATION             BIT(10)
 #define EGL_EXT_DEVICE_QUERY                   BIT(11)
 #define EGL_EXT_PLATFORM_DEVICE                BIT(12)
+#define EGL_EXT_IMAGE_GL_COLORSPACE            BIT(13)
 
 static const struct {
    uint32_t bit;
@@ -89,6 +90,7 @@ static const struct {
    { EGL_EXT_DEVICE_ENUMERATION, "EGL_EXT_device_enumeration" },
    { EGL_EXT_DEVICE_QUERY, "EGL_EXT_device_query" },
    { EGL_EXT_PLATFORM_DEVICE, "EGL_EXT_platform_device" },
+   { EGL_EXT_IMAGE_GL_COLORSPACE, "EGL_EXT_image_gl_colorspace" },
 };
 
 struct egl_funcs {
@@ -780,6 +782,11 @@ bool virgl_has_egl_khr_gl_colorspace(struct virgl_egl *egl)
    return has_bit(egl->extension_bits, EGL_KHR_GL_COLORSPACE);
 }
 
+bool virgl_has_egl_image_gl_colorspace(struct virgl_egl *egl)
+{
+   return has_bit(egl->extension_bits, EGL_EXT_IMAGE_GL_COLORSPACE);
+}
+
 #ifdef ENABLE_GBM
 void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   uint32_t width,
@@ -789,9 +796,10 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   uint32_t plane_count,
                                   const int *plane_fds,
                                   const uint32_t *plane_strides,
-                                  const uint32_t *plane_offsets)
+                                  const uint32_t *plane_offsets,
+                                  bool srgb)
 {
-   EGLint attrs[6 + VIRGL_GBM_MAX_PLANES * 10 + 1];
+   EGLint attrs[6 + VIRGL_GBM_MAX_PLANES * 10 + 4];
    uint32_t count;
 
    assert(VIRGL_GBM_MAX_PLANES <= 4);
@@ -831,6 +839,20 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
             attrs[count++] = (uint32_t)(drm_modifier >> 32);
          }
       }
+   }
+
+   /* EGL_EXT_image_gl_colorspace: 显式声明 sRGB 色彩空间, 使导入纹理
+    * 真正以 sRGB 格式解释, 从而 GL_FRAMEBUFFER_SRGB_EXT 硬件编码可兑现。
+    * 否则 dmabuf 导入的纹理按 UNORM 解释, 硬件 sRGB 编码不生效。 */
+   if (srgb && has_bit(egl->extension_bits, EGL_EXT_IMAGE_GL_COLORSPACE)) {
+#ifndef EGL_GL_COLORSPACE
+#define EGL_GL_COLORSPACE 0x309D
+#endif
+#ifndef EGL_GL_COLORSPACE_SRGB
+#define EGL_GL_COLORSPACE_SRGB 0x3089
+#endif
+      attrs[count++] = EGL_GL_COLORSPACE;
+      attrs[count++] = EGL_GL_COLORSPACE_SRGB;
    }
    attrs[count++] = EGL_NONE;
    assert(count <= ARRAY_SIZE(attrs));
@@ -881,7 +903,8 @@ void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo)
                                        num_planes,
                                        fds,
                                        strides,
-                                       offsets);
+                                       offsets,
+                                       false);
 
 out_close:
    for (int plane = 0; plane < num_planes; plane++)
@@ -918,7 +941,8 @@ void *virgl_egl_aux_plane_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo
                                        1,
                                        &fd,
                                        &stride,
-                                       &offset);
+                                       &offset,
+                                       false);
    close(fd);
 
    return image;

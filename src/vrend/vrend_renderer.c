@@ -400,6 +400,9 @@ struct global_renderer_state {
 
 #ifdef HAVE_EPOXY_EGL_H
    bool use_egl_fence : 1;
+   /* EGL_EXT_image_gl_colorspace: dmabuf 导入时可声明 sRGB colorspace,
+    * 使 EGL-backed sRGB 纹理真正以 sRGB 格式存在, 硬件编码可兑现。 */
+   bool egl_image_srgb_import : 1;
 #endif
    bool d3d_share_texture : 1;
    bool gbm_layout_feat : 1;
@@ -2349,6 +2352,15 @@ int vrend_create_surface(struct vrend_context *ctx,
          GLenum target = res->target;
          GLenum internalformat = tex_conv_table[format].internalformat;
 
+         /* dest_surface_srgb_control: guest 用 UNORM surface 渲染 sRGB 资源
+          * (host 上报 VIRGL_CAP_SRGB_WRITE_CONTROL 后允许的格式组合)。
+          * 此时必须创建 sRGB view, 使 GL_FRAMEBUFFER_SRGB_EXT 硬件编码
+          * 真正作用到 sRGB 附件上, 否则写入 sRGB 存储不编码会偏暗。 */
+         if (has_feature(feat_srgb_write_control) &&
+             !util_format_is_srgb(surf->format) &&
+             util_format_is_srgb(res->base.format))
+            internalformat = tex_conv_table[res->base.format].internalformat;
+
          if (target == GL_TEXTURE_CUBE_MAP && first_layer == last_layer) {
             first_layer = 0;
             last_layer = 5;
@@ -3108,6 +3120,13 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
                use_srgb = true;
                break;
             }
+            /* dest_srgb_control: UNORM surface 渲染 sRGB 资源时同样需要
+             * 硬件 sRGB 编码 (view 已在 vrend_create_surface 用 sRGB 格式创建)。 */
+            if (!util_format_is_srgb(surf->format) &&
+                util_format_is_srgb(surf->texture->base.format)) {
+               use_srgb = true;
+               break;
+            }
          }
       }
       if (use_srgb) {
@@ -3139,7 +3158,16 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
        * manual colorspace conversion is instead injected in the fragment
        * shader writing to such surfaces and during glClearColor(). */
       if (util_format_is_srgb(surf->format) &&
-          !vrend_resource_supports_view(surf->texture, surf->format)) {
+          !vrend_resource_supports_view(surf->texture, surf->format) &&
+#ifdef HAVE_EPOXY_EGL_H
+          /* 能力驱动: EGL_EXT_image_gl_colorspace 可用时, dmabuf 导入的
+           * sRGB 纹理已真正以 sRGB 格式存在, 由 GL_FRAMEBUFFER_SRGB_EXT
+           * 硬件编码, 无需 shader 手动编码 (否则双编码偏黑)。 */
+          !vrend_state.egl_image_srgb_import
+#else
+          true
+#endif
+          ) {
          VREND_DEBUG(dbg_tex, sub_ctx->parent,
                      "manually converting linear->srgb for EGL-backed framebuffer color attachment 0x%x"
                      " (surface format is %s; resource format is %s)\n",
@@ -4718,7 +4746,14 @@ static void vrend_clear_prepare(struct vrend_sub_context *sub_ctx,
                                 struct vrend_surface *surf, unsigned buffers,
                                 float *colorf, double depth, unsigned stencil) {
    if (surf && util_format_is_srgb(surf->format) &&
-       !vrend_resource_supports_view(surf->texture, surf->format)) {
+       !vrend_resource_supports_view(surf->texture, surf->format) &&
+#ifdef HAVE_EPOXY_EGL_H
+       /* 能力驱动: EGL image 已声明 sRGB 时由硬件编码, clear 无需手动转换 */
+       !vrend_state.egl_image_srgb_import
+#else
+       true
+#endif
+       ) {
       VREND_DEBUG(dbg_tex, sub_ctx->parent,
                   "manually converting glClearColor from linear->srgb colorspace for EGL-backed framebuffer color attachment"
                   " (surface format is %s; resource format is %s)\n",
@@ -7690,6 +7725,18 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
 
    if (!vrend_winsys_has_gl_colorspace())
       clear_feature(feat_srgb_write_control) ;
+
+#ifdef HAVE_EPOXY_EGL_H
+   /* 能力驱动: 只有 host 能以 sRGB 格式导入/创建纹理时, 才保留硬件
+    * sRGB write control 路径并上报 VIRGL_CAP_SRGB_WRITE_CONTROL。
+    * EGL_EXT_image_gl_colorspace 存在 → dmabuf EGL image 导入时声明
+    * sRGB → 纹理真正 sRGB → GL_FRAMEBUFFER_SRGB_EXT 生效。
+    * 无此扩展 (如部分 Maleoon 驱动) → EGL-backed 纹理保持 UNORM,
+    * 硬件编码无法兑现 → 清除 feat, guest 走格式匹配 + shader 编码。 */
+   vrend_state.egl_image_srgb_import = virgl_has_egl_image_gl_colorspace(egl);
+   if (!vrend_state.egl_image_srgb_import)
+      clear_feature(feat_srgb_write_control);
+#endif
 
    glGetIntegerv(GL_MAX_DRAW_BUFFERS, (GLint *) &vrend_state.max_draw_buffers);
 
@@ -13489,7 +13536,8 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                                                      args->plane_count,
                                                      plane_fds,
                                                      args->plane_strides,
-                                                     args->plane_offsets);
+                                                     args->plane_offsets,
+                                                     util_format_is_srgb(virgl_format));
          if (!gr->egl_image) {
             virgl_error("%s: failed to create egl image\n", __func__);
             FREE(gr);

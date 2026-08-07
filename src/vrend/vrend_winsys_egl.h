@@ -60,6 +60,7 @@ int virgl_egl_make_context_current(struct virgl_egl *egl, virgl_renderer_gl_cont
 virgl_renderer_gl_context virgl_egl_get_current_context(struct virgl_egl *egl);
 
 bool virgl_has_egl_khr_gl_colorspace(struct virgl_egl *egl);
+bool virgl_has_egl_image_gl_colorspace(struct virgl_egl *egl);
 
 #ifdef ENABLE_GBM
 int virgl_egl_get_attrs_for_texture(struct virgl_egl *egl, uint32_t tex_id, uint32_t format,
@@ -79,7 +80,8 @@ void *virgl_egl_image_from_dmabuf(struct virgl_egl *egl,
                                   uint32_t plane_count,
                                   const int *plane_fds,
                                   const uint32_t *plane_strides,
-                                  const uint32_t *plane_offsets);
+                                  const uint32_t *plane_offsets,
+                                  bool srgb);
 void virgl_egl_image_destroy(struct virgl_egl *egl, void *image);
 
 void *virgl_egl_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo *bo);
