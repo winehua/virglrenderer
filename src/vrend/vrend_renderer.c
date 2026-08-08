@@ -2356,6 +2356,10 @@ int vrend_create_surface(struct vrend_context *ctx,
           * (host 上报 VIRGL_CAP_SRGB_WRITE_CONTROL 后允许的格式组合)。
           * 此时必须创建 sRGB view, 使 GL_FRAMEBUFFER_SRGB_EXT 硬件编码
           * 真正作用到 sRGB 附件上, 否则写入 sRGB 存储不编码会偏暗。 */
+         /* FIXME(硬件加速参考): vrend_renderer_init() 已无条件清除
+          * feat_srgb_write_control, 当前分支与 framebuffer use_srgb 分支
+          * 不会触发; 保留代码供未来恢复硬件 sRGB 编码时参考, 详见
+          * 主仓 docs/VIRGL_SRGB_DEST_SURFACE_FIX.md。 */
          if (has_feature(feat_srgb_write_control) &&
              !util_format_is_srgb(surf->format) &&
              util_format_is_srgb(res->base.format))
@@ -3122,6 +3126,8 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
             }
             /* dest_srgb_control: UNORM surface 渲染 sRGB 资源时同样需要
              * 硬件 sRGB 编码 (view 已在 vrend_create_surface 用 sRGB 格式创建)。 */
+            /* FIXME(硬件加速参考): feat_srgb_write_control 已无条件清除,
+             * 此分支不会触发, 保留作未来恢复硬件编码的参考。 */
             if (!util_format_is_srgb(surf->format) &&
                 util_format_is_srgb(surf->texture->base.format)) {
                use_srgb = true;
@@ -7723,20 +7729,18 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    init_features(gles ? 0 : gl_ver,
                  gles ? gl_ver : 0);
 
-   if (!vrend_winsys_has_gl_colorspace())
-      clear_feature(feat_srgb_write_control) ;
-
-#ifdef HAVE_EPOXY_EGL_H
-   /* 能力驱动: 只有 host 能以 sRGB 格式导入/创建纹理时, 才保留硬件
-    * sRGB write control 路径并上报 VIRGL_CAP_SRGB_WRITE_CONTROL。
-    * EGL_EXT_image_gl_colorspace 存在 → dmabuf EGL image 导入时声明
-    * sRGB → 纹理真正 sRGB → GL_FRAMEBUFFER_SRGB_EXT 生效。
-    * 无此扩展 (如部分 Maleoon 驱动) → EGL-backed 纹理保持 UNORM,
-    * 硬件编码无法兑现 → 清除 feat, guest 走格式匹配 + shader 编码。 */
-   vrend_state.egl_image_srgb_import = virgl_has_egl_image_gl_colorspace(egl);
-   if (!vrend_state.egl_image_srgb_import)
-      clear_feature(feat_srgb_write_control);
-#endif
+   /* FIXME: 硬件 sRGB 编码 (GL_EXT_sRGB_write_control) 在 Maleoon 920/935
+    * 上与 guest (wined3d) 的 sRGB 语义冲突: host 组合编码后纹理内容为
+    * sRGB 编码值 f(L), 而 guest 按 UNORM view 采样 (SRGBTEXTURE=false,
+    * 采样器 SKIP_DECODE) 时, 部分游戏 (如仙剑5) 预期线性 L → 偏白;
+    * 部分游戏 (如仙剑4) 的合成在 sRGB 空间预期 f(L) → 组合编码后正常。
+    * vrend 无法从 view 格式区分两类游戏, 全局 DECODE 会让后者偏黑。
+    *
+    * 当前统一按 Maleoon 910 (无此扩展) 的行为: 清除 feat, host 不编码,
+    * SRGB 纹理内容保持线性 L, 所有游戏与 910 一致 (正常)。
+    * 未来若要兼容硬件加速, 需要按 guest 采样语义 (view 格式/SKIP vs
+    * DECODE) 精确决定内容编码, 或扩展协议传递明确的 srgb_decode 意图。 */
+   clear_feature(feat_srgb_write_control);
 
    glGetIntegerv(GL_MAX_DRAW_BUFFERS, (GLint *) &vrend_state.max_draw_buffers);
 
