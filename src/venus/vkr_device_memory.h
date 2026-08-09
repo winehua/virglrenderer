@@ -136,6 +136,7 @@ struct vkr_shadow_sync_stats {
    uint64_t bytes;
    uint32_t copies;
    uint32_t cache_ops;
+   VkResult result;
    uint64_t gpu_upload_skipped_bytes;
    uint32_t gpu_upload_skipped_copies;
    uint32_t scanned;

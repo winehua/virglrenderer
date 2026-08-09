@@ -1943,6 +1943,9 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
          return stats;
       }
 
+      const bool had_deferred_copy = mem->shadow_host_copy_deferred &&
+         mem->shadow_upload_snapshot;
+
       if (vkr_ohos_shadow_trace_enabled()) {
          const VkDeviceSize available = MIN2(mem->shadow_size,
                                              mem->allocation_size);
@@ -2015,11 +2018,36 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
       VkResult dirty_result = host_flush_prepared ? VK_SUCCESS :
          vk->FlushMappedMemoryRanges(mem->device->base.handle.device, 1,
                                      &dirty_range);
+      stats.result = dirty_result;
       if (dirty_result != VK_SUCCESS)
          vkr_log("OHOS shadow dirty flush failed result=%d offset=%" PRIu64
                  " size=%" PRIu64,
                  dirty_result, (uint64_t)mem->shadow_dirty_offset,
                  (uint64_t)mem->shadow_dirty_size);
+      if (vkr_ohos_shadow_trace_enabled()) {
+         const VkDeviceSize available = MIN2(mem->shadow_size,
+                                             mem->allocation_size);
+         const VkDeviceSize trace_offset = MIN2(mem->shadow_dirty_offset,
+                                                available);
+         const VkDeviceSize trace_size = MIN2(mem->shadow_dirty_size,
+                                              available - trace_offset);
+         const uint8_t *expected = had_deferred_copy
+            ? mem->shadow_upload_snapshot : mem->shadow_map;
+         const uint8_t *host = mem->host_map;
+         const uint32_t expected_hash = vkr_ohos_fnv1a32(
+            expected + trace_offset, (size_t)trace_size);
+         const uint32_t host_hash = vkr_ohos_fnv1a32(
+            host + trace_offset, (size_t)trace_size);
+         vkr_log("OHOS shadow submit-output guestMemory=%" PRIu64
+                 " hostMemory=0x%" PRIxPTR " offset=%" PRIu64
+                 " size=%" PRIu64 " expectedFnv=0x%08x hostFnv=0x%08x"
+                 " equal=%u source=%s flushResult=%d",
+                 (uint64_t)mem->base.id,
+                 (uintptr_t)mem->base.handle.device_memory,
+                 (uint64_t)trace_offset, (uint64_t)trace_size,
+                 expected_hash, host_hash, expected_hash == host_hash,
+                 had_deferred_copy ? "snapshot" : "shadow", dirty_result);
+      }
       if (vkr_ohos_shadow_submit_unmap_large_enabled() &&
           mem->allocation_size >= 1024u * 1024u) {
          void *old_host_map = mem->host_map;
@@ -2276,6 +2304,22 @@ vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
       : MIN2(size, available);
    if (!copy_size)
       return VK_SUCCESS;
+
+   /* Inline GPU upload keeps explicit Guest flushes in a snapshot until the
+    * next queue submit.  An invalidate is a conflicting Host access boundary:
+    * retire all earlier Guest writes before Host memory is read back, or the
+    * stale Host mapping would overwrite the shared shadow. */
+   if (mem->shadow_host_dirty) {
+      const struct vkr_shadow_sync_stats pending =
+         vkr_device_memory_sync_shadow(mem, true, false);
+      if (pending.result != VK_SUCCESS)
+         return pending.result;
+
+      if (vkr_ohos_shadow_trace_enabled())
+         vkr_log("OHOS shadow invalidate resolved pending guest writes "
+                 "guestMemory=%" PRIu64 " copies=%u bytes=%" PRIu64,
+                 (uint64_t)mem->base.id, pending.copies, pending.bytes);
+   }
 
    struct vn_device_proc_table *vk = &mem->device->proc_table;
    const VkMappedMemoryRange range = {
