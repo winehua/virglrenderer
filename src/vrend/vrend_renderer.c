@@ -400,9 +400,6 @@ struct global_renderer_state {
 
 #ifdef HAVE_EPOXY_EGL_H
    bool use_egl_fence : 1;
-   /* EGL_EXT_image_gl_colorspace: dmabuf 导入时可声明 sRGB colorspace,
-    * 使 EGL-backed sRGB 纹理真正以 sRGB 格式存在, 硬件编码可兑现。 */
-   bool egl_image_srgb_import : 1;
 #endif
    bool d3d_share_texture : 1;
    bool gbm_layout_feat : 1;
@@ -697,6 +694,12 @@ struct vrend_vertex_buffer {
 #define VREND_PROGRAM_NQUEUES (1 << 8)
 #define VREND_PROGRAM_NQUEUE_MASK (VREND_PROGRAM_NQUEUES - 1)
 
+enum vrend_unorm_srgb_write_policy {
+   VREND_UNORM_SRGB_WRITE_UNDECIDED = 0,
+   VREND_UNORM_SRGB_WRITE_ENCODE_XRGB,
+   VREND_UNORM_SRGB_WRITE_PRESERVE,
+};
+
 struct vrend_sub_context {
    struct list_head head;
 
@@ -804,6 +807,7 @@ struct vrend_sub_context {
    struct vrend_context_tweaks tweaks;
    uint8_t swizzle_output_rgb_to_bgr;
    uint8_t needs_manual_srgb_encode_bitmask;
+   enum vrend_unorm_srgb_write_policy unorm_srgb_write_policy;
    int fake_occlusion_query_samples_passed_multiplier;
 
    int prim_mode;
@@ -2352,19 +2356,6 @@ int vrend_create_surface(struct vrend_context *ctx,
          GLenum target = res->target;
          GLenum internalformat = tex_conv_table[format].internalformat;
 
-         /* dest_surface_srgb_control: guest 用 UNORM surface 渲染 sRGB 资源
-          * (host 上报 VIRGL_CAP_SRGB_WRITE_CONTROL 后允许的格式组合)。
-          * 此时必须创建 sRGB view, 使 GL_FRAMEBUFFER_SRGB_EXT 硬件编码
-          * 真正作用到 sRGB 附件上, 否则写入 sRGB 存储不编码会偏暗。 */
-         /* FIXME(硬件加速参考): vrend_renderer_init() 已无条件清除
-          * feat_srgb_write_control, 当前分支与 framebuffer use_srgb 分支
-          * 不会触发; 保留代码供未来恢复硬件 sRGB 编码时参考, 详见
-          * 主仓 docs/VIRGL_SRGB_DEST_SURFACE_FIX.md。 */
-         if (has_feature(feat_srgb_write_control) &&
-             !util_format_is_srgb(surf->format) &&
-             util_format_is_srgb(res->base.format))
-            internalformat = tex_conv_table[res->base.format].internalformat;
-
          if (target == GL_TEXTURE_CUBE_MAP && first_layer == last_layer) {
             first_layer = 0;
             last_layer = 5;
@@ -2741,7 +2732,6 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
           !util_format_is_srgb(view->format))
          view->srgb_decode = GL_SKIP_DECODE_EXT;
    }
-
    if (!(util_format_has_alpha(view->format) || util_format_is_depth_or_stencil(view->format))) {
       if (swizzle[0] == PIPE_SWIZZLE_W)
           swizzle[0] = PIPE_SWIZZLE_1;
@@ -3095,6 +3085,57 @@ static void vrend_hw_set_color_surface(struct vrend_sub_context *sub_ctx, GLuint
    }
 }
 
+static bool
+vrend_is_unorm_surface_of_srgb_resource(const struct vrend_surface *surf,
+                                        bool alpha_surface)
+{
+   if (!surf)
+      return false;
+
+   switch (surf->format) {
+   case VIRGL_FORMAT_R8G8B8A8_UNORM:
+      return alpha_surface &&
+         (surf->texture->base.format == VIRGL_FORMAT_R8G8B8A8_SRGB ||
+          surf->texture->base.format == VIRGL_FORMAT_R8G8B8X8_SRGB);
+   case VIRGL_FORMAT_R8G8B8X8_UNORM:
+      return !alpha_surface &&
+         (surf->texture->base.format == VIRGL_FORMAT_R8G8B8A8_SRGB ||
+          surf->texture->base.format == VIRGL_FORMAT_R8G8B8X8_SRGB);
+   case VIRGL_FORMAT_B8G8R8A8_UNORM:
+      return alpha_surface &&
+         (surf->texture->base.format == VIRGL_FORMAT_B8G8R8A8_SRGB ||
+          surf->texture->base.format == VIRGL_FORMAT_B8G8R8X8_SRGB);
+   case VIRGL_FORMAT_B8G8R8X8_UNORM:
+      return !alpha_surface &&
+         (surf->texture->base.format == VIRGL_FORMAT_B8G8R8A8_SRGB ||
+          surf->texture->base.format == VIRGL_FORMAT_B8G8R8X8_SRGB);
+   default:
+      return false;
+   }
+}
+
+static void
+vrend_classify_unorm_srgb_write_policy(struct vrend_sub_context *sub_ctx)
+{
+   if (sub_ctx->unorm_srgb_write_policy != VREND_UNORM_SRGB_WRITE_UNDECIDED ||
+       !vrend_state.use_gles || !has_feature(feat_srgb_write_control))
+      return;
+
+   bool saw_xrgb = false;
+   for (uint32_t i = 0; i < sub_ctx->nr_cbufs; i++) {
+      struct vrend_surface *surf = sub_ctx->surf[i];
+
+      if (vrend_is_unorm_surface_of_srgb_resource(surf, true)) {
+         sub_ctx->unorm_srgb_write_policy = VREND_UNORM_SRGB_WRITE_PRESERVE;
+         return;
+      }
+      saw_xrgb |= vrend_is_unorm_surface_of_srgb_resource(surf, false);
+   }
+
+   if (saw_xrgb)
+      sub_ctx->unorm_srgb_write_policy = VREND_UNORM_SRGB_WRITE_ENCODE_XRGB;
+}
+
 static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
 {
    static const GLenum buffers[8] = {
@@ -3124,15 +3165,6 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
                use_srgb = true;
                break;
             }
-            /* dest_srgb_control: UNORM surface 渲染 sRGB 资源时同样需要
-             * 硬件 sRGB 编码 (view 已在 vrend_create_surface 用 sRGB 格式创建)。 */
-            /* FIXME(硬件加速参考): feat_srgb_write_control 已无条件清除,
-             * 此分支不会触发, 保留作未来恢复硬件编码的参考。 */
-            if (!util_format_is_srgb(surf->format) &&
-                util_format_is_srgb(surf->texture->base.format)) {
-               use_srgb = true;
-               break;
-            }
          }
       }
       if (use_srgb) {
@@ -3142,6 +3174,13 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
       }
       sub_ctx->framebuffer_srgb_enabled = use_srgb;
    }
+
+   /* Classify the guest's render-target convention from the first relevant
+    * framebuffer state.  An alpha-bearing UNORM view first means the guest is
+    * intentionally bypassing sRGB writes.  An XRGB view first needs the GLES
+    * compatibility encode.  Do not let unrelated render targets encountered
+    * later retroactively change the main target's colorspace policy. */
+   vrend_classify_unorm_srgb_write_policy(sub_ctx);
 
    sub_ctx->swizzle_output_rgb_to_bgr = 0;
    sub_ctx->needs_manual_srgb_encode_bitmask = 0;
@@ -3163,17 +3202,13 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
        * To work around this for colorspace conversion, views are avoided
        * manual colorspace conversion is instead injected in the fragment
        * shader writing to such surfaces and during glClearColor(). */
-      if (util_format_is_srgb(surf->format) &&
-          !vrend_resource_supports_view(surf->texture, surf->format) &&
-#ifdef HAVE_EPOXY_EGL_H
-          /* 能力驱动: EGL_EXT_image_gl_colorspace 可用时, dmabuf 导入的
-           * sRGB 纹理已真正以 sRGB 格式存在, 由 GL_FRAMEBUFFER_SRGB_EXT
-           * 硬件编码, 无需 shader 手动编码 (否则双编码偏黑)。 */
-          !vrend_state.egl_image_srgb_import
-#else
-          true
-#endif
-          ) {
+      bool needs_xrgb_compat_encode =
+         vrend_state.use_gles && has_feature(feat_srgb_write_control) &&
+         sub_ctx->unorm_srgb_write_policy == VREND_UNORM_SRGB_WRITE_ENCODE_XRGB &&
+         vrend_is_unorm_surface_of_srgb_resource(surf, false);
+      if ((util_format_is_srgb(surf->format) &&
+           !vrend_resource_supports_view(surf->texture, surf->format)) ||
+          needs_xrgb_compat_encode) {
          VREND_DEBUG(dbg_tex, sub_ctx->parent,
                      "manually converting linear->srgb for EGL-backed framebuffer color attachment 0x%x"
                      " (surface format is %s; resource format is %s)\n",
@@ -4751,15 +4786,15 @@ vrend_color_encode_as_srgb(float color) {
 static void vrend_clear_prepare(struct vrend_sub_context *sub_ctx,
                                 struct vrend_surface *surf, unsigned buffers,
                                 float *colorf, double depth, unsigned stencil) {
-   if (surf && util_format_is_srgb(surf->format) &&
-       !vrend_resource_supports_view(surf->texture, surf->format) &&
-#ifdef HAVE_EPOXY_EGL_H
-       /* 能力驱动: EGL image 已声明 sRGB 时由硬件编码, clear 无需手动转换 */
-       !vrend_state.egl_image_srgb_import
-#else
-       true
-#endif
-       ) {
+   vrend_classify_unorm_srgb_write_policy(sub_ctx);
+   bool needs_xrgb_compat_encode =
+      surf && vrend_state.use_gles && has_feature(feat_srgb_write_control) &&
+      sub_ctx->unorm_srgb_write_policy == VREND_UNORM_SRGB_WRITE_ENCODE_XRGB &&
+      vrend_is_unorm_surface_of_srgb_resource(surf, false);
+   if (surf &&
+       ((util_format_is_srgb(surf->format) &&
+         !vrend_resource_supports_view(surf->texture, surf->format)) ||
+        needs_xrgb_compat_encode)) {
       VREND_DEBUG(dbg_tex, sub_ctx->parent,
                   "manually converting glClearColor from linear->srgb colorspace for EGL-backed framebuffer color attachment"
                   " (surface format is %s; resource format is %s)\n",
@@ -7729,18 +7764,8 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    init_features(gles ? 0 : gl_ver,
                  gles ? gl_ver : 0);
 
-   /* FIXME: 硬件 sRGB 编码 (GL_EXT_sRGB_write_control) 在 Maleoon 920/935
-    * 上与 guest (wined3d) 的 sRGB 语义冲突: host 组合编码后纹理内容为
-    * sRGB 编码值 f(L), 而 guest 按 UNORM view 采样 (SRGBTEXTURE=false,
-    * 采样器 SKIP_DECODE) 时, 部分游戏 (如仙剑5) 预期线性 L → 偏白;
-    * 部分游戏 (如仙剑4) 的合成在 sRGB 空间预期 f(L) → 组合编码后正常。
-    * vrend 无法从 view 格式区分两类游戏, 全局 DECODE 会让后者偏黑。
-    *
-    * 当前统一按 Maleoon 910 (无此扩展) 的行为: 清除 feat, host 不编码,
-    * SRGB 纹理内容保持线性 L, 所有游戏与 910 一致 (正常)。
-    * 未来若要兼容硬件加速, 需要按 guest 采样语义 (view 格式/SKIP vs
-    * DECODE) 精确决定内容编码, 或扩展协议传递明确的 srgb_decode 意图。 */
-   clear_feature(feat_srgb_write_control);
+   if (!vrend_winsys_has_gl_colorspace())
+      clear_feature(feat_srgb_write_control);
 
    glGetIntegerv(GL_MAX_DRAW_BUFFERS, (GLint *) &vrend_state.max_draw_buffers);
 
@@ -13540,8 +13565,7 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
                                                      args->plane_count,
                                                      plane_fds,
                                                      args->plane_strides,
-                                                     args->plane_offsets,
-                                                     util_format_is_srgb(virgl_format));
+                                                     args->plane_offsets);
          if (!gr->egl_image) {
             virgl_error("%s: failed to create egl image\n", __func__);
             FREE(gr);
