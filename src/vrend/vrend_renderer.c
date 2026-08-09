@@ -8916,9 +8916,35 @@ static int vrend_resource_alloc_texture(struct vrend_resource *gr,
       }
       gr->storage_bits |= VREND_STORAGE_EGL_IMAGE;
    } else {
-      internalformat = tex_conv_table[format].internalformat;
-      glformat = tex_conv_table[format].glformat;
-      gltype = tex_conv_table[format].gltype;
+      /* GLES hosts without GL_EXT_sRGB_write_control cannot render to sRGB
+       * storage (e.g. Maleoon 910).  The guest still creates UNORM surfaces
+       * bound to sRGB resources, so allocate the storage with the matching
+       * UNORM format: writes stay raw and presentation matches the
+       * pre-1.1.7 baseline on those hosts.  Hosts with the extension
+       * (Maleoon 920/935) keep sRGB storage and the existing write-policy
+       * logic. */
+      enum virgl_formats storage_format = format;
+      if (vrend_state.use_gles && !has_feature(feat_srgb_write_control)) {
+         switch (format) {
+         case VIRGL_FORMAT_R8G8B8A8_SRGB:
+         case VIRGL_FORMAT_R8G8B8X8_SRGB:
+            storage_format = VIRGL_FORMAT_R8G8B8A8_UNORM;
+            break;
+         case VIRGL_FORMAT_B8G8R8A8_SRGB:
+         case VIRGL_FORMAT_B8G8R8X8_SRGB:
+            storage_format = VIRGL_FORMAT_B8G8R8A8_UNORM;
+            break;
+         default:
+            break;
+         }
+         if (storage_format != format)
+            virgl_info("vrend: sRGB storage %s -> %s (no sRGB write control)\n",
+                       util_format_name(format),
+                       util_format_name(storage_format));
+      }
+      internalformat = tex_conv_table[storage_format].internalformat;
+      glformat = tex_conv_table[storage_format].glformat;
+      gltype = tex_conv_table[storage_format].gltype;
 
       if (internalformat == 0) {
          virgl_error("Unknown format is %d\n", pr->format);
