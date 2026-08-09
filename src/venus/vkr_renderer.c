@@ -55,6 +55,13 @@ vkr_winehua_present_image_trace_enabled(void)
    return trace && trace[0] == '1' && !trace[1];
 }
 
+static bool
+vkr_winehua_present_prewait_enabled(void)
+{
+   const char *value = getenv("WINEHUA_VKR_PRESENT_PREWAIT");
+   return value && value[0] == '1' && !value[1];
+}
+
 static void
 vkr_winehua_stage(const char *stage, uint32_t serial)
 {
@@ -405,6 +412,20 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
       return -EAGAIN;
    }
    vkr_winehua_stage("queue-locked", serial);
+
+   if (vkr_winehua_present_prewait_enabled()) {
+      const VkResult wait_result =
+         dev->proc_table.QueueWaitIdle(queue->base.handle.queue);
+      vkr_log("WineHuaFrameAssoc: present-prewait serial=%u ctx=%u "
+              "queueId=%" PRIu64 " result=%d",
+              serial, ctx_id, queue_id, wait_result);
+      if (wait_result != VK_SUCCESS) {
+         mtx_unlock(&queue->vk_mutex);
+         mtx_unlock(&ctx->object_mutex);
+         mtx_unlock(&vkr_state.context_mutex);
+         return wait_result == VK_ERROR_DEVICE_LOST ? -ENODEV : -EIO;
+      }
+   }
 
 #ifdef __OHOS__
    /* A sampled timeline is armed for the interval after a present.  Reading

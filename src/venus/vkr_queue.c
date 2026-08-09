@@ -259,6 +259,13 @@ vkr_ohos_frame_assoc_trace_enabled(void)
    return vkr_ohos_cached_option_enabled("WINEHUA_VKR_TRACE_CAPTURE", &cached);
 }
 
+static bool
+vkr_ohos_submit_postwait_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   return vkr_ohos_cached_option_enabled("WINEHUA_VKR_SUBMIT_POSTWAIT", &cached);
+}
+
 static void
 vkr_ohos_atomic_max(atomic_uint_fast64_t *value, uint64_t candidate)
 {
@@ -1084,6 +1091,15 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
          args->queue, args->submitCount, args->pSubmits, args->fence);
 #ifdef __OHOS__
    }
+   if (args->ret == VK_SUCCESS && vkr_ohos_submit_postwait_enabled()) {
+      const VkResult wait_result =
+         vk->QueueWaitIdle(queue->base.handle.queue);
+      vkr_log("WineHuaFrameAssoc: submit-postwait api=submit submit=%" PRIu64
+              " queueId=%" PRIu64 " result=%d",
+              submit_id, queue->base.id, wait_result);
+      if (wait_result != VK_SUCCESS)
+         args->ret = wait_result;
+   }
 #endif
 #ifdef __OHOS__
    const uint64_t driver_end_ns = perf_timing ? vkr_ohos_queue_now_ns() : 0;
@@ -1379,11 +1395,35 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
    struct vn_device_proc_table *vk = &queue->device->proc_table;
 
-   vn_replace_vkQueueSubmit2_args_handle(args);
 #ifdef __OHOS__
    const uint64_t submit_id =
       atomic_fetch_add_explicit(&vkr_ohos_queue_submit_count, 1,
                                 memory_order_relaxed) + 1;
+   if (vkr_ohos_frame_assoc_trace_enabled()) {
+      for (uint32_t i = 0; i < args->submitCount; i++) {
+         const VkSubmitInfo2 *submit = &args->pSubmits[i];
+         for (uint32_t j = 0; j < submit->commandBufferInfoCount; j++) {
+            const VkCommandBufferSubmitInfo *command =
+               &submit->pCommandBufferInfos[j];
+            const struct vkr_command_buffer *cmd =
+               vkr_command_buffer_from_handle(command->commandBuffer);
+            vkr_log("WineHuaFrameAssoc: queue-submit2 ctx=%u submit=%" PRIu64
+                    " queueId=%" PRIu64 " hostQueue=0x%" PRIxPTR
+                    " batch=%u cmdIndex=%u guestCmd=0x%" PRIxPTR
+                    " cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR,
+                    queue->context ? queue->context->ctx_id : 0,
+                    submit_id, queue->base.id,
+                    (uintptr_t)queue->base.handle.queue, i, j,
+                    (uintptr_t)command->commandBuffer,
+                    cmd ? cmd->base.id : 0,
+                    cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0);
+         }
+      }
+   }
+#endif
+
+   vn_replace_vkQueueSubmit2_args_handle(args);
+#ifdef __OHOS__
    const bool gpu_upload = vkr_device_memory_gpu_upload_enabled(queue->device);
    const bool perf_summary = queue->winehua_perf_summary;
    VkResult upload_prepare_result = VK_SUCCESS;
@@ -1438,6 +1478,15 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
       args->ret = vk->QueueSubmit2(
          args->queue, args->submitCount, args->pSubmits, args->fence);
 #ifdef __OHOS__
+   }
+   if (args->ret == VK_SUCCESS && vkr_ohos_submit_postwait_enabled()) {
+      const VkResult wait_result =
+         vk->QueueWaitIdle(queue->base.handle.queue);
+      vkr_log("WineHuaFrameAssoc: submit-postwait api=submit2 submit=%" PRIu64
+              " queueId=%" PRIu64 " result=%d",
+              submit_id, queue->base.id, wait_result);
+      if (wait_result != VK_SUCCESS)
+         args->ret = wait_result;
    }
 #endif
    mtx_unlock(&queue->vk_mutex);

@@ -864,6 +864,32 @@ static void
 vkr_dispatch_vkCmdCopyBufferToImage2(UNUSED struct vn_dispatch_context *dispatch,
                                      struct vn_command_vkCmdCopyBufferToImage2 *args)
 {
+#ifdef __OHOS__
+   /* Modern DXVK uses the Vulkan 1.3 copy-commands2 entry point. Keep the
+    * upload inspection identical to the legacy entry point so array texture
+    * alpha can be diagnosed without changing the submitted command. */
+   const VkCopyBufferToImageInfo2 *info = args->pCopyBufferToImageInfo;
+   if (info && info->regionCount && info->pRegions) {
+      const struct vkr_command_buffer *cmd =
+         vkr_command_buffer_from_handle(args->commandBuffer);
+      const struct vkr_buffer *buffer = vkr_buffer_from_handle(info->srcBuffer);
+      const struct vkr_image *image = vkr_image_from_handle(info->dstImage);
+      for (uint32_t i = 0; i < info->regionCount; i++) {
+         const VkBufferImageCopy2 *src = &info->pRegions[i];
+         VkBufferImageCopy region = {
+            .bufferOffset = src->bufferOffset,
+            .bufferRowLength = src->bufferRowLength,
+            .bufferImageHeight = src->bufferImageHeight,
+            .imageSubresource = src->imageSubresource,
+            .imageOffset = src->imageOffset,
+            .imageExtent = src->imageExtent,
+         };
+         vkr_winehua_log_image_copy(
+            "copy-buffer-to-image2", cmd, buffer, image,
+            info->dstImageLayout, 1, &region);
+      }
+   }
+#endif
    VKR_CMD_CALL(CmdCopyBufferToImage2, args, args->pCopyBufferToImageInfo);
 }
 
