@@ -367,6 +367,20 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
                     raster->cullMode, raster->frontFace,
                     raster->depthBiasEnable, raster->lineWidth);
          }
+         if (info->pMultisampleState) {
+            const VkPipelineMultisampleStateCreateInfo *multisample =
+               info->pMultisampleState;
+            const VkSampleMask sample_mask = multisample->pSampleMask
+               ? multisample->pSampleMask[0] : UINT32_MAX;
+            vkr_log("WineHuaPipeline: create[%u].multisample samples=%u "
+                    "sampleShading=%u minSampleShading=%g sampleMask=0x%x "
+                    "alphaToCoverage=%u alphaToOne=%u",
+                    i, multisample->rasterizationSamples,
+                    multisample->sampleShadingEnable,
+                    multisample->minSampleShading, sample_mask,
+                    multisample->alphaToCoverageEnable,
+                    multisample->alphaToOneEnable);
+         }
          if (info->pDepthStencilState) {
             const VkPipelineDepthStencilStateCreateInfo *depth =
                info->pDepthStencilState;
