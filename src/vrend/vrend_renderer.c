@@ -808,6 +808,7 @@ struct vrend_sub_context {
    uint8_t swizzle_output_rgb_to_bgr;
    uint8_t needs_manual_srgb_encode_bitmask;
    enum vrend_unorm_srgb_write_policy unorm_srgb_write_policy;
+   uint32_t srgb_fb_diag_mask;
    int fake_occlusion_query_samples_passed_multiplier;
 
    int prim_mode;
@@ -2664,6 +2665,36 @@ static inline GLenum to_gl_swizzle(enum pipe_swizzle swizzle)
    }
 }
 
+static void
+vrend_log_sampler_srgb_once(enum virgl_formats view_format,
+                            enum virgl_formats tex_format,
+                            GLenum decode)
+{
+   static enum virgl_formats seen_view[16];
+   static enum virgl_formats seen_tex[16];
+   static GLenum seen_decode[16];
+   static unsigned seen_count = 0;
+
+   for (unsigned i = 0; i < seen_count; i++) {
+      if (seen_view[i] == view_format &&
+          seen_tex[i] == tex_format &&
+          seen_decode[i] == decode)
+         return;
+   }
+   if (seen_count < ARRAY_SIZE(seen_view)) {
+      seen_view[seen_count] = view_format;
+      seen_tex[seen_count] = tex_format;
+      seen_decode[seen_count] = decode;
+      seen_count++;
+   }
+   virgl_info("vrend: sampler view=%s tex=%s decode=%s\n",
+              util_format_name(view_format),
+              util_format_name(tex_format),
+              decode == GL_SKIP_DECODE_EXT ? "SKIP" : "DECODE");
+}
+
+static void vrend_log_framebuffer_srgb_pairs(struct vrend_sub_context *sub_ctx);
+
 int vrend_create_sampler_view(struct vrend_context *ctx,
                               uint32_t handle,
                               struct vrend_resource *res,
@@ -2732,6 +2763,11 @@ int vrend_create_sampler_view(struct vrend_context *ctx,
           !util_format_is_srgb(view->format))
          view->srgb_decode = GL_SKIP_DECODE_EXT;
    }
+   if (util_format_is_srgb(view->texture->base.format) ||
+       util_format_is_srgb(view->format))
+      vrend_log_sampler_srgb_once(view->format,
+                                  view->texture->base.format,
+                                  view->srgb_decode);
    if (!(util_format_has_alpha(view->format) || util_format_is_depth_or_stencil(view->format))) {
       if (swizzle[0] == PIPE_SWIZZLE_W)
           swizzle[0] = PIPE_SWIZZLE_1;
@@ -3115,6 +3151,38 @@ vrend_is_unorm_surface_of_srgb_resource(const struct vrend_surface *surf,
 }
 
 static void
+vrend_log_framebuffer_srgb_pairs(struct vrend_sub_context *sub_ctx)
+{
+   uint32_t mask = 0;
+   for (uint32_t i = 0; i < sub_ctx->nr_cbufs; i++) {
+      struct vrend_surface *surf = sub_ctx->surf[i];
+      if (vrend_is_unorm_surface_of_srgb_resource(surf, true) ||
+          vrend_is_unorm_surface_of_srgb_resource(surf, false))
+         mask |= 1u << i;
+   }
+   if (mask == sub_ctx->srgb_fb_diag_mask)
+      return;
+   sub_ctx->srgb_fb_diag_mask = mask;
+   if (!mask)
+      return;
+
+   virgl_info("vrend: subctx=%d srgb-fb nr=%u\n", sub_ctx->sub_ctx_id,
+              sub_ctx->nr_cbufs);
+   for (uint32_t i = 0; i < sub_ctx->nr_cbufs; i++) {
+      struct vrend_surface *surf = sub_ctx->surf[i];
+      if (!surf)
+         continue;
+      if (vrend_is_unorm_surface_of_srgb_resource(surf, true) ||
+          vrend_is_unorm_surface_of_srgb_resource(surf, false)) {
+         virgl_info("vrend: subctx=%d fb[%u] surf=%s res=%s\n",
+                    sub_ctx->sub_ctx_id, i,
+                    util_format_name(surf->format),
+                    util_format_name(surf->texture->base.format));
+      }
+   }
+}
+
+static void
 vrend_classify_unorm_srgb_write_policy(struct vrend_sub_context *sub_ctx)
 {
    if (sub_ctx->unorm_srgb_write_policy != VREND_UNORM_SRGB_WRITE_UNDECIDED ||
@@ -3127,6 +3195,8 @@ vrend_classify_unorm_srgb_write_policy(struct vrend_sub_context *sub_ctx)
 
       if (vrend_is_unorm_surface_of_srgb_resource(surf, true)) {
          sub_ctx->unorm_srgb_write_policy = VREND_UNORM_SRGB_WRITE_PRESERVE;
+         virgl_info("vrend: subctx=%d unorm-srgb policy=PRESERVE (alpha-bearing first)\n",
+                    sub_ctx->sub_ctx_id);
          return;
       }
       saw_xrgb |= vrend_is_unorm_surface_of_srgb_resource(surf, false);
@@ -3134,6 +3204,9 @@ vrend_classify_unorm_srgb_write_policy(struct vrend_sub_context *sub_ctx)
 
    if (saw_xrgb)
       sub_ctx->unorm_srgb_write_policy = VREND_UNORM_SRGB_WRITE_ENCODE_XRGB;
+   if (saw_xrgb)
+      virgl_info("vrend: subctx=%d unorm-srgb policy=ENCODE_XRGB (XRGB-only first)\n",
+                 sub_ctx->sub_ctx_id);
 }
 
 static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
@@ -3181,6 +3254,7 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
     * compatibility encode.  Do not let unrelated render targets encountered
     * later retroactively change the main target's colorspace policy. */
    vrend_classify_unorm_srgb_write_policy(sub_ctx);
+   vrend_log_framebuffer_srgb_pairs(sub_ctx);
 
    sub_ctx->swizzle_output_rgb_to_bgr = 0;
    sub_ctx->needs_manual_srgb_encode_bitmask = 0;
@@ -7766,6 +7840,15 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
 
    if (!vrend_winsys_has_gl_colorspace())
       clear_feature(feat_srgb_write_control);
+
+   virgl_info("vrend: host GL_RENDERER=%s GL_VERSION=%s gles=%d srgb_write_control=%d srgb_decode=%d texture_view=%d gl_colorspace=%d\n",
+              (const char *)glGetString(GL_RENDERER),
+              (const char *)glGetString(GL_VERSION),
+              gles,
+              has_feature(feat_srgb_write_control),
+              has_feature(feat_texture_srgb_decode),
+              has_feature(feat_texture_view),
+              vrend_winsys_has_gl_colorspace());
 
    glGetIntegerv(GL_MAX_DRAW_BUFFERS, (GLint *) &vrend_state.max_draw_buffers);
 
