@@ -215,6 +215,9 @@ static FILE *winehua_diag_file;
 static uint64_t winehua_submit_count;
 static uint64_t winehua_submit2_count;
 static uint64_t winehua_complete_count;
+static uint64_t winehua_timeline_submit_count;
+static uint64_t winehua_timeline_complete_count;
+static uint64_t winehua_sync_wait_count;
 static uint64_t winehua_present_count;
 static uint64_t winehua_vk_present_count;
 static vtest_winehua_present_callback winehua_present_callback;
@@ -344,11 +347,17 @@ static void vtest_signal_timeline(struct vtest_timeline *timeline,
                                   struct vtest_timeline_submit *to_submit);
 
 static void vtest_write_context_fence(UNUSED void *cookie,
-                                      UNUSED uint32_t ctx_id,
-                                      UNUSED uint32_t ring_idx,
+                                      uint32_t ctx_id,
+                                      uint32_t ring_idx,
                                       uint64_t fence_id)
 {
    struct vtest_timeline_submit *submit = (void*)(uintptr_t)fence_id;
+   const uint64_t complete_count = ++winehua_timeline_complete_count;
+   if (complete_count <= 16 ||
+       (winehua_vtest_perf_summary_enabled() && !(complete_count % 120)))
+      winehua_diag("timeline complete ctx=%u ring=%u fence_ptr=0x%llx count=%llu",
+                   ctx_id, ring_idx, (unsigned long long)fence_id,
+                   (unsigned long long)complete_count);
    vtest_signal_timeline(submit->timeline, submit);
 }
 
@@ -758,6 +767,9 @@ int vtest_init_renderer(bool multi_clients,
    winehua_submit_count = 0;
    winehua_submit2_count = 0;
    winehua_complete_count = 0;
+   winehua_timeline_submit_count = 0;
+   winehua_timeline_complete_count = 0;
+   winehua_sync_wait_count = 0;
    winehua_present_count = 0;
    winehua_vk_present_count = 0;
    winehua_diag("renderer init sync=%s submitted=%u completed=%u multi_clients=%d ctx_flags=0x%x",
@@ -2660,6 +2672,13 @@ int vtest_sync_wait(uint32_t length_dw)
    if ((wait->flags & VCMD_SYNC_WAIT_FLAG_ANY) && wait->count < sync_count)
       is_ready = true;
 
+   const uint64_t wait_id = ++winehua_sync_wait_count;
+   if (wait_id <= 16 ||
+       (winehua_vtest_perf_summary_enabled() && !(wait_id % 120)))
+      winehua_diag("sync wait id=%llu ctx=%d flags=0x%x timeout_ms=%u syncs=%u pending=%u ready=%d",
+                   (unsigned long long)wait_id, ctx->ctx_id, wait->flags,
+                   timeout, sync_count, wait->count, is_ready);
+
    if (is_ready) {
       write_ready(wait->fd);
    }
@@ -2826,6 +2845,15 @@ static int vtest_submit_cmd2_batch(struct vtest_context *ctx,
                                                 VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
                                                 batch->ring_idx,
                                                 fence_id);
+      ++winehua_timeline_submit_count;
+      if (winehua_timeline_submit_count <= 16 ||
+          (winehua_vtest_perf_summary_enabled() &&
+           !(winehua_timeline_submit_count % 120)))
+         winehua_diag("timeline submit ctx=%d ring=%u fence_ptr=0x%llx syncs=%u cmd_dw=%u ret=%d count=%llu",
+                      ctx->ctx_id, batch->ring_idx,
+                      (unsigned long long)fence_id, batch->sync_count,
+                      batch->cmd_size, ret,
+                      (unsigned long long)winehua_timeline_submit_count);
       if (ret) {
          vtest_free_timeline_submit(submit);
          goto out;

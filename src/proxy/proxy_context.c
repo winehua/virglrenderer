@@ -589,7 +589,18 @@ proxy_context_init_fencing(struct proxy_context *ctx)
     *
     * Fence polling can always check the shmem directly.
     */
-   if (!(proxy_renderer.flags & VIRGL_RENDERER_THREAD_SYNC))
+#ifdef __OHOS__
+   /* vtest's egl-main mode intentionally keeps vrend on its established
+    * single-threaded fence path.  Venus proxy contexts still need an eventfd
+    * so the vtest select loop is woken when the remote timeline advances;
+    * otherwise a completed GPU fence is not retired until the next client
+    * socket command arrives. */
+   const bool need_fence_eventfd = true;
+#else
+   const bool need_fence_eventfd =
+      proxy_renderer.flags & VIRGL_RENDERER_THREAD_SYNC;
+#endif
+   if (!need_fence_eventfd)
       return true;
 
    ctx->sync_thread.fence_eventfd = create_eventfd(0);

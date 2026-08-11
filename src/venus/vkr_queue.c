@@ -27,6 +27,8 @@ static atomic_uint_fast64_t vkr_ohos_fence_status_not_ready_count;
 static atomic_uint_fast64_t vkr_ohos_fence_wait_count;
 static atomic_uint_fast64_t vkr_ohos_fence_wait_total_us;
 static atomic_uint_fast64_t vkr_ohos_fence_wait_max_us;
+static atomic_uint_fast64_t vkr_ohos_context_fence_submit_count;
+static atomic_uint_fast64_t vkr_ohos_context_fence_wait_count;
 static atomic_uint_fast64_t vkr_ohos_perf_submit_infos;
 static atomic_uint_fast64_t vkr_ohos_perf_shadow_scanned;
 static atomic_uint_fast64_t vkr_ohos_perf_shadow_copies;
@@ -480,9 +482,25 @@ vkr_queue_sync_submit(struct vkr_queue *queue,
    if (!sync)
       return false;
 
+#ifdef __OHOS__
+   const bool perf_summary = vkr_ohos_perf_summary_enabled();
+   const uint64_t submit_id = atomic_fetch_add_explicit(
+      &vkr_ohos_context_fence_submit_count, 1, memory_order_relaxed) + 1;
+   const bool trace_submit = perf_summary || submit_id <= 16;
+   const uint64_t submit_start_ns = trace_submit ? vkr_ohos_queue_now_ns() : 0;
+#endif
    mtx_lock(&queue->vk_mutex);
    VkResult result = vk->QueueSubmit(queue->base.handle.queue, 0, NULL, sync->fence);
    mtx_unlock(&queue->vk_mutex);
+#ifdef __OHOS__
+   const uint64_t submit_end_ns = trace_submit ? vkr_ohos_queue_now_ns() : 0;
+   if (submit_id <= 16 || (perf_summary && !(submit_id % 120)) || result)
+      vkr_log("OHOS context fence submit id=%" PRIu64
+              " ring=%u fence_ptr=0x%" PRIx64 " result=%d elapsed_us=%" PRIu64,
+              submit_id, ring_idx, fence_id, result,
+              submit_end_ns >= submit_start_ns
+                 ? (submit_end_ns - submit_start_ns) / 1000 : 0);
+#endif
 
    if (result == VK_ERROR_DEVICE_LOST) {
       sync->device_lost = true;
@@ -579,12 +597,30 @@ vkr_queue_thread(void *arg)
       mtx_unlock(&queue->sync_thread.mutex);
 
       VkResult result;
+#ifdef __OHOS__
+      const bool perf_summary = vkr_ohos_perf_summary_enabled();
+      const uint64_t wait_id = atomic_fetch_add_explicit(
+         &vkr_ohos_context_fence_wait_count, 1, memory_order_relaxed) + 1;
+      const bool trace_wait = perf_summary || wait_id <= 16;
+      const uint64_t wait_start_ns = trace_wait ? vkr_ohos_queue_now_ns() : 0;
+#endif
       if (sync->device_lost) {
          result = VK_ERROR_DEVICE_LOST;
       } else {
          result = vk->WaitForFences(dev->base.handle.device, 1, &sync->fence, true,
                                     ns_per_sec * 3);
       }
+#ifdef __OHOS__
+      const uint64_t wait_end_ns = trace_wait ? vkr_ohos_queue_now_ns() : 0;
+      if (wait_id <= 16 || (perf_summary && !(wait_id % 120)) ||
+          result != VK_SUCCESS)
+         vkr_log("OHOS context fence wait id=%" PRIu64
+                 " ring=%u fence_ptr=0x%" PRIx64
+                 " result=%d elapsed_us=%" PRIu64,
+                 wait_id, sync->ring_idx, sync->fence_id, result,
+                 wait_end_ns >= wait_start_ns
+                    ? (wait_end_ns - wait_start_ns) / 1000 : 0);
+#endif
 
       mtx_lock(&queue->sync_thread.mutex);
 
