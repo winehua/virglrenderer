@@ -156,6 +156,14 @@ vkr_queue_destroy(struct vkr_context *ctx, struct vkr_queue *queue);
 uint64_t
 vkr_winehua_queue_submit_generation(void);
 
+void
+vkr_winehua_perf_case_begin(struct vkr_device *dev,
+                            const struct vkr_context *ctx);
+
+void
+vkr_winehua_perf_case_end(struct vkr_device *dev,
+                          const struct vkr_context *ctx);
+
 /* Called with queue->vk_mutex held by the private present implementation.
  * It reports the completed sampled interval and arms the following one. */
 void

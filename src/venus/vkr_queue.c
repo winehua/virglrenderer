@@ -9,6 +9,7 @@
 
 #include "vkr_context.h"
 #include "vkr_command_buffer.h"
+#include "vkr_device.h"
 #include "vkr_device_memory.h"
 #include "vkr_physical_device.h"
 #include "vkr_queue_gen.h"
@@ -69,6 +70,209 @@ static atomic_uint_fast64_t vkr_ohos_perf_total_us;
 static atomic_uint_fast64_t vkr_ohos_perf_total_max_us;
 static atomic_uint_fast64_t vkr_ohos_perf_submit_gap_total_us;
 static atomic_uint_fast64_t vkr_ohos_perf_submit_gap_max_us;
+
+static bool
+vkr_ohos_perf_summary_enabled(void);
+
+static uint64_t
+vkr_ohos_perf_delta(uint64_t end, uint64_t begin)
+{
+   return end >= begin ? end - begin : 0;
+}
+
+static void
+vkr_ohos_perf_totals_read(struct vkr_winehua_perf_totals *totals)
+{
+   totals->queue_submit_count = atomic_load_explicit(
+      &vkr_ohos_queue_submit_count, memory_order_relaxed);
+   totals->submit_infos = atomic_load_explicit(
+      &vkr_ohos_perf_submit_infos, memory_order_relaxed);
+   totals->shadow_scanned = atomic_load_explicit(
+      &vkr_ohos_perf_shadow_scanned, memory_order_relaxed);
+   totals->shadow_copies = atomic_load_explicit(
+      &vkr_ohos_perf_shadow_copies, memory_order_relaxed);
+   totals->shadow_bytes = atomic_load_explicit(
+      &vkr_ohos_perf_shadow_bytes, memory_order_relaxed);
+   totals->prepare_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_prepare_total_us, memory_order_relaxed);
+   totals->prepare_phase_count = atomic_load_explicit(
+      &vkr_ohos_perf_prepare_phase_count, memory_order_relaxed);
+   totals->prepare_wait_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_prepare_wait_total_us, memory_order_relaxed);
+   totals->prepare_reset_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_prepare_reset_total_us, memory_order_relaxed);
+   totals->prepare_dirty_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_prepare_dirty_total_us, memory_order_relaxed);
+   totals->prepare_buffer_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_prepare_buffer_total_us, memory_order_relaxed);
+   totals->prepare_uncovered_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_prepare_uncovered_total_us, memory_order_relaxed);
+   totals->prepare_end_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_prepare_end_total_us, memory_order_relaxed);
+   totals->sync_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_sync_total_us, memory_order_relaxed);
+   totals->lock_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_lock_total_us, memory_order_relaxed);
+   totals->upload_submit_count = atomic_load_explicit(
+      &vkr_ohos_perf_upload_submit_count, memory_order_relaxed);
+   totals->upload_buffers = atomic_load_explicit(
+      &vkr_ohos_perf_upload_buffers, memory_order_relaxed);
+   totals->upload_uniform_buffers = atomic_load_explicit(
+      &vkr_ohos_perf_upload_uniform_buffers, memory_order_relaxed);
+   totals->upload_storage_buffers = atomic_load_explicit(
+      &vkr_ohos_perf_upload_storage_buffers, memory_order_relaxed);
+   totals->upload_ranges = atomic_load_explicit(
+      &vkr_ohos_perf_upload_ranges, memory_order_relaxed);
+   totals->upload_updates = atomic_load_explicit(
+      &vkr_ohos_perf_upload_updates, memory_order_relaxed);
+   totals->upload_bytes = atomic_load_explicit(
+      &vkr_ohos_perf_upload_bytes, memory_order_relaxed);
+   totals->upload_skipped_bytes = atomic_load_explicit(
+      &vkr_ohos_perf_upload_skipped_bytes, memory_order_relaxed);
+   totals->upload_skipped_copies = atomic_load_explicit(
+      &vkr_ohos_perf_upload_skipped_copies, memory_order_relaxed);
+   totals->upload_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_upload_total_us, memory_order_relaxed);
+   totals->driver_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_driver_total_us, memory_order_relaxed);
+   totals->total_us = atomic_load_explicit(
+      &vkr_ohos_perf_total_us, memory_order_relaxed);
+   totals->submit_gap_total_us = atomic_load_explicit(
+      &vkr_ohos_perf_submit_gap_total_us, memory_order_relaxed);
+   totals->fence_status_count = atomic_load_explicit(
+      &vkr_ohos_fence_status_count, memory_order_relaxed);
+   totals->fence_status_total_us = atomic_load_explicit(
+      &vkr_ohos_fence_status_total_us, memory_order_relaxed);
+   totals->fence_status_success_count = atomic_load_explicit(
+      &vkr_ohos_fence_status_success_count, memory_order_relaxed);
+   totals->fence_status_not_ready_count = atomic_load_explicit(
+      &vkr_ohos_fence_status_not_ready_count, memory_order_relaxed);
+   totals->fence_wait_count = atomic_load_explicit(
+      &vkr_ohos_fence_wait_count, memory_order_relaxed);
+   totals->fence_wait_total_us = atomic_load_explicit(
+      &vkr_ohos_fence_wait_total_us, memory_order_relaxed);
+   totals->context_fence_submit_count = atomic_load_explicit(
+      &vkr_ohos_context_fence_submit_count, memory_order_relaxed);
+   totals->context_fence_wait_count = atomic_load_explicit(
+      &vkr_ohos_context_fence_wait_count, memory_order_relaxed);
+}
+
+void
+vkr_winehua_perf_case_begin(struct vkr_device *dev,
+                            const struct vkr_context *ctx)
+{
+   if (!dev || !vkr_ohos_perf_summary_enabled())
+      return;
+
+   vkr_ohos_perf_totals_read(&dev->winehua_perf_begin);
+   dev->winehua_perf_boundary_enabled = true;
+   const uint32_t ctx_id = ctx ? ctx->ctx_id : 0;
+   const char *ctx_name = ctx && ctx->instance_name && ctx->instance_name[0]
+      ? ctx->instance_name
+      : (ctx && ctx->debug_name && ctx->debug_name[0] ? ctx->debug_name : "-");
+   vkr_log("WineHuaPerfCase: phase=begin scope=device device=%p "
+           "ctx=%u ctx_name=%s submit=%" PRIu64,
+           (void *)dev, ctx_id, ctx_name,
+           dev->winehua_perf_begin.queue_submit_count);
+}
+
+void
+vkr_winehua_perf_case_end(struct vkr_device *dev,
+                          const struct vkr_context *ctx)
+{
+   if (!dev || !dev->winehua_perf_boundary_enabled)
+      return;
+
+   struct vkr_winehua_perf_totals end;
+   vkr_ohos_perf_totals_read(&end);
+   const struct vkr_winehua_perf_totals *begin = &dev->winehua_perf_begin;
+   const uint32_t ctx_id = ctx ? ctx->ctx_id : 0;
+   const char *ctx_name = ctx && ctx->instance_name && ctx->instance_name[0]
+      ? ctx->instance_name
+      : (ctx && ctx->debug_name && ctx->debug_name[0] ? ctx->debug_name : "-");
+
+   vkr_log("WineHuaPerfCase: phase=end scope=device device=%p "
+           "ctx=%u ctx_name=%s submits=%" PRIu64
+           " submit_infos=%" PRIu64 " shadow_scanned=%" PRIu64
+           " shadow_copies=%" PRIu64 " shadow_bytes=%" PRIu64
+           " prepare_us=%" PRIu64 " prepare_calls=%" PRIu64
+           " prepare_wait_us=%" PRIu64 " prepare_reset_us=%" PRIu64
+           " prepare_dirty_us=%" PRIu64 " prepare_buffer_us=%" PRIu64
+           " prepare_uncovered_us=%" PRIu64 " prepare_end_us=%" PRIu64
+           " sync_us=%" PRIu64 " lock_us=%" PRIu64
+           " upload_submits=%" PRIu64 " upload_buffers=%" PRIu64
+           " upload_uniform_buffers=%" PRIu64
+           " upload_storage_buffers=%" PRIu64 " upload_ranges=%" PRIu64
+           " upload_updates=%" PRIu64 " upload_bytes=%" PRIu64
+           " upload_skipped_bytes=%" PRIu64
+           " upload_skipped_copies=%" PRIu64 " upload_us=%" PRIu64
+           " driver_us=%" PRIu64 " total_us=%" PRIu64
+           " submit_gap_us=%" PRIu64 " fence_status=%" PRIu64
+           " fence_status_us=%" PRIu64 " fence_success=%" PRIu64
+           " fence_not_ready=%" PRIu64 " fence_wait=%" PRIu64
+           " fence_wait_us=%" PRIu64 " context_fence_submit=%" PRIu64
+           " context_fence_wait=%" PRIu64,
+           (void *)dev, ctx_id, ctx_name,
+           vkr_ohos_perf_delta(end.queue_submit_count,
+                               begin->queue_submit_count),
+           vkr_ohos_perf_delta(end.submit_infos, begin->submit_infos),
+           vkr_ohos_perf_delta(end.shadow_scanned, begin->shadow_scanned),
+           vkr_ohos_perf_delta(end.shadow_copies, begin->shadow_copies),
+           vkr_ohos_perf_delta(end.shadow_bytes, begin->shadow_bytes),
+           vkr_ohos_perf_delta(end.prepare_total_us, begin->prepare_total_us),
+           vkr_ohos_perf_delta(end.prepare_phase_count,
+                               begin->prepare_phase_count),
+           vkr_ohos_perf_delta(end.prepare_wait_total_us,
+                               begin->prepare_wait_total_us),
+           vkr_ohos_perf_delta(end.prepare_reset_total_us,
+                               begin->prepare_reset_total_us),
+           vkr_ohos_perf_delta(end.prepare_dirty_total_us,
+                               begin->prepare_dirty_total_us),
+           vkr_ohos_perf_delta(end.prepare_buffer_total_us,
+                               begin->prepare_buffer_total_us),
+           vkr_ohos_perf_delta(end.prepare_uncovered_total_us,
+                               begin->prepare_uncovered_total_us),
+           vkr_ohos_perf_delta(end.prepare_end_total_us,
+                               begin->prepare_end_total_us),
+           vkr_ohos_perf_delta(end.sync_total_us, begin->sync_total_us),
+           vkr_ohos_perf_delta(end.lock_total_us, begin->lock_total_us),
+           vkr_ohos_perf_delta(end.upload_submit_count,
+                               begin->upload_submit_count),
+           vkr_ohos_perf_delta(end.upload_buffers, begin->upload_buffers),
+           vkr_ohos_perf_delta(end.upload_uniform_buffers,
+                               begin->upload_uniform_buffers),
+           vkr_ohos_perf_delta(end.upload_storage_buffers,
+                               begin->upload_storage_buffers),
+           vkr_ohos_perf_delta(end.upload_ranges, begin->upload_ranges),
+           vkr_ohos_perf_delta(end.upload_updates, begin->upload_updates),
+           vkr_ohos_perf_delta(end.upload_bytes, begin->upload_bytes),
+           vkr_ohos_perf_delta(end.upload_skipped_bytes,
+                               begin->upload_skipped_bytes),
+           vkr_ohos_perf_delta(end.upload_skipped_copies,
+                               begin->upload_skipped_copies),
+           vkr_ohos_perf_delta(end.upload_total_us, begin->upload_total_us),
+           vkr_ohos_perf_delta(end.driver_total_us, begin->driver_total_us),
+           vkr_ohos_perf_delta(end.total_us, begin->total_us),
+           vkr_ohos_perf_delta(end.submit_gap_total_us,
+                               begin->submit_gap_total_us),
+           vkr_ohos_perf_delta(end.fence_status_count,
+                               begin->fence_status_count),
+           vkr_ohos_perf_delta(end.fence_status_total_us,
+                               begin->fence_status_total_us),
+           vkr_ohos_perf_delta(end.fence_status_success_count,
+                               begin->fence_status_success_count),
+           vkr_ohos_perf_delta(end.fence_status_not_ready_count,
+                               begin->fence_status_not_ready_count),
+           vkr_ohos_perf_delta(end.fence_wait_count, begin->fence_wait_count),
+           vkr_ohos_perf_delta(end.fence_wait_total_us,
+                               begin->fence_wait_total_us),
+           vkr_ohos_perf_delta(end.context_fence_submit_count,
+                               begin->context_fence_submit_count),
+           vkr_ohos_perf_delta(end.context_fence_wait_count,
+                               begin->context_fence_wait_count));
+
+   dev->winehua_perf_boundary_enabled = false;
+}
 
 uint64_t
 vkr_winehua_queue_submit_generation(void)

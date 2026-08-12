@@ -12,6 +12,47 @@
 
 #include "vkr_context.h"
 
+#ifdef __OHOS__
+struct vkr_winehua_perf_totals {
+   uint64_t queue_submit_count;
+   uint64_t submit_infos;
+   uint64_t shadow_scanned;
+   uint64_t shadow_copies;
+   uint64_t shadow_bytes;
+   uint64_t prepare_total_us;
+   uint64_t prepare_phase_count;
+   uint64_t prepare_wait_total_us;
+   uint64_t prepare_reset_total_us;
+   uint64_t prepare_dirty_total_us;
+   uint64_t prepare_buffer_total_us;
+   uint64_t prepare_uncovered_total_us;
+   uint64_t prepare_end_total_us;
+   uint64_t sync_total_us;
+   uint64_t lock_total_us;
+   uint64_t upload_submit_count;
+   uint64_t upload_buffers;
+   uint64_t upload_uniform_buffers;
+   uint64_t upload_storage_buffers;
+   uint64_t upload_ranges;
+   uint64_t upload_updates;
+   uint64_t upload_bytes;
+   uint64_t upload_skipped_bytes;
+   uint64_t upload_skipped_copies;
+   uint64_t upload_total_us;
+   uint64_t driver_total_us;
+   uint64_t total_us;
+   uint64_t submit_gap_total_us;
+   uint64_t fence_status_count;
+   uint64_t fence_status_total_us;
+   uint64_t fence_status_success_count;
+   uint64_t fence_status_not_ready_count;
+   uint64_t fence_wait_count;
+   uint64_t fence_wait_total_us;
+   uint64_t context_fence_submit_count;
+   uint64_t context_fence_wait_count;
+};
+#endif
+
 struct vkr_device {
    struct vkr_object base;
 
@@ -28,6 +69,11 @@ struct vkr_device {
    struct list_head objects;
 
 #ifdef __OHOS__
+   /* Diagnostics only: process-wide counters are snapshotted at device
+    * creation and reported as a per-device delta at destruction. */
+   struct vkr_winehua_perf_totals winehua_perf_begin;
+   bool winehua_perf_boundary_enabled;
+
    /* Diagnostic descriptor serialization waits at most once for each Host
     * queue-submit generation. Waiting before every descriptor write makes a
     * real game effectively single-step and can mask the ordering failure the
