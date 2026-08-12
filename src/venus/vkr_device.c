@@ -220,7 +220,9 @@ vkr_dispatch_vkCreateDevice(struct vn_dispatch_context *dispatch,
    mtx_init(&dev->object_mutex, mtx_plain);
    list_inithead(&dev->objects);
 
+#ifdef __OHOS__
    vkr_winehua_perf_case_begin(dev, ctx);
+#endif
    list_add(&dev->base.track_head, &physical_dev->devices);
 
    vkr_context_add_object(ctx, &dev->base);
@@ -373,7 +375,9 @@ vkr_device_destroy(struct vkr_context *ctx, struct vkr_device *dev, bool destroy
    list_for_each_entry_safe (struct vkr_queue, queue, &dev->queues, base.track_head)
       vkr_queue_destroy(ctx, queue);
 
+#ifdef __OHOS__
    vkr_winehua_perf_case_end(dev, ctx);
+#endif
 
    list_for_each_entry_safe (struct vkr_queue_sync, sync, &dev->free_syncs, head) {
       vk->DestroyFence(dev->base.handle.device, sync->fence, NULL);
