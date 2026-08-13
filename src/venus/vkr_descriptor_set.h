@@ -20,6 +20,7 @@ struct vkr_winehua_ubo_binding {
    uint64_t last_bound_mapping_sequence;
    VkDeviceSize offset;
    VkDeviceSize size;
+   uint32_t binding;
    uint32_t array_element;
    VkDescriptorType descriptor_type;
    bool valid;

@@ -279,6 +279,95 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
                  (const void *)info->pMultisampleState,
                  (const void *)info->pColorBlendState,
                  (const void *)info->pDynamicState);
+         for (const VkBaseInStructure *next =
+                 (const VkBaseInStructure *)info->pNext;
+              next; next = next->pNext) {
+            vkr_log("WineHuaPipeline: create[%u].pNext sType=%u ptr=%p",
+                    i, next->sType, (const void *)next);
+            if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+               const VkPipelineRenderingCreateInfo *rendering =
+                  (const VkPipelineRenderingCreateInfo *)next;
+               vkr_log("WineHuaPipeline: create[%u].rendering viewMask=0x%x colors=%u depthFormat=%u stencilFormat=%u",
+                       i, rendering->viewMask,
+                       rendering->colorAttachmentCount,
+                       rendering->depthAttachmentFormat,
+                       rendering->stencilAttachmentFormat);
+               if (rendering->colorAttachmentCount &&
+                   !rendering->pColorAttachmentFormats) {
+                  vkr_log("WineHuaPipeline: create[%u].rendering colorFormats=null", i);
+               } else {
+                  for (uint32_t j = 0;
+                       j < rendering->colorAttachmentCount; j++) {
+                     vkr_log("WineHuaPipeline: create[%u].rendering colorFormat[%u]=%u",
+                             i, j, rendering->pColorAttachmentFormats[j]);
+                  }
+               }
+            }
+         }
+         if (info->pRasterizationState) {
+            const VkPipelineRasterizationStateCreateInfo *raster =
+               info->pRasterizationState;
+            vkr_log("WineHuaPipeline: create[%u].raster depthClamp=%u discard=%u polygon=%u cull=0x%x front=%u depthBias=%u lineWidth=%g",
+                    i, raster->depthClampEnable,
+                    raster->rasterizerDiscardEnable, raster->polygonMode,
+                    raster->cullMode, raster->frontFace,
+                    raster->depthBiasEnable, raster->lineWidth);
+         }
+         if (info->pDepthStencilState) {
+            const VkPipelineDepthStencilStateCreateInfo *depth =
+               info->pDepthStencilState;
+            vkr_log("WineHuaPipeline: create[%u].depth test=%u write=%u compare=%u bounds=%u stencil=%u",
+                    i, depth->depthTestEnable, depth->depthWriteEnable,
+                    depth->depthCompareOp, depth->depthBoundsTestEnable,
+                    depth->stencilTestEnable);
+         }
+         if (info->pColorBlendState) {
+            const VkPipelineColorBlendStateCreateInfo *blend =
+               info->pColorBlendState;
+            vkr_log("WineHuaPipeline: create[%u].blend flags=0x%x logicEnable=%u logicOp=%u attachmentCount=%u constants=%g,%g,%g,%g",
+                    i, blend->flags, blend->logicOpEnable, blend->logicOp,
+                    blend->attachmentCount, blend->blendConstants[0],
+                    blend->blendConstants[1], blend->blendConstants[2],
+                    blend->blendConstants[3]);
+            if (blend->attachmentCount && !blend->pAttachments) {
+               vkr_log("WineHuaPipeline: create[%u].blend attachments=null", i);
+            } else {
+               for (uint32_t j = 0; j < blend->attachmentCount; j++) {
+                  const VkPipelineColorBlendAttachmentState *attachment =
+                     &blend->pAttachments[j];
+                  const bool dual_src =
+                     (attachment->srcColorBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+                      attachment->srcColorBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+                     (attachment->dstColorBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+                      attachment->dstColorBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+                     (attachment->srcAlphaBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+                      attachment->srcAlphaBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+                     (attachment->dstAlphaBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+                      attachment->dstAlphaBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA);
+                  vkr_log("WineHuaPipeline: create[%u].blend[%u] enable=%u color=%u,%u,%u alpha=%u,%u,%u writeMask=0x%x dualSrc=%u",
+                          i, j, attachment->blendEnable,
+                          attachment->srcColorBlendFactor,
+                          attachment->dstColorBlendFactor,
+                          attachment->colorBlendOp,
+                          attachment->srcAlphaBlendFactor,
+                          attachment->dstAlphaBlendFactor,
+                          attachment->alphaBlendOp,
+                          attachment->colorWriteMask, dual_src ? 1u : 0u);
+               }
+            }
+         }
+         if (info->pDynamicState) {
+            const VkPipelineDynamicStateCreateInfo *dynamic = info->pDynamicState;
+            vkr_log("WineHuaPipeline: create[%u].dynamic flags=0x%x count=%u",
+                    i, dynamic->flags, dynamic->dynamicStateCount);
+            if (dynamic->dynamicStateCount && !dynamic->pDynamicStates) {
+               vkr_log("WineHuaPipeline: create[%u].dynamic states=null", i);
+            } else {
+               for (uint32_t j = 0; j < dynamic->dynamicStateCount; j++)
+                  vkr_log("WineHuaPipeline: create[%u].dynamic[%u]=%u",
+                          i, j, dynamic->pDynamicStates[j]);
+            }
+         }
          for (uint32_t j = 0; j < info->stageCount; j++) {
             const struct vkr_shader_module *shader =
                vkr_shader_module_from_handle(info->pStages[j].module);

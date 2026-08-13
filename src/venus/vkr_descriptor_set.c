@@ -254,7 +254,8 @@ vkr_winehua_track_ubo_mappings(struct vkr_context *ctx,
    mtx_lock(&ctx->object_mutex);
    for (uint32_t i = 0; i < write_count; i++) {
       const VkWriteDescriptorSet *write = &writes[i];
-      if ((write->dstBinding != 3 && write->dstBinding != 4) ||
+      if ((write->dstBinding != 0 && write->dstBinding != 3 &&
+           write->dstBinding != 4) ||
           !write->pBufferInfo ||
           (write->descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
            write->descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC))
@@ -268,10 +269,11 @@ vkr_winehua_track_ubo_mappings(struct vkr_context *ctx,
             ? vkr_buffer_from_handle(info->buffer) : NULL;
          struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
          if (!set || !buffer || !mem ||
-             (info->range != 48 && info->range != 1536))
+             (info->range != 48 && info->range != 64 &&
+              info->range != 1536))
             continue;
 
-         const uint32_t binding_index = write->dstBinding - 3;
+         const uint32_t binding_index = write->dstBinding == 4 ? 1 : 0;
          const uint32_t array_element = write->dstArrayElement + j;
          struct vkr_winehua_ubo_binding *state =
             &set->winehua_ubo_bindings[binding_index];
@@ -302,6 +304,7 @@ vkr_winehua_track_ubo_mappings(struct vkr_context *ctx,
          state->buffer_id = buffer->base.id;
          state->offset = info->offset;
          state->size = info->range;
+         state->binding = write->dstBinding;
          state->array_element = array_element;
          state->descriptor_type = write->descriptorType;
          state->valid = true;
