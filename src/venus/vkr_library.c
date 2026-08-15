@@ -49,7 +49,14 @@ vkr_library_load(struct vulkan_library *lib)
    if (lib->handle == NULL)
       lib->handle = dlopen("libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
 #else
-   lib->handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+   /* WineHua arm64/OHOS: app bundle el1 顶层放有 guest Vulkan Loader
+    * (libvulkan.so.1), 名字搜索会先命中它而不是宿主驱动 → host vkCreateInstance
+    * 返回 INCOMPATIBLE_DRIVER. 宿主系统 Vulkan 是 /system/lib64/libvulkan.so
+    * (无版本号, 海思 Maleoon), 用绝对路径直连绕过名字搜索/遮蔽.
+    * 非 OHOS 平台该路径不存在 → dlopen 返回 NULL, 自然 fallback 到名字搜索. */
+   lib->handle = dlopen("/system/lib64/libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+   if (lib->handle == NULL)
+      lib->handle = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
    if (lib->handle == NULL)
       lib->handle = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
 #endif
