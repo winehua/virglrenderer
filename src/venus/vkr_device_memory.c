@@ -1013,6 +1013,25 @@ vkr_ohos_record_shadow_dirty_range(struct vkr_device_memory *mem,
    if (mem->shadow_dirty_range_overflow)
       return false;
 
+   /* WineHua guest-dirty: VKD3D GUEST-DIRTY 每帧上报精确 dirty range。
+    * guest mesa persistent whole flush 是冗余的，永不加入精确列表
+    * （仅作 fallback，见 sync_shadow），避免 whole 覆盖精确导致
+    * virgl 全量跨进程扫描。 */
+   {
+      static uint32_t diag_ignore_count;
+      const bool is_whole = mem->shadow_size &&
+         offset == 0 && size >= mem->shadow_size;
+      if (is_whole) {
+         if ((++diag_ignore_count % 120) == 1)
+            vkr_log("SHADOW-WHOLE-IGNORE mem=%" PRIu64 " whole=%" PRIu64
+                    " precise=%u",
+                    (uint64_t)mem->base.id, (uint64_t)mem->shadow_size,
+                    mem->shadow_dirty_range_count);
+         return true;
+      }
+      mem->shadow_guest_dirty_tracked = true;
+   }
+
    VkDeviceSize begin = offset;
    VkDeviceSize end = offset + size;
    for (uint32_t i = 0; i < mem->shadow_dirty_range_count;) {
@@ -2100,9 +2119,129 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
                                       mem->shadow_dirty_offset,
                                       mem->shadow_dirty_size, false,
                                       VK_SUCCESS);
-      VkResult dirty_result = host_flush_prepared ? VK_SUCCESS :
-         vk->FlushMappedMemoryRanges(mem->device->base.handle.device, 1,
-                                     &dirty_range);
+      VkResult dirty_result = VK_SUCCESS;
+      /* WineHua guest-dirty: 有精确 ranges 时用其并集重置 dirty 范围，
+       * 避免 whole fallback 导致 DIFF-COPY 全量扫描。 */
+      if (host_flush_prepared) {
+         dirty_result = VK_SUCCESS;
+      } else if (mem->shadow_dirty_range_count &&
+                 mem->shadow_dirty_ranges) {
+         VkDeviceSize pmin = ~(VkDeviceSize)0;
+         VkDeviceSize pmax = 0;
+         for (uint32_t pi = 0; pi < mem->shadow_dirty_range_count; pi++) {
+            const struct vkr_ohos_shadow_dirty_range *pr =
+               &mem->shadow_dirty_ranges[pi];
+            if (pr->offset < pmin)
+               pmin = pr->offset;
+            if (pr->offset + pr->size > pmax)
+               pmax = pr->offset + pr->size;
+         }
+         if (pmin < pmax) {
+            mem->shadow_dirty_offset = pmin;
+            mem->shadow_dirty_size = pmax - pmin;
+            vkr_log("SHADOW-PRECISE-SYNC mem=%" PRIu64 " offset=%" PRIu64
+                    " size=%" PRIu64 " ranges=%u",
+                    (uint64_t)mem->base.id, (uint64_t)pmin,
+                    (uint64_t)(pmax - pmin), mem->shadow_dirty_range_count);
+         }
+      } else if (mem->shadow_map && mem->host_map && mem->shadow_dirty_size) {
+         /* DIFF-COPY: VKD3D over-flushes whole buffers on Unmap(NULL); the
+          * guest usually wrote only a small fraction (observed same% 99-100).
+          * Compare shadow_map (guest writes) vs host_map (last GPU state) and
+          * only memcpy+flush the ranges that actually changed. */
+         const uint8_t *shadow = mem->shadow_map;
+         uint8_t *host = mem->host_map;
+         /* DIFF-COPY granularity: 64 KiB balances memcmp overhead against
+          * copying a few extra bytes at segment edges; VKD3D over-flush
+          * means most of the dirty range is unchanged, so fewer, larger
+          * comparisons beat many tiny ones. */
+         const VkDeviceSize page = 65536;
+         VkDeviceSize off = mem->shadow_dirty_offset;
+         const VkDeviceSize end = off + mem->shadow_dirty_size;
+         uint64_t diff_total = 0;
+         uint64_t diag_cmp_us = 0, diag_copy_us = 0, diag_flush_us = 0;
+         uint32_t diag_flush_calls = 0;
+         const uint64_t diag_dc_start_ns = vkr_ohos_now_ns();
+         static uint64_t diag_host_read_bytes = 0;
+         static uint64_t diag_host_read_total = 0;
+         static uint32_t diag_host_read_calls = 0;
+         while (off < end) {
+            while (off < end) {
+               const VkDeviceSize sz = MIN2(page, end - off);
+               const uint64_t dc_cs = vkr_ohos_now_ns();
+               if (memcmp(shadow + off, host + off, (size_t)sz) != 0) break;
+               const uint64_t dc_ce = vkr_ohos_now_ns();
+               diag_cmp_us += (dc_ce - dc_cs) / 1000;
+               diag_host_read_bytes += sz;
+               off += sz;
+            }
+            if (off >= end) break;
+            const VkDeviceSize seg_begin = off;
+            while (off < end) {
+               const VkDeviceSize sz = MIN2(page, end - off);
+               const uint64_t dc_cs = vkr_ohos_now_ns();
+               if (memcmp(shadow + off, host + off, (size_t)sz) == 0) break;
+               const uint64_t dc_ce = vkr_ohos_now_ns();
+               diag_cmp_us += (dc_ce - dc_cs) / 1000;
+               diag_host_read_bytes += sz;
+               off += sz;
+            }
+            const VkDeviceSize seg_end = off;
+            diff_total += seg_end - seg_begin;
+            const uint64_t dc_cp_s = vkr_ohos_now_ns();
+            memcpy(host + seg_begin, shadow + seg_begin,
+                   (size_t)(seg_end - seg_begin));
+            const uint64_t dc_cp_e = vkr_ohos_now_ns();
+            diag_copy_us += (dc_cp_e - dc_cp_s) / 1000;
+            VkMappedMemoryRange seg_range = {
+               .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+               .memory = mem->base.handle.device_memory,
+               .offset = seg_begin,
+               .size = seg_end - seg_begin,
+            };
+            const uint64_t dc_fl_s = vkr_ohos_now_ns();
+            const VkResult r = vk->FlushMappedMemoryRanges(
+               mem->device->base.handle.device, 1, &seg_range);
+            const uint64_t dc_fl_e = vkr_ohos_now_ns();
+            diag_flush_us += (dc_fl_e - dc_fl_s) / 1000;
+            diag_flush_calls++;
+            if (r != VK_SUCCESS && dirty_result == VK_SUCCESS)
+               dirty_result = r;
+         }
+         const uint64_t diag_dc_end_ns = vkr_ohos_now_ns();
+         if (diff_total != mem->shadow_dirty_size) {
+            vkr_log("WineHua shadow-diffcopy guestMemory=%" PRIu64
+                    " dirty=%" PRIu64 " copied=%" PRIu64
+                    " skipped=%" PRIu64,
+                    (uint64_t)mem->base.id,
+                    (uint64_t)mem->shadow_dirty_size,
+                    diff_total,
+                    (uint64_t)mem->shadow_dirty_size - diff_total);
+         }
+         static uint32_t diag_sd_count;
+         if ((++diag_sd_count % 120) == 1) {
+            vkr_log("SHADOW-DIFF mem=%" PRIu64 " dirty=%" PRIu64
+                    " copied=%" PRIu64 " cmpUs=%" PRIu64
+                    " copyUs=%" PRIu64 " flushUs=%" PRIu64
+                    " flushCalls=%u totalUs=%" PRIu64
+                    " hostRead=%" PRIu64,
+                    (uint64_t)mem->base.id,
+                    (uint64_t)mem->shadow_dirty_size, diff_total,
+                    diag_cmp_us, diag_copy_us, diag_flush_us,
+                    diag_flush_calls,
+                    (diag_dc_end_ns - diag_dc_start_ns) / 1000,
+                    diag_host_read_bytes);
+            diag_host_read_total += diag_host_read_bytes;
+            diag_host_read_calls++;
+            vkr_log("SHADOW-READ mem=%" PRIu64 " last=%" PRIu64
+                    " total=%" PRIu64 " calls=%u",
+                    (uint64_t)mem->base.id, diag_host_read_bytes,
+                    diag_host_read_total, diag_host_read_calls);
+         }
+      } else {
+         dirty_result = vk->FlushMappedMemoryRanges(
+            mem->device->base.handle.device, 1, &dirty_range);
+      }
       stats.result = dirty_result;
       if (!host_flush_prepared)
          vkr_ohos_gate_c_trace_memory("flush-result", mem,
@@ -2114,6 +2253,41 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
                  " size=%" PRIu64,
                  dirty_result, (uint64_t)mem->shadow_dirty_offset,
                  (uint64_t)mem->shadow_dirty_size);
+      /* DIFF-DIAG (opt-in WINEHUA_VKD3D_SHADOW_DIFF=1): compare shadow_map
+       * vs host_map to measure how much of the dirty range actually changed.
+       * Disabled by default: it rescans the whole dirty range a second time
+       * and writes one log line per memory per submit, which dominated the
+       * per-submit sync cost (~20ms for a 2.6MB allocation). */
+      {
+         const char *diag_opt = os_get_option("WINEHUA_VKD3D_SHADOW_DIFF");
+         if (diag_opt && diag_opt[0] == '1' && !diag_opt[1] &&
+             mem->shadow_map && mem->host_map && mem->shadow_dirty_size) {
+            const uint8_t *shadow = mem->shadow_map;
+            const uint8_t *host = mem->host_map;
+            VkDeviceSize off = mem->shadow_dirty_offset;
+            const VkDeviceSize end = off + mem->shadow_dirty_size;
+            uint64_t same_bytes = 0;
+            uint64_t diff_bytes = 0;
+            const VkDeviceSize page = 4096;
+            for (; off < end; off += page) {
+               const VkDeviceSize sz = MIN2(page, end - off);
+               if (memcmp(shadow + off, host + off, (size_t)sz) == 0)
+                  same_bytes += sz;
+               else
+                  diff_bytes += sz;
+            }
+            if (diff_bytes || same_bytes) {
+               vkr_log("WineHua shadow-diff guestMemory=%" PRIu64
+                       " dirty=%" PRIu64 " same=%" PRIu64 " diff=%" PRIu64
+                       " samePct=%u",
+                       (uint64_t)mem->base.id,
+                       (uint64_t)mem->shadow_dirty_size,
+                       same_bytes, diff_bytes,
+                       (unsigned)(same_bytes * 100 /
+                                  (uint64_t)(same_bytes + diff_bytes)));
+            }
+         }
+      }
       if (vkr_ohos_shadow_trace_enabled()) {
          const VkDeviceSize available = MIN2(mem->shadow_size,
                                              mem->allocation_size);
@@ -2373,6 +2547,27 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
       return result;
    }
 
+   {
+      static uint32_t diag_flush_count;
+      if ((++diag_flush_count % 120) == 1)
+         vkr_log("SHADOW-FLUSH-RECV mem=%" PRIu64 " offset=%" PRIu64
+                 " size=%" PRIu64 " dirtyOff=%" PRIu64 " dirtySize=%" PRIu64,
+                 (uint64_t)mem->base.id, (uint64_t)offset,
+                 (uint64_t)copy_size, (uint64_t)mem->shadow_dirty_offset,
+                 (uint64_t)mem->shadow_dirty_size);
+   }
+   {
+      const bool whole_flush = mem->shadow_size &&
+         offset == 0 && copy_size >= mem->shadow_size;
+      if (whole_flush && mem->shadow_guest_dirty_tracked) {
+         /* WineHua guest-dirty: VKD3D GUEST-DIRTY 精确覆盖该 memory，
+          * whole flush 冗余且会撑大 dirty 导致 DIFF-COPY 全量跨进程扫描。
+          * GUEST-DIRTY 每帧 diff 该 buffer，无变化时无需同步。 */
+         if (mem->shadow_guest_write_depth)
+            mem->shadow_guest_write_depth--;
+         return VK_SUCCESS;
+      }
+   }
    vkr_ohos_record_shadow_dirty_range(mem, offset, copy_size);
    mem->shadow_pending_copy_bytes += copy_size;
    if (copy_size)
@@ -2980,6 +3175,8 @@ vkr_device_memory_requires_deferred_host_wait(struct vkr_context *ctx,
 #endif
 }
 
+static void vkr_ohos_shadow_bench_memory(struct vkr_device_memory *mem);
+
 static struct vkr_shadow_sync_stats
 vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
 {
@@ -3034,13 +3231,34 @@ vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
       }
    }
 
+   uint32_t diag_mem_count = 0;
+   uint64_t diag_total_mem_us = 0;
+   uint64_t diag_max_mem_us = 0;
+   uint64_t diag_max_mem_id = 0;
+   uint64_t diag_max_mem_dirty = 0;
+   uint64_t diag_total_dirty = 0;
+   const uint64_t diag_iter_start_ns = to_host ? vkr_ohos_now_ns() : 0;
    if (use_dirty_list) {
       list_for_each_entry_safe (struct vkr_device_memory, mem,
                                 &ctx->shadow_dirty_memories,
                                 shadow_dirty_head) {
+         const uint64_t diag_dirty = to_host ? (uint64_t)mem->shadow_dirty_size : 0;
+         const uint64_t diag_s_ns = to_host ? vkr_ohos_now_ns() : 0;
          const struct vkr_shadow_sync_stats stats =
             vkr_device_memory_sync_shadow(mem, to_host,
                                           host_flush_prepared);
+         const uint64_t diag_e_ns = to_host ? vkr_ohos_now_ns() : 0;
+         if (to_host) {
+            const uint64_t diag_mem_us = (diag_e_ns - diag_s_ns) / 1000;
+            diag_mem_count++;
+            diag_total_mem_us += diag_mem_us;
+            diag_total_dirty += diag_dirty;
+            if (diag_mem_us > diag_max_mem_us) {
+               diag_max_mem_us = diag_mem_us;
+               diag_max_mem_id = (uint64_t)mem->base.id;
+               diag_max_mem_dirty = diag_dirty;
+            }
+         }
          total.scanned++;
          total.bytes += stats.bytes;
          total.copies += stats.copies;
@@ -3052,9 +3270,24 @@ vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
       hash_table_foreach (ctx->object_table, entry) {
          struct vkr_object *obj = entry->data;
          if (obj->type == VK_OBJECT_TYPE_DEVICE_MEMORY) {
+            struct vkr_device_memory *mem = (struct vkr_device_memory *)obj;
+            const uint64_t diag_dirty = to_host ? (uint64_t)mem->shadow_dirty_size : 0;
+            const uint64_t diag_s_ns = to_host ? vkr_ohos_now_ns() : 0;
             const struct vkr_shadow_sync_stats stats =
-               vkr_device_memory_sync_shadow((struct vkr_device_memory *)obj,
+               vkr_device_memory_sync_shadow(mem,
                                              to_host, host_flush_prepared);
+            const uint64_t diag_e_ns = to_host ? vkr_ohos_now_ns() : 0;
+            if (to_host) {
+               const uint64_t diag_mem_us = (diag_e_ns - diag_s_ns) / 1000;
+               diag_mem_count++;
+               diag_total_mem_us += diag_mem_us;
+               diag_total_dirty += diag_dirty;
+               if (diag_mem_us > diag_max_mem_us) {
+                  diag_max_mem_us = diag_mem_us;
+                  diag_max_mem_id = (uint64_t)mem->base.id;
+                  diag_max_mem_dirty = diag_dirty;
+               }
+            }
             total.scanned++;
             total.bytes += stats.bytes;
             total.copies += stats.copies;
@@ -3064,6 +3297,7 @@ vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
          }
       }
    }
+   const uint64_t diag_iter_end_ns = to_host ? vkr_ohos_now_ns() : 0;
    mtx_unlock(&ctx->object_mutex);
 
    atomic_uint_fast64_t *counter = to_host
@@ -3075,6 +3309,40 @@ vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
    const uint64_t elapsed_us = start_ns && end_ns >= start_ns
       ? (end_ns - start_ns) / 1000 : 0;
    total.elapsed_us = elapsed_us;
+   if (to_host && diag_mem_count &&
+       (call_id <= 8 || !(call_id % 120) || elapsed_us >= 20000)) {
+      static uint64_t bench_call;
+      if ((++bench_call % 6) == 1) {
+         struct vkr_object *benched = NULL;
+         uint64_t best_size = 0;
+         hash_table_foreach (ctx->object_table, be) {
+            if (be->data && ((struct vkr_object *)be->data)->type ==
+                   VK_OBJECT_TYPE_DEVICE_MEMORY) {
+               struct vkr_device_memory *bm =
+                  (struct vkr_device_memory *)be->data;
+               if (bm->shadow_map && bm->host_map && bm->shadow_size &&
+                   bm->shadow_size > best_size) {
+                  best_size = bm->shadow_size;
+                  benched = be->data;
+               }
+            }
+         }
+         if (benched)
+            vkr_ohos_shadow_bench_memory(
+               (struct vkr_device_memory *)benched);
+      }
+      const uint64_t diag_iter_us = (diag_iter_end_ns - diag_iter_start_ns) / 1000;
+      vkr_log("SHADOW-REASON to-host call=%" PRIu64
+              " memCount=%u totalMemUs=%" PRIu64 " iterUs=%" PRIu64
+              " syncTotalUs=%" PRIu64 " dirtyBytes=%" PRIu64
+              " maxMemUs=%" PRIu64 " maxMemId=%" PRIu64
+              " maxMemDirty=%" PRIu64
+              " copies=%u bytes=%" PRIu64,
+              call_id, diag_mem_count, diag_total_mem_us, diag_iter_us,
+              elapsed_us, diag_total_dirty,
+              diag_max_mem_us, diag_max_mem_id, diag_max_mem_dirty,
+              total.copies, total.bytes);
+   }
    if (vkr_ohos_shadow_trace_enabled() &&
        (call_id <= 8 || !(call_id % 120) || elapsed_us >= 20000)) {
       vkr_log("OHOS shadow sync direction=%s call=%" PRIu64
@@ -3088,6 +3356,68 @@ vkr_device_memory_sync_shadows(struct vkr_context *ctx, bool to_host)
    (void)to_host;
 #endif
    return total;
+}
+
+static void
+vkr_ohos_shadow_bench_memory(struct vkr_device_memory *mem)
+{
+   if (!mem->shadow_map || !mem->host_map || !mem->shadow_size) {
+      vkr_log("SHADOW-BENCH-CALL mem=%" PRIu64 " skipped=nomap",
+              (uint64_t)(mem ? mem->base.id : 0));
+      return;
+   }
+   const size_t sz = (size_t)MIN2(mem->shadow_size, mem->allocation_size);
+   if (sz < 4096) {
+      vkr_log("SHADOW-BENCH-CALL mem=%" PRIu64 " skipped=small sz=%zu",
+              (uint64_t)mem->base.id, sz);
+      return;
+   }
+
+   static uint8_t *local_a = NULL, *local_b = NULL;
+   static size_t local_cap = 0;
+   if (!local_a || local_cap < sz) {
+      if (local_a) free(local_a);
+      if (local_b) free(local_b);
+      local_a = malloc(sz);
+      local_b = malloc(sz);
+      local_cap = local_a ? sz : 0;
+      if (!local_a) {
+         vkr_log("SHADOW-BENCH-CALL mem=%" PRIu64 " skipped=malloc sz=%zu",
+                 (uint64_t)mem->base.id, sz);
+         return;
+      }
+   }
+
+   vkr_log("SHADOW-BENCH-CALL mem=%" PRIu64 " sz=%zu run",
+           (uint64_t)mem->base.id, sz);
+   uint64_t t0, t1;
+   t0 = vkr_ohos_now_ns();
+   volatile int r1 = memcmp(mem->shadow_map, mem->host_map, sz);
+   t1 = vkr_ohos_now_ns();
+   const uint64_t memcmp_sh_us = (t1 - t0) / 1000;
+
+   t0 = vkr_ohos_now_ns();
+   memcpy(local_a, mem->shadow_map, sz);
+   t1 = vkr_ohos_now_ns();
+   const uint64_t read_sh_us = (t1 - t0) / 1000;
+
+   t0 = vkr_ohos_now_ns();
+   memcpy(local_b, mem->host_map, sz);
+   t1 = vkr_ohos_now_ns();
+   const uint64_t read_host_us = (t1 - t0) / 1000;
+
+   t0 = vkr_ohos_now_ns();
+   volatile int r2 = memcmp(local_a, local_b, sz);
+   t1 = vkr_ohos_now_ns();
+   const uint64_t memcmp_local_us = (t1 - t0) / 1000;
+
+   vkr_log("SHADOW-BENCH mem=%" PRIu64 " bytes=%zu"
+           " memcmpShadowUs=%" PRIu64 " readShadowUs=%" PRIu64
+           " readHostUs=%" PRIu64 " memcmpLocalUs=%" PRIu64
+           " r=%d/%d",
+           (uint64_t)mem->base.id, sz,
+           memcmp_sh_us, read_sh_us, read_host_us,
+           memcmp_local_us, r1, r2);
 }
 
 struct vkr_shadow_sync_stats

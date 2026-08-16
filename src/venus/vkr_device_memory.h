@@ -81,6 +81,7 @@ struct vkr_device_memory {
    bool shadow_host_copy_deferred;
    bool shadow_gpu_upload_covered;
    bool shadow_gpu_upload_full_coverage;
+   bool shadow_guest_dirty_tracked;
    uint64_t shadow_pending_copy_bytes;
    uint32_t shadow_pending_copy_count;
 #endif

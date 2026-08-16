@@ -260,6 +260,17 @@ vkr_physical_device_init_memory_properties(struct vkr_physical_device *physical_
       else
          vkr_log("missing VK_EXT_external_memory_dma_buf for gbm import!");
    }
+
+   /* Step 1 diag: report dma_buf support so host-side zero-copy path can be
+    * evaluated from hilog (forwarded by virgl_child). */
+   vkr_log("WineHua dma_buf diag: EXT_dma_buf=%d EXT_metal=%d "
+           "dma_export=%d opaque_export=%d gbm=%p udmabuf_fd=%d",
+           physical_dev->EXT_external_memory_dma_buf,
+           physical_dev->EXT_external_memory_metal,
+           physical_dev->is_dma_buf_fd_export_supported,
+           physical_dev->is_opaque_fd_export_supported,
+           (void *)physical_dev->gbm_device,
+           physical_dev->udmabuf_dev_fd);
 }
 
 static void
