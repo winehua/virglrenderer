@@ -61,6 +61,9 @@
 #include "virgl_resource.h"
 #include "virgl_util.h"
 
+VIRGL_EXPORT void
+virgl_renderer_winehua_set_color_remap(uint32_t src_tex, uint32_t dst_tex);
+
 #ifdef ENABLE_VENUS
 /* Exported wrappers are called from the vtest shared library. Keep the
  * declarations visible before their definitions so -Wmissing-prototypes
@@ -1657,6 +1660,13 @@ int virgl_renderer_get_dev_fd(int ctx_id)
       return -ENODEV;
 
    return ctx->get_device_fd(ctx);
+}
+
+
+VIRGL_EXPORT void
+virgl_renderer_winehua_set_color_remap(uint32_t src_tex, uint32_t dst_tex)
+{
+   vrend_winehua_set_color_remap(src_tex, dst_tex);
 }
 
 

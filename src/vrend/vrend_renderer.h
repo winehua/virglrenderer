@@ -447,6 +447,8 @@ void vrend_fb_bind_texture_id(struct vrend_resource *res,
                               int id, GLuint idx, GLint level,
                               GLint layer, uint32_t samples);
 
+void vrend_winehua_set_color_remap(GLuint src_tex, GLuint dst_tex);
+
 void vrend_set_tess_state(struct vrend_context *ctx, const float tess_factors[6]);
 
 void vrend_renderer_fini(void);

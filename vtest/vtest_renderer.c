@@ -2246,7 +2246,9 @@ int vtest_resource_busy_wait(UNUSED uint32_t length_dw)
    /*  handle = bw_buf[VCMD_BUSY_WAIT_HANDLE]; unused as of now */
    flags = bw_buf[VCMD_BUSY_WAIT_FLAGS];
 
-   if ((flags & VCMD_BUSY_WAIT_FLAG_WAIT) && getenv("VTEST_SYNC_GL_FINISH")) {
+   if ((flags & VCMD_BUSY_WAIT_FLAG_WAIT) &&
+       getenv("VTEST_SYNC_GL_FINISH") &&
+       getenv("VTEST_SYNC_GL_FINISH")[0] == '1') {
       ret = virgl_renderer_context_finish(ctx->ctx_id);
       if (ret) {
          winehua_diag("busy wait context finish failed ctx=%d ret=%d submitted=%u completed=%u",

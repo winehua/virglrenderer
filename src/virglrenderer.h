@@ -516,6 +516,14 @@ VIRGL_EXPORT int virgl_renderer_attach_fence(int ctx_id, int fence_fd);
 VIRGL_EXPORT int virgl_renderer_get_fence_fd(uint64_t fence_id);
 VIRGL_EXPORT int virgl_renderer_get_dev_fd(int ctx_id);
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+VIRGL_EXPORT void virgl_renderer_winehua_set_color_remap(uint32_t src_tex, uint32_t dst_tex);
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* VIRGL_RENDERER_UNSTABLE_APIS */
 
 #endif

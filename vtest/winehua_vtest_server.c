@@ -5,6 +5,8 @@
 #include "vtest_server.h"
 #include "vtest.h"
 
+extern void virgl_renderer_winehua_set_color_remap(uint32_t src_tex, uint32_t dst_tex);
+
 #ifdef ENABLE_VENUS
 #include "venus/vkr_renderer.h"
 extern void virgl_renderer_set_winehua_vk_present_callback(
@@ -20,6 +22,8 @@ __attribute__((visibility("default"))) void winehua_vtest_reset_stop_request(voi
 __attribute__((visibility("default"))) int winehua_vtest_request_stop(void);
 __attribute__((visibility("default"))) void winehua_vtest_set_present_callback(
    vtest_winehua_present_callback callback, void *user_data);
+__attribute__((visibility("default"))) void winehua_vtest_set_color_remap(
+   uint32_t src_tex, uint32_t dst_tex);
 #ifdef ENABLE_VENUS
 __attribute__((visibility("default"))) void winehua_vtest_set_vulkan_present_callback(
    vkr_renderer_winehua_present_callback_type callback, void *user_data);
@@ -46,6 +50,11 @@ void winehua_vtest_set_present_callback(
    vtest_winehua_present_callback callback, void *user_data)
 {
    vtest_set_winehua_present_callback(callback, user_data);
+}
+
+void winehua_vtest_set_color_remap(uint32_t src_tex, uint32_t dst_tex)
+{
+   virgl_renderer_winehua_set_color_remap(src_tex, dst_tex);
 }
 
 #ifdef ENABLE_VENUS

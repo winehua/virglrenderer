@@ -2968,12 +2968,30 @@ void debug_texture(ASSERTED const char *f, const struct vrend_resource *gt)
 #undef PRINT_TARGET
 }
 
+static GLuint winehua_scanout_src;
+static GLuint winehua_scanout_dst;
+
+void vrend_winehua_set_color_remap(GLuint src_tex, GLuint dst_tex)
+{
+   if (!src_tex || !dst_tex) {
+      winehua_scanout_src = 0;
+      winehua_scanout_dst = 0;
+      return;
+   }
+   winehua_scanout_src = src_tex;
+   winehua_scanout_dst = dst_tex;
+}
+
 void vrend_fb_bind_texture_id(struct vrend_resource *res,
                               int id, GLuint idx, GLint level,
                               GLint layer, uint32_t samples)
 {
    const struct util_format_description *desc = util_format_description(res->base.format);
    GLenum attachment = GL_COLOR_ATTACHMENT0 + idx;
+
+   if (!vrend_format_is_ds(res->base.format) &&
+       winehua_scanout_src && (GLuint)id == winehua_scanout_src && winehua_scanout_dst)
+      id = (int)winehua_scanout_dst;
 
    debug_texture(__func__, res);
 
