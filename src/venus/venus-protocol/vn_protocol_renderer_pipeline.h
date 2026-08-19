@@ -3750,7 +3750,7 @@ static inline void vn_encode_vkCreateComputePipelines_reply(struct vn_cs_encoder
 static inline void vn_decode_vkDestroyPipeline_args_temp(struct vn_cs_decoder *dec, struct vn_command_vkDestroyPipeline *args)
 {
     vn_decode_VkDevice_lookup(dec, &args->device);
-    vn_decode_VkPipeline_lookup(dec, &args->pipeline);
+    vn_decode_VkPipeline_destroy_lookup(dec, &args->pipeline);
     if (vn_decode_simple_pointer(dec)) {
         vn_cs_decoder_set_fatal(dec);
     } else {

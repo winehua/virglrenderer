@@ -28,7 +28,10 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -101,6 +104,8 @@ struct vtest_server
 
    int ctx_flags;
 
+   int wake_read_fd;
+
    struct list_head new_clients;
    struct list_head active_clients;
    struct list_head inactive_clients;
@@ -120,7 +125,13 @@ struct vtest_server server = {
    .multi_clients = false,
 
    .ctx_flags = 0,
+   .wake_read_fd = -1,
 };
+
+static pthread_mutex_t vtest_server_control_mutex = PTHREAD_MUTEX_INITIALIZER;
+static atomic_bool vtest_server_stop_requested = ATOMIC_VAR_INIT(false);
+static int vtest_server_stop_write_fd = -1;
+static bool vtest_server_is_running;
 
 static void winehua_server_diag(const char *fmt, ...)
 {
@@ -145,6 +156,7 @@ static void winehua_server_diag(const char *fmt, ...)
 }
 
 static void vtest_server_getenv(void);
+static void vtest_server_reset_state(void);
 static void vtest_server_parse_args(int argc, char **argv);
 static void vtest_server_set_signal_child(void);
 static void vtest_server_set_signal_segv(void);
@@ -152,7 +164,113 @@ static void vtest_server_open_read_file(void);
 static void vtest_server_open_socket(void);
 static void vtest_server_run(void);
 static void vtest_server_close_socket(void);
+static int vtest_server_open_wake_pipe(void);
+static void vtest_server_close_wake_pipe(void);
 static int vtest_client_dispatch_commands(struct vtest_client *client);
+
+void vtest_server_reset_stop_request(void)
+{
+   pthread_mutex_lock(&vtest_server_control_mutex);
+   if (!vtest_server_is_running)
+      atomic_store_explicit(&vtest_server_stop_requested, false,
+                            memory_order_release);
+   pthread_mutex_unlock(&vtest_server_control_mutex);
+}
+
+int vtest_server_request_stop(void)
+{
+   static const char wake = 1;
+   bool running;
+
+   atomic_store_explicit(&vtest_server_stop_requested, true,
+                         memory_order_release);
+
+   pthread_mutex_lock(&vtest_server_control_mutex);
+   running = vtest_server_is_running;
+   if (vtest_server_stop_write_fd >= 0) {
+      ssize_t ret;
+
+      do {
+         ret = write(vtest_server_stop_write_fd, &wake, sizeof(wake));
+      } while (ret < 0 && errno == EINTR);
+      /* EAGAIN means a previous wake byte is already pending. */
+   }
+   pthread_mutex_unlock(&vtest_server_control_mutex);
+
+   return running ? 1 : 0;
+}
+
+static void vtest_server_reset_state(void)
+{
+   memset(&server, 0, sizeof(server));
+   server.socket_name = VTEST_DEFAULT_SOCKET_NAME;
+   server.socket = -1;
+   server.render_device = NULL;
+   server.main_server = true;
+   server.do_fork = true;
+   server.loop = true;
+   server.wake_read_fd = -1;
+}
+
+static int vtest_server_set_fd_flags(int fd)
+{
+   int flags = fcntl(fd, F_GETFL);
+   int fd_flags = fcntl(fd, F_GETFD);
+
+   if (flags < 0 || fd_flags < 0 ||
+       fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+       fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0)
+      return -1;
+   return 0;
+}
+
+static int vtest_server_open_wake_pipe(void)
+{
+   int wake_pipe[2] = {-1, -1};
+
+   if (pipe(wake_pipe) < 0 ||
+       vtest_server_set_fd_flags(wake_pipe[0]) < 0 ||
+       vtest_server_set_fd_flags(wake_pipe[1]) < 0) {
+      if (wake_pipe[0] >= 0)
+         close(wake_pipe[0]);
+      if (wake_pipe[1] >= 0)
+         close(wake_pipe[1]);
+      return -1;
+   }
+
+   pthread_mutex_lock(&vtest_server_control_mutex);
+   if (vtest_server_is_running) {
+      pthread_mutex_unlock(&vtest_server_control_mutex);
+      close(wake_pipe[0]);
+      close(wake_pipe[1]);
+      errno = EBUSY;
+      return -1;
+   }
+   server.wake_read_fd = wake_pipe[0];
+   vtest_server_stop_write_fd = wake_pipe[1];
+   vtest_server_is_running = true;
+   pthread_mutex_unlock(&vtest_server_control_mutex);
+   return 0;
+}
+
+static void vtest_server_close_wake_pipe(void)
+{
+   int read_fd;
+   int write_fd;
+
+   pthread_mutex_lock(&vtest_server_control_mutex);
+   read_fd = server.wake_read_fd;
+   write_fd = vtest_server_stop_write_fd;
+   server.wake_read_fd = -1;
+   vtest_server_stop_write_fd = -1;
+   vtest_server_is_running = false;
+   pthread_mutex_unlock(&vtest_server_control_mutex);
+
+   if (read_fd >= 0)
+      close(read_fd);
+   if (write_fd >= 0)
+      close(write_fd);
+}
 
 
 int vtest_main(int argc, char **argv)
@@ -160,6 +278,12 @@ int vtest_main(int argc, char **argv)
 #ifdef __AFL_LOOP
 while (__AFL_LOOP(1000)) {
 #endif
+
+   vtest_server_reset_state();
+   if (vtest_server_open_wake_pipe()) {
+      perror("Failed to create vtest wake pipe");
+      return 1;
+   }
 
    vtest_server_getenv();
    vtest_server_parse_args(argc, argv);
@@ -174,7 +298,11 @@ while (__AFL_LOOP(1000)) {
       vtest_server_set_signal_segv();
    }
 
-   vtest_server_run();
+   if (!atomic_load_explicit(&vtest_server_stop_requested,
+                             memory_order_acquire))
+      vtest_server_run();
+
+   vtest_server_close_wake_pipe();
 
 #ifdef __AFL_LOOP
    if (!server.main_server) {
@@ -203,6 +331,10 @@ while (__AFL_LOOP(1000)) {
 static void vtest_server_parse_args(int argc, char **argv)
 {
    int ret;
+
+   /* vtest_main can be called repeatedly by WineHua's in-process host. */
+   optarg = NULL;
+   optind = 1;
 
    static struct option long_options[] = {
       {"no-fork",             no_argument, NULL, OPT_NO_FORK},
@@ -456,7 +588,7 @@ err:
    exit(1);
 }
 
-static void vtest_server_wait_clients(void)
+static bool vtest_server_wait_clients(void)
 {
    struct vtest_client *client;
    fd_set read_fds;
@@ -464,6 +596,15 @@ static void vtest_server_wait_clients(void)
    int ret;
 
    FD_ZERO(&read_fds);
+
+   if (atomic_load_explicit(&vtest_server_stop_requested,
+                            memory_order_acquire))
+      return false;
+
+   if (server.wake_read_fd >= 0) {
+      FD_SET(server.wake_read_fd, &read_fds);
+      max_fd = MAX2(server.wake_read_fd, max_fd);
+   }
 
    LIST_FOR_EACH_ENTRY(client, &server.active_clients, head) {
       FD_SET(client->in_fd, &read_fds);
@@ -483,17 +624,33 @@ static void vtest_server_wait_clients(void)
 
    if (max_fd < 0) {
       if (!list_is_empty(&server.new_clients)) {
-         return;
+         return true;
       }
 
       fprintf(stderr, "server has no fd to wait\n");
       exit(1);
    }
 
-   ret = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+   do {
+      ret = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+   } while (ret < 0 && errno == EINTR &&
+            !atomic_load_explicit(&vtest_server_stop_requested,
+                                  memory_order_acquire));
    if (ret < 0) {
       perror("Failed to select on socket!");
       exit(1);
+   }
+
+   if (atomic_load_explicit(&vtest_server_stop_requested,
+                            memory_order_acquire) ||
+       (server.wake_read_fd >= 0 &&
+        FD_ISSET(server.wake_read_fd, &read_fds))) {
+      char buffer[32];
+
+      while (server.wake_read_fd >= 0 &&
+             read(server.wake_read_fd, buffer, sizeof(buffer)) > 0) {
+      }
+      return false;
    }
 
    LIST_FOR_EACH_ENTRY(client, &server.active_clients, head) {
@@ -522,6 +679,8 @@ static void vtest_server_wait_clients(void)
          exit(1);
       }
    }
+
+   return true;
 }
 
 static const char *vtest_client_result_string(enum vtest_client_result ret)
@@ -658,6 +817,7 @@ static void vtest_server_tidy_clients(void)
 static void vtest_server_run(void)
 {
    bool run = true;
+   bool renderer_initialized = false;
 
    if (server.read_file) {
       vtest_server_open_read_file();
@@ -665,11 +825,14 @@ static void vtest_server_run(void)
       vtest_server_open_socket();
    }
 
-   while (run) {
+   while (run &&
+          !atomic_load_explicit(&vtest_server_stop_requested,
+                                memory_order_acquire)) {
       const bool was_empty = list_is_empty(&server.active_clients);
       bool is_empty;
 
-      vtest_server_wait_clients();
+      if (!vtest_server_wait_clients())
+         break;
       vtest_server_dispatch_clients();
 
       if (server.do_fork) {
@@ -687,7 +850,8 @@ static void vtest_server_run(void)
          if (ret) {
             vtest_server_inactivate_clients();
             run = false;
-         }
+         } else
+            renderer_initialized = true;
       }
 
       vtest_server_tidy_clients();
@@ -695,11 +859,21 @@ static void vtest_server_run(void)
       /* clean up renderer after the last active client is removed */
       if (!was_empty && is_empty) {
          vtest_cleanup_renderer();
+         renderer_initialized = false;
          if (!server.loop) {
             run = false;
          }
       }
    }
+
+   /* External shutdown may leave clients in either queue. Destroy contexts
+    * before tearing down the renderer so a subsequent in-process run starts
+    * from an entirely clean static vtest state. */
+   vtest_server_activate_clients();
+   vtest_server_inactivate_clients();
+   vtest_server_tidy_clients();
+   if (renderer_initialized)
+      vtest_cleanup_renderer();
 
    vtest_server_close_socket();
 }

@@ -259,6 +259,13 @@ vkr_ohos_frame_assoc_trace_enabled(void)
    return vkr_ohos_cached_option_enabled("WINEHUA_VKR_TRACE_CAPTURE", &cached);
 }
 
+static bool
+vkr_ohos_submit_postwait_enabled(void)
+{
+   static atomic_int cached = ATOMIC_VAR_INIT(-1);
+   return vkr_ohos_cached_option_enabled("WINEHUA_VKR_SUBMIT_POSTWAIT", &cached);
+}
+
 static void
 vkr_ohos_atomic_max(atomic_uint_fast64_t *value, uint64_t candidate)
 {
@@ -1084,6 +1091,15 @@ vkr_dispatch_vkQueueSubmit(struct vn_dispatch_context *dispatch,
          args->queue, args->submitCount, args->pSubmits, args->fence);
 #ifdef __OHOS__
    }
+   if (args->ret == VK_SUCCESS && vkr_ohos_submit_postwait_enabled()) {
+      const VkResult wait_result =
+         vk->QueueWaitIdle(queue->base.handle.queue);
+      vkr_log("WineHuaFrameAssoc: submit-postwait api=submit submit=%" PRIu64
+              " queueId=%" PRIu64 " result=%d",
+              submit_id, queue->base.id, wait_result);
+      if (wait_result != VK_SUCCESS)
+         args->ret = wait_result;
+   }
 #endif
 #ifdef __OHOS__
    const uint64_t driver_end_ns = perf_timing ? vkr_ohos_queue_now_ns() : 0;
@@ -1379,16 +1395,41 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
    struct vkr_queue *queue = vkr_queue_from_handle(args->queue);
    struct vn_device_proc_table *vk = &queue->device->proc_table;
 
-   vn_replace_vkQueueSubmit2_args_handle(args);
 #ifdef __OHOS__
    const uint64_t submit_id =
       atomic_fetch_add_explicit(&vkr_ohos_queue_submit_count, 1,
                                 memory_order_relaxed) + 1;
+   if (vkr_ohos_frame_assoc_trace_enabled()) {
+      for (uint32_t i = 0; i < args->submitCount; i++) {
+         const VkSubmitInfo2 *submit = &args->pSubmits[i];
+         for (uint32_t j = 0; j < submit->commandBufferInfoCount; j++) {
+            const VkCommandBufferSubmitInfo *command =
+               &submit->pCommandBufferInfos[j];
+            const struct vkr_command_buffer *cmd =
+               vkr_command_buffer_from_handle(command->commandBuffer);
+            vkr_log("WineHuaFrameAssoc: queue-submit2 ctx=%u submit=%" PRIu64
+                    " queueId=%" PRIu64 " hostQueue=0x%" PRIxPTR
+                    " batch=%u cmdIndex=%u guestCmd=0x%" PRIxPTR
+                    " cmdId=%" PRIu64 " hostCmd=0x%" PRIxPTR,
+                    queue->context ? queue->context->ctx_id : 0,
+                    submit_id, queue->base.id,
+                    (uintptr_t)queue->base.handle.queue, i, j,
+                    (uintptr_t)command->commandBuffer,
+                    cmd ? cmd->base.id : 0,
+                    cmd ? (uintptr_t)cmd->base.handle.command_buffer : 0);
+         }
+      }
+   }
+#endif
+
+   vn_replace_vkQueueSubmit2_args_handle(args);
+#ifdef __OHOS__
    const bool gpu_upload = vkr_device_memory_gpu_upload_enabled(queue->device);
    const bool perf_summary = queue->winehua_perf_summary;
    VkResult upload_prepare_result = VK_SUCCESS;
    if (gpu_upload) {
       mtx_lock(&queue->shadow_upload_mutex);
+      vkr_device_memory_shadow_generation_begin(dispatch->data, true);
       upload_prepare_result =
          vkr_device_memory_prepare_shadow_upload(dispatch->data, queue,
                                                  perf_summary, submit_id);
@@ -1401,14 +1442,18 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
       vkr_ohos_wait_deferred_shadow_host_copy(
          dispatch->data, queue, vk);
    if (deferred_host_wait_result != VK_SUCCESS) {
-      if (gpu_upload)
+      if (gpu_upload) {
+         vkr_device_memory_shadow_generation_end(dispatch->data);
          mtx_unlock(&queue->shadow_upload_mutex);
+      }
       args->ret = deferred_host_wait_result;
       return;
    }
 #endif
    vkr_device_memory_sync_shadows_to_host(dispatch->data);
 #ifdef __OHOS__
+   if (gpu_upload)
+      vkr_device_memory_shadow_generation_end(dispatch->data);
    const bool upload_prepared = gpu_upload && queue->shadow_upload_prepared;
    const bool inline_upload = upload_prepared && queue->shadow_upload_inline &&
       args->submitCount <= VKR_WINEHUA_INLINE_MAX_GUEST_SUBMITS;
@@ -1433,6 +1478,15 @@ vkr_dispatch_vkQueueSubmit2(struct vn_dispatch_context *dispatch,
       args->ret = vk->QueueSubmit2(
          args->queue, args->submitCount, args->pSubmits, args->fence);
 #ifdef __OHOS__
+   }
+   if (args->ret == VK_SUCCESS && vkr_ohos_submit_postwait_enabled()) {
+      const VkResult wait_result =
+         vk->QueueWaitIdle(queue->base.handle.queue);
+      vkr_log("WineHuaFrameAssoc: submit-postwait api=submit2 submit=%" PRIu64
+              " queueId=%" PRIu64 " result=%d",
+              submit_id, queue->base.id, wait_result);
+      if (wait_result != VK_SUCCESS)
+         args->ret = wait_result;
    }
 #endif
    mtx_unlock(&queue->vk_mutex);
@@ -1625,7 +1679,7 @@ vkr_dispatch_vkDestroySemaphore(struct vn_dispatch_context *dispatch,
 }
 
 static void
-vkr_dispatch_vkGetSemaphoreCounterValue(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkGetSemaphoreCounterValue(struct vn_dispatch_context *dispatch,
                                         struct vn_command_vkGetSemaphoreCounterValue *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -1633,10 +1687,16 @@ vkr_dispatch_vkGetSemaphoreCounterValue(UNUSED struct vn_dispatch_context *dispa
 
    vn_replace_vkGetSemaphoreCounterValue_args_handle(args);
    args->ret = vk->GetSemaphoreCounterValue(args->device, args->semaphore, args->pValue);
+   /* Timeline semaphores are a completion boundary just like a fence.  In the
+    * separated Host/Guest shadow transport, visibility of a newly observed
+    * signal must also make preceding Host GPU writes visible to mapped Guest
+    * memory. DXVK 2.x relies on this path rather than fence polling. */
+   if (args->ret == VK_SUCCESS)
+      vkr_device_memory_sync_shadows_from_host(dispatch->data);
 }
 
 static void
-vkr_dispatch_vkWaitSemaphores(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkWaitSemaphores(struct vn_dispatch_context *dispatch,
                               struct vn_command_vkWaitSemaphores *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
@@ -1644,6 +1704,10 @@ vkr_dispatch_vkWaitSemaphores(UNUSED struct vn_dispatch_context *dispatch,
 
    vn_replace_vkWaitSemaphores_args_handle(args);
    args->ret = vk->WaitSemaphores(args->device, args->pWaitInfo, args->timeout);
+   /* Successful waits establish completion of all waited timeline values, so
+    * mirror the fence completion path and refresh Host-produced shadow data. */
+   if (args->ret == VK_SUCCESS)
+      vkr_device_memory_sync_shadows_from_host(dispatch->data);
 }
 
 static void

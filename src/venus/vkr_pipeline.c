@@ -19,6 +19,60 @@ vkr_winehua_option_enabled(const char *name)
    return value && !strcmp(value, "1");
 }
 
+#ifdef __OHOS__
+static bool
+vkr_winehua_gate_c_trace_enabled(void)
+{
+   return vkr_winehua_option_enabled("WINEHUA_VKD3D_GATE_C_TRACE");
+}
+
+static void
+vkr_winehua_remember_failed_compute_pipelines(
+   struct vkr_context *ctx,
+   const VkPipeline *pipelines,
+   uint32_t count)
+{
+   if (!pipelines || !count)
+      return;
+
+   mtx_lock(&ctx->object_mutex);
+   for (uint32_t i = 0; i < count; i++) {
+      const vkr_object_id id = vkr_cs_handle_load_id(
+         (const void **)&pipelines[i], VK_OBJECT_TYPE_PIPELINE);
+      struct vkr_winehua_failed_compute_pipelines *failed =
+         &ctx->winehua_gate_c_failed_compute_pipelines;
+
+      if (!id)
+         continue;
+
+      if (failed->count == failed->capacity) {
+         if (failed->capacity > UINT32_MAX / 2) {
+            vkr_log("WineHuaPipeline: failed compute pipeline record capacity "
+                    "exhausted");
+            break;
+         }
+         const uint32_t capacity = failed->capacity ?
+            failed->capacity * 2 : 8;
+         vkr_object_id *ids =
+            realloc(failed->ids, (size_t)capacity * sizeof(*ids));
+         if (!ids) {
+            vkr_log("WineHuaPipeline: unable to record failed compute pipeline "
+                    "object=%" PRIu64, id);
+            continue;
+         }
+         failed->ids = ids;
+         failed->capacity = capacity;
+      }
+
+      failed->ids[failed->count++] = id;
+      vkr_log("WineHuaPipeline: gate-c failed-compute recorded object=%" PRIu64,
+              id);
+   }
+   mtx_unlock(&ctx->object_mutex);
+}
+
+#endif
+
 static uint32_t
 vkr_winehua_fnv1a32(const void *data, size_t size)
 {
@@ -279,6 +333,109 @@ vkr_dispatch_vkCreateGraphicsPipelines(struct vn_dispatch_context *dispatch,
                  (const void *)info->pMultisampleState,
                  (const void *)info->pColorBlendState,
                  (const void *)info->pDynamicState);
+         for (const VkBaseInStructure *next =
+                 (const VkBaseInStructure *)info->pNext;
+              next; next = next->pNext) {
+            vkr_log("WineHuaPipeline: create[%u].pNext sType=%u ptr=%p",
+                    i, next->sType, (const void *)next);
+            if (next->sType == VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO) {
+               const VkPipelineRenderingCreateInfo *rendering =
+                  (const VkPipelineRenderingCreateInfo *)next;
+               vkr_log("WineHuaPipeline: create[%u].rendering viewMask=0x%x colors=%u depthFormat=%u stencilFormat=%u",
+                       i, rendering->viewMask,
+                       rendering->colorAttachmentCount,
+                       rendering->depthAttachmentFormat,
+                       rendering->stencilAttachmentFormat);
+               if (rendering->colorAttachmentCount &&
+                   !rendering->pColorAttachmentFormats) {
+                  vkr_log("WineHuaPipeline: create[%u].rendering colorFormats=null", i);
+               } else {
+                  for (uint32_t j = 0;
+                       j < rendering->colorAttachmentCount; j++) {
+                     vkr_log("WineHuaPipeline: create[%u].rendering colorFormat[%u]=%u",
+                             i, j, rendering->pColorAttachmentFormats[j]);
+                  }
+               }
+            }
+         }
+         if (info->pRasterizationState) {
+            const VkPipelineRasterizationStateCreateInfo *raster =
+               info->pRasterizationState;
+            vkr_log("WineHuaPipeline: create[%u].raster depthClamp=%u discard=%u polygon=%u cull=0x%x front=%u depthBias=%u lineWidth=%g",
+                    i, raster->depthClampEnable,
+                    raster->rasterizerDiscardEnable, raster->polygonMode,
+                    raster->cullMode, raster->frontFace,
+                    raster->depthBiasEnable, raster->lineWidth);
+         }
+         if (info->pMultisampleState) {
+            const VkPipelineMultisampleStateCreateInfo *multisample =
+               info->pMultisampleState;
+            const VkSampleMask sample_mask = multisample->pSampleMask
+               ? multisample->pSampleMask[0] : UINT32_MAX;
+            vkr_log("WineHuaPipeline: create[%u].multisample samples=%u "
+                    "sampleShading=%u minSampleShading=%g sampleMask=0x%x "
+                    "alphaToCoverage=%u alphaToOne=%u",
+                    i, multisample->rasterizationSamples,
+                    multisample->sampleShadingEnable,
+                    multisample->minSampleShading, sample_mask,
+                    multisample->alphaToCoverageEnable,
+                    multisample->alphaToOneEnable);
+         }
+         if (info->pDepthStencilState) {
+            const VkPipelineDepthStencilStateCreateInfo *depth =
+               info->pDepthStencilState;
+            vkr_log("WineHuaPipeline: create[%u].depth test=%u write=%u compare=%u bounds=%u stencil=%u",
+                    i, depth->depthTestEnable, depth->depthWriteEnable,
+                    depth->depthCompareOp, depth->depthBoundsTestEnable,
+                    depth->stencilTestEnable);
+         }
+         if (info->pColorBlendState) {
+            const VkPipelineColorBlendStateCreateInfo *blend =
+               info->pColorBlendState;
+            vkr_log("WineHuaPipeline: create[%u].blend flags=0x%x logicEnable=%u logicOp=%u attachmentCount=%u constants=%g,%g,%g,%g",
+                    i, blend->flags, blend->logicOpEnable, blend->logicOp,
+                    blend->attachmentCount, blend->blendConstants[0],
+                    blend->blendConstants[1], blend->blendConstants[2],
+                    blend->blendConstants[3]);
+            if (blend->attachmentCount && !blend->pAttachments) {
+               vkr_log("WineHuaPipeline: create[%u].blend attachments=null", i);
+            } else {
+               for (uint32_t j = 0; j < blend->attachmentCount; j++) {
+                  const VkPipelineColorBlendAttachmentState *attachment =
+                     &blend->pAttachments[j];
+                  const bool dual_src =
+                     (attachment->srcColorBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+                      attachment->srcColorBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+                     (attachment->dstColorBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+                      attachment->dstColorBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+                     (attachment->srcAlphaBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+                      attachment->srcAlphaBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA) ||
+                     (attachment->dstAlphaBlendFactor >= VK_BLEND_FACTOR_SRC1_COLOR &&
+                      attachment->dstAlphaBlendFactor <= VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA);
+                  vkr_log("WineHuaPipeline: create[%u].blend[%u] enable=%u color=%u,%u,%u alpha=%u,%u,%u writeMask=0x%x dualSrc=%u",
+                          i, j, attachment->blendEnable,
+                          attachment->srcColorBlendFactor,
+                          attachment->dstColorBlendFactor,
+                          attachment->colorBlendOp,
+                          attachment->srcAlphaBlendFactor,
+                          attachment->dstAlphaBlendFactor,
+                          attachment->alphaBlendOp,
+                          attachment->colorWriteMask, dual_src ? 1u : 0u);
+               }
+            }
+         }
+         if (info->pDynamicState) {
+            const VkPipelineDynamicStateCreateInfo *dynamic = info->pDynamicState;
+            vkr_log("WineHuaPipeline: create[%u].dynamic flags=0x%x count=%u",
+                    i, dynamic->flags, dynamic->dynamicStateCount);
+            if (dynamic->dynamicStateCount && !dynamic->pDynamicStates) {
+               vkr_log("WineHuaPipeline: create[%u].dynamic states=null", i);
+            } else {
+               for (uint32_t j = 0; j < dynamic->dynamicStateCount; j++)
+                  vkr_log("WineHuaPipeline: create[%u].dynamic[%u]=%u",
+                          i, j, dynamic->pDynamicStates[j]);
+            }
+         }
          for (uint32_t j = 0; j < info->stageCount; j++) {
             const struct vkr_shader_module *shader =
                vkr_shader_module_from_handle(info->pStages[j].module);
@@ -348,6 +505,32 @@ vkr_dispatch_vkCreateComputePipelines(struct vn_dispatch_context *dispatch,
    struct vkr_context *ctx = dispatch->data;
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct object_array arr;
+   const bool trace = vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_PIPELINE");
+#ifdef __OHOS__
+   const bool gate_c = vkr_winehua_gate_c_trace_enabled();
+   VkPipeline *requested_pipelines = NULL;
+
+   if (gate_c && args->createInfoCount) {
+      requested_pipelines = malloc((size_t)args->createInfoCount *
+                                   sizeof(*requested_pipelines));
+      if (requested_pipelines)
+         memcpy(requested_pipelines, args->pPipelines,
+                (size_t)args->createInfoCount * sizeof(*requested_pipelines));
+      else
+         vkr_log("WineHuaPipeline: unable to retain %u requested compute "
+                 "pipeline IDs", args->createInfoCount);
+   }
+#endif
+
+   if (trace) {
+      for (uint32_t i = 0; i < args->createInfoCount; i++) {
+         const VkComputePipelineCreateInfo *info = &args->pCreateInfos[i];
+         vkr_log("WineHuaPipeline: compute-create[%u] requested=0x%" PRIxPTR
+                 " layout=0x%" PRIxPTR " shader=0x%" PRIxPTR,
+                 i, (uintptr_t)args->pPipelines[i], (uintptr_t)info->layout,
+                 (uintptr_t)info->stage.module);
+      }
+   }
 
    if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
       for (uint32_t i = 0; i < args->createInfoCount; i++) {
@@ -369,16 +552,39 @@ vkr_dispatch_vkCreateComputePipelines(struct vn_dispatch_context *dispatch,
       }
    }
 
-   if (vkr_compute_pipeline_create_array(ctx, args, &arr) < VK_SUCCESS)
+   const VkResult result = vkr_compute_pipeline_create_array(ctx, args, &arr);
+   if (trace)
+      vkr_log("WineHuaPipeline: vkCreateComputePipelines result=%d count=%u",
+              result, args->createInfoCount);
+   if (result < VK_SUCCESS) {
+#ifdef __OHOS__
+      if (gate_c && requested_pipelines)
+         vkr_winehua_remember_failed_compute_pipelines(
+            ctx, requested_pipelines, args->createInfoCount);
+      free(requested_pipelines);
+#endif
       return;
+   }
+
+#ifdef __OHOS__
+   free(requested_pipelines);
+#endif
 
    vkr_pipeline_add_array(ctx, dev, &arr, args->pPipelines);
+   if (trace) {
+      for (uint32_t i = 0; i < args->createInfoCount; i++)
+         vkr_log("WineHuaPipeline: compute-add[%u] object=0x%" PRIxPTR,
+                 i, (uintptr_t)args->pPipelines[i]);
+   }
 }
 
 static void
 vkr_dispatch_vkDestroyPipeline(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkDestroyPipeline *args)
 {
+   if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_PIPELINE"))
+      vkr_log("WineHuaPipeline: destroy requested=0x%" PRIxPTR,
+              (uintptr_t)args->pipeline);
    vkr_pipeline_destroy_and_remove(dispatch->data, args);
 }
 

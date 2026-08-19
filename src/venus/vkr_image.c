@@ -18,6 +18,24 @@ vkr_winehua_option_enabled(const char *name)
    return value && !strcmp(value, "1");
 }
 
+static bool
+vkr_winehua_remap_bgra_array_to_rgba(const struct vkr_image *image,
+                                     VkFormat format)
+{
+#ifdef __OHOS__
+   return vkr_winehua_option_enabled("VKR_WINEHUA_BGRA_ARRAY_RGBA") &&
+      image && image->image_type == VK_IMAGE_TYPE_2D &&
+      image->array_layers > 1 &&
+      (image->usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+      image->format == VK_FORMAT_B8G8R8A8_SRGB &&
+      format == VK_FORMAT_B8G8R8A8_SRGB;
+#else
+   (void)image;
+   (void)format;
+   return false;
+#endif
+}
+
 static void
 vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
                            struct vn_command_vkCreateImage *args)
@@ -42,8 +60,23 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
     */
 
    struct vkr_device *dev = vkr_device_from_handle(args->device);
+   const VkImageCreateInfo *guest_info = args->pCreateInfo;
    const VkImageCreateInfo create_info = *args->pCreateInfo;
+   VkImageCreateInfo host_info = create_info;
+#ifdef __OHOS__
+   const bool remap_bgra_array =
+      vkr_winehua_option_enabled("VKR_WINEHUA_BGRA_ARRAY_RGBA") &&
+      create_info.imageType == VK_IMAGE_TYPE_2D &&
+      create_info.arrayLayers > 1 &&
+      (create_info.usage & VK_IMAGE_USAGE_SAMPLED_BIT) &&
+      create_info.format == VK_FORMAT_B8G8R8A8_SRGB;
+   if (remap_bgra_array) {
+      host_info.format = VK_FORMAT_R8G8B8A8_SRGB;
+      args->pCreateInfo = &host_info;
+   }
+#endif
    struct vkr_image *image = vkr_image_create_and_add(dispatch->data, args);
+   args->pCreateInfo = guest_info;
    if (!image)
       return;
 
@@ -58,10 +91,11 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
    image->tiling = create_info.tiling;
    if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
       vkr_log("WineHuaSampled: host-image guestImage=%" PRIu64
-              " hostImage=0x%" PRIxPTR " format=%u extent=%ux%ux%u"
+              " hostImage=0x%" PRIxPTR " format=%u hostFormat=%u"
+              " extent=%ux%ux%u"
               " mips=%u layers=%u usage=0x%x tiling=%u",
               image->base.id, (uintptr_t)image->base.handle.image,
-              create_info.format, create_info.extent.width,
+              create_info.format, host_info.format, create_info.extent.width,
               create_info.extent.height, create_info.extent.depth,
               create_info.mipLevels, create_info.arrayLayers,
               create_info.usage, create_info.tiling);
@@ -205,11 +239,22 @@ static void
 vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCreateImageView *args)
 {
+   const VkImageViewCreateInfo *guest_info = args->pCreateInfo;
    const VkImageViewCreateInfo create_info = *args->pCreateInfo;
    struct vkr_image *image =
       vkr_image_from_handle(args->pCreateInfo->image);
+   VkImageViewCreateInfo host_info = create_info;
+   if (vkr_winehua_remap_bgra_array_to_rgba(image, create_info.format)) {
+      host_info.format = VK_FORMAT_R8G8B8A8_SRGB;
+      host_info.components.r = VK_COMPONENT_SWIZZLE_B;
+      host_info.components.g = VK_COMPONENT_SWIZZLE_G;
+      host_info.components.b = VK_COMPONENT_SWIZZLE_R;
+      host_info.components.a = VK_COMPONENT_SWIZZLE_A;
+      args->pCreateInfo = &host_info;
+   }
    struct vkr_image_view *view =
       vkr_image_view_create_and_add(dispatch->data, args);
+   args->pCreateInfo = guest_info;
 
    if (!view)
       return;
@@ -219,12 +264,15 @@ vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
       if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
          vkr_log("WineHuaSampled: host-image-view guestView=%" PRIu64 " "
                  "guestImage=%" PRIu64 " hostView=0x%" PRIxPTR " "
-                 "hostImage=0x%" PRIxPTR " format=%u viewType=%u "
+                 "hostImage=0x%" PRIxPTR " format=%u hostFormat=%u viewType=%u "
+                 "components=%u,%u,%u,%u "
                  "aspect=0x%x mip=%u+%u layer=%u+%u",
                  view->base.id, image ? image->base.id : 0,
                  (uintptr_t)view->base.handle.image_view,
                  image ? (uintptr_t)image->base.handle.image : 0,
-                 create_info.format, create_info.viewType,
+                 create_info.format, host_info.format, create_info.viewType,
+                 host_info.components.r, host_info.components.g,
+                 host_info.components.b, host_info.components.a,
                  create_info.subresourceRange.aspectMask,
                  create_info.subresourceRange.baseMipLevel,
                  create_info.subresourceRange.levelCount,

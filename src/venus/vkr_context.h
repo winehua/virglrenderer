@@ -43,6 +43,14 @@ enum vkr_context_validate_level {
    VKR_CONTEXT_VALIDATE_FULL,
 };
 
+#ifdef __OHOS__
+struct vkr_winehua_failed_compute_pipelines {
+   vkr_object_id *ids;
+   uint32_t count;
+   uint32_t capacity;
+};
+#endif
+
 struct vkr_context {
    uint32_t ctx_id;
    vkr_renderer_retire_fence_callback_type retire_fence;
@@ -86,6 +94,9 @@ struct vkr_context {
    struct hash_table *object_table;
 
 #ifdef __OHOS__
+   struct vkr_winehua_failed_compute_pipelines
+      winehua_gate_c_failed_compute_pipelines;
+
    mtx_t shadow_generation_mutex;
    struct list_head shadow_dirty_memories;
 #endif

@@ -83,6 +83,22 @@ vn_cs_decoder_lookup_object(const struct vn_cs_decoder *dec, vn_object_id id, Vk
    return vkr_cs_decoder_lookup_object(d, id, type);
 }
 
+static inline void *
+vn_cs_decoder_lookup_destroy_pipeline_object(const struct vn_cs_decoder *dec,
+                                             vn_object_id id)
+{
+   const struct vkr_cs_decoder *d = (const struct vkr_cs_decoder *)dec;
+   return vkr_cs_decoder_lookup_destroy_pipeline_object(d, id);
+}
+
+static inline void *
+vn_cs_decoder_lookup_destroy_descriptor_set_layout_object(
+   const struct vn_cs_decoder *dec, vn_object_id id)
+{
+   const struct vkr_cs_decoder *d = (const struct vkr_cs_decoder *)dec;
+   return vkr_cs_decoder_lookup_destroy_descriptor_set_layout_object(d, id);
+}
+
 static inline void
 vn_cs_decoder_reset_temp_pool(struct vn_cs_decoder *dec)
 {

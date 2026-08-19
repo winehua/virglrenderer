@@ -6,6 +6,7 @@
 #include "vkr_device_memory.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,6 +49,74 @@ static atomic_uint vkr_ohos_ubo_watched_update_trace_count;
 #define VKR_WINEHUA_UBO_TRACE_LIMIT 200000u
 #define VKR_WINEHUA_FNV64_OFFSET UINT64_C(1469598103934665603)
 #define VKR_WINEHUA_FNV64_PRIME UINT64_C(1099511628211)
+
+static uint64_t
+vkr_ohos_fnv1a64(const void *data, size_t size);
+
+static bool
+vkr_ohos_gate_c_trace_enabled(void)
+{
+   const char *value = os_get_option("WINEHUA_VKD3D_GATE_C_TRACE");
+   return value && value[0] == '1' && !value[1];
+}
+
+static uint64_t
+vkr_ohos_gate_c_trace_now_us(void)
+{
+   struct timespec ts;
+   if (clock_gettime(CLOCK_MONOTONIC, &ts))
+      return 0;
+   return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+static void
+vkr_ohos_gate_c_trace_memory(const char *phase,
+                             const struct vkr_device_memory *mem,
+                             VkDeviceSize offset,
+                             VkDeviceSize size,
+                             bool complete,
+                             VkResult result)
+{
+   if (!vkr_ohos_gate_c_trace_enabled() || !mem)
+      return;
+
+   const VkDeviceSize available = mem
+      ? MIN2(mem->allocation_size, mem->shadow_size) : 0;
+   const VkDeviceSize sample_offset = MIN2(offset, available);
+   const VkDeviceSize requested_size = size == VK_WHOLE_SIZE
+      ? available - sample_offset : MIN2(size, available - sample_offset);
+   const VkDeviceSize sample_size = MIN2(requested_size, 4096u);
+   const uint64_t host_hash = mem && mem->host_map && sample_size
+      ? vkr_ohos_fnv1a64((const uint8_t *)mem->host_map + sample_offset,
+                         (size_t)sample_size)
+      : 0;
+   const uint64_t shadow_hash = mem && mem->shadow_map && sample_size
+      ? vkr_ohos_fnv1a64((const uint8_t *)mem->shadow_map + sample_offset,
+                         (size_t)sample_size)
+      : 0;
+
+   const char *path = getenv("WINEHUA_VIRGL_LOG_PATH");
+   if (!path || !path[0])
+      return;
+
+   FILE *file = fopen(path, "a");
+   if (!file)
+      return;
+
+   fprintf(file,
+           "[%" PRIu64 "] [vkd3d-gate-c] phase=%s memory_id=%" PRIu64
+           " allocation_size=%" PRIu64 " offset=%" PRIu64
+           " size=%" PRIu64 " host_map=%u shadow_map=%u"
+           " sample_size=%" PRIu64 " host_hash=%016" PRIx64
+           " shadow_hash=%016" PRIx64 " equal=%u complete=%u result=%d\n",
+           vkr_ohos_gate_c_trace_now_us(), phase, (uint64_t)mem->base.id,
+           (uint64_t)mem->allocation_size, (uint64_t)offset, (uint64_t)size,
+           mem->host_map != NULL, mem->shadow_map != NULL,
+           (uint64_t)sample_size, host_hash, shadow_hash,
+           host_hash == shadow_hash, complete, result);
+   fflush(file);
+   fclose(file);
+}
 
 static bool
 vkr_ohos_shadow_trace_enabled(void)
@@ -777,6 +846,7 @@ vkr_ohos_record_shadow_upload_memory_cover(
 struct vkr_ohos_shadow_flush_batch {
    struct vkr_device *device;
    VkMappedMemoryRange ranges[VKR_OHOS_SHADOW_BATCH_MAX_RANGES];
+   struct vkr_device_memory *memories[VKR_OHOS_SHADOW_BATCH_MAX_RANGES];
    uint32_t count;
    bool overflow;
 };
@@ -802,6 +872,7 @@ vkr_ohos_shadow_flush_batch_add(
    if (!batch->device)
       batch->device = mem->device;
 
+   batch->memories[batch->count] = mem;
    batch->ranges[batch->count++] = (VkMappedMemoryRange) {
       .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
       .memory = mem->base.handle.device_memory,
@@ -819,8 +890,17 @@ vkr_ohos_shadow_flush_batch_submit(
       return batch->overflow ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_SUCCESS;
 
    struct vn_device_proc_table *vk = &batch->device->proc_table;
-   return vk->FlushMappedMemoryRanges(
+   for (uint32_t i = 0; i < batch->count; i++)
+      vkr_ohos_gate_c_trace_memory("flush-batch-entry", batch->memories[i],
+                                   batch->ranges[i].offset, batch->ranges[i].size,
+                                   false, VK_SUCCESS);
+   const VkResult result = vk->FlushMappedMemoryRanges(
       batch->device->base.handle.device, batch->count, batch->ranges);
+   for (uint32_t i = 0; i < batch->count; i++)
+      vkr_ohos_gate_c_trace_memory("flush-batch-result", batch->memories[i],
+                                   batch->ranges[i].offset, batch->ranges[i].size,
+                                   true, result);
+   return result;
 }
 
 static void
@@ -1943,6 +2023,9 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
          return stats;
       }
 
+      const bool had_deferred_copy = mem->shadow_host_copy_deferred &&
+         mem->shadow_upload_snapshot;
+
       if (vkr_ohos_shadow_trace_enabled()) {
          const VkDeviceSize available = MIN2(mem->shadow_size,
                                              mem->allocation_size);
@@ -2012,14 +2095,49 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
                  page_end - page_begin, msync_result,
                  msync_result ? errno : 0);
       }
+      if (!host_flush_prepared)
+         vkr_ohos_gate_c_trace_memory("flush-entry", mem,
+                                      mem->shadow_dirty_offset,
+                                      mem->shadow_dirty_size, false,
+                                      VK_SUCCESS);
       VkResult dirty_result = host_flush_prepared ? VK_SUCCESS :
          vk->FlushMappedMemoryRanges(mem->device->base.handle.device, 1,
                                      &dirty_range);
+      stats.result = dirty_result;
+      if (!host_flush_prepared)
+         vkr_ohos_gate_c_trace_memory("flush-result", mem,
+                                      mem->shadow_dirty_offset,
+                                      mem->shadow_dirty_size, true,
+                                      dirty_result);
       if (dirty_result != VK_SUCCESS)
          vkr_log("OHOS shadow dirty flush failed result=%d offset=%" PRIu64
                  " size=%" PRIu64,
                  dirty_result, (uint64_t)mem->shadow_dirty_offset,
                  (uint64_t)mem->shadow_dirty_size);
+      if (vkr_ohos_shadow_trace_enabled()) {
+         const VkDeviceSize available = MIN2(mem->shadow_size,
+                                             mem->allocation_size);
+         const VkDeviceSize trace_offset = MIN2(mem->shadow_dirty_offset,
+                                                available);
+         const VkDeviceSize trace_size = MIN2(mem->shadow_dirty_size,
+                                              available - trace_offset);
+         const uint8_t *expected = had_deferred_copy
+            ? mem->shadow_upload_snapshot : mem->shadow_map;
+         const uint8_t *host = mem->host_map;
+         const uint32_t expected_hash = vkr_ohos_fnv1a32(
+            expected + trace_offset, (size_t)trace_size);
+         const uint32_t host_hash = vkr_ohos_fnv1a32(
+            host + trace_offset, (size_t)trace_size);
+         vkr_log("OHOS shadow submit-output guestMemory=%" PRIu64
+                 " hostMemory=0x%" PRIxPTR " offset=%" PRIu64
+                 " size=%" PRIu64 " expectedFnv=0x%08x hostFnv=0x%08x"
+                 " equal=%u source=%s flushResult=%d",
+                 (uint64_t)mem->base.id,
+                 (uintptr_t)mem->base.handle.device_memory,
+                 (uint64_t)trace_offset, (uint64_t)trace_size,
+                 expected_hash, host_hash, expected_hash == host_hash,
+                 had_deferred_copy ? "snapshot" : "shadow", dirty_result);
+      }
       if (vkr_ohos_shadow_submit_unmap_large_enabled() &&
           mem->allocation_size >= 1024u * 1024u) {
          void *old_host_map = mem->host_map;
@@ -2053,8 +2171,12 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
          return stats;
 
       memcpy(mem->host_map, mem->shadow_map, copy_size);
+      vkr_ohos_gate_c_trace_memory("flush-entry", mem, 0, copy_size, false,
+                                   VK_SUCCESS);
       VkResult result =
          vk->FlushMappedMemoryRanges(mem->device->base.handle.device, 1, &range);
+      vkr_ohos_gate_c_trace_memory("flush-result", mem, 0, copy_size, true,
+                                   result);
       if (result != VK_SUCCESS)
          vkr_log("OHOS shadow initial flush failed result=%d coherent=%d size=%zu",
                  result, coherent, copy_size);
@@ -2113,8 +2235,12 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
        * shader reads without an explicit cache-domain transition.  Flushing a
        * coherent range is valid Vulkan and is a no-op on conformant coherent
        * implementations, so force it for the OHOS compatibility path. */
+      vkr_ohos_gate_c_trace_memory("flush-entry", mem, 0, copy_size, false,
+                                   VK_SUCCESS);
       VkResult result =
          vk->FlushMappedMemoryRanges(mem->device->base.handle.device, 1, &range);
+      vkr_ohos_gate_c_trace_memory("flush-result", mem, 0, copy_size, true,
+                                   result);
       if (result != VK_SUCCESS)
          vkr_log("OHOS shadow flush failed result=%d coherent=%d size=%zu",
                  result, coherent, copy_size);
@@ -2124,8 +2250,12 @@ vkr_device_memory_sync_shadow(struct vkr_device_memory *mem, bool to_host,
    } else {
       if (mem->shadow_guest_write_depth)
          return stats;
+      vkr_ohos_gate_c_trace_memory("invalidate-entry", mem, 0, copy_size,
+                                   false, VK_SUCCESS);
       VkResult result =
          vk->InvalidateMappedMemoryRanges(mem->device->base.handle.device, 1, &range);
+      vkr_ohos_gate_c_trace_memory("invalidate-result", mem, 0, copy_size,
+                                   true, result);
       if (result != VK_SUCCESS)
          vkr_log("OHOS shadow invalidate failed result=%d coherent=%d size=%zu",
                  result, coherent, copy_size);
@@ -2170,9 +2300,14 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
    const VkDeviceSize copy_size = size == VK_WHOLE_SIZE
       ? available
       : MIN2(size, available);
+   const bool gate_c = vkr_ohos_gate_c_trace_enabled();
+
+   vkr_ohos_gate_c_trace_memory("flush-request", mem, offset, copy_size,
+                                false, VK_SUCCESS);
 
    bool deferred_copy = false;
-   if (copy_size && vkr_ohos_shadow_defer_host_copy_enabled(mem->device)) {
+   if (copy_size && !gate_c &&
+       vkr_ohos_shadow_defer_host_copy_enabled(mem->device)) {
       if (!mem->shadow_upload_snapshot) {
          const size_t snapshot_size = (size_t)MIN2(
             mem->shadow_size, mem->allocation_size);
@@ -2213,6 +2348,31 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
               vkr_ohos_fnv1a64(source + offset, (size_t)copy_size),
               deferred_copy);
    }
+
+   /* VKD3D's explicit map flush is a synchronous API boundary.  The regular
+    * shadow path batches writes at queue submit, but this isolated Gate C
+    * path must execute the requested range before replying to the caller. */
+   if (gate_c && !deferred_copy && copy_size) {
+      struct vn_device_proc_table *vk = &mem->device->proc_table;
+      const VkMappedMemoryRange range = {
+         .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+         .memory = mem->base.handle.device_memory,
+         .offset = offset,
+         .size = size == VK_WHOLE_SIZE ? VK_WHOLE_SIZE : copy_size,
+      };
+      vkr_ohos_gate_c_trace_memory("flush-direct-entry", mem, offset,
+                                   copy_size, false, VK_SUCCESS);
+      const VkResult result = vk->FlushMappedMemoryRanges(
+         mem->device->base.handle.device, 1, &range);
+      vkr_ohos_gate_c_trace_memory("flush-direct-result", mem, offset,
+                                   copy_size, true, result);
+      if (mem->shadow_guest_write_depth)
+         mem->shadow_guest_write_depth--;
+      if (result == VK_SUCCESS)
+         mem->shadow_remote_active = true;
+      return result;
+   }
+
    vkr_ohos_record_shadow_dirty_range(mem, offset, copy_size);
    mem->shadow_pending_copy_bytes += copy_size;
    if (copy_size)
@@ -2243,6 +2403,9 @@ vkr_device_memory_flush_shadow_range(struct vkr_device_memory *mem,
               " size=%" PRIu64 " result=0",
               flush_count + 1, mem, (uint64_t)offset,
               (uint64_t)copy_size);
+
+   vkr_ohos_gate_c_trace_memory("flush-staged", mem, offset, copy_size,
+                                true, VK_SUCCESS);
 
    /* The queue-submit path performs the actual Host Vulkan cache-domain
     * flush once per submit.  Doing it here for every 64-byte slice is
@@ -2276,6 +2439,25 @@ vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
       : MIN2(size, available);
    if (!copy_size)
       return VK_SUCCESS;
+
+   /* Inline GPU upload keeps explicit Guest flushes in a snapshot until the
+    * next queue submit.  An invalidate is a conflicting Host access boundary:
+    * retire all earlier Guest writes before Host memory is read back, or the
+    * stale Host mapping would overwrite the shared shadow. */
+   if (mem->shadow_host_dirty) {
+      const struct vkr_shadow_sync_stats pending =
+         vkr_device_memory_sync_shadow(mem, true, false);
+      if (pending.result != VK_SUCCESS)
+         return pending.result;
+
+      if (vkr_ohos_shadow_trace_enabled())
+         vkr_log("OHOS shadow invalidate resolved pending guest writes "
+                 "guestMemory=%" PRIu64 " copies=%u bytes=%" PRIu64,
+                 (uint64_t)mem->base.id, pending.copies, pending.bytes);
+   }
+
+   vkr_ohos_gate_c_trace_memory("invalidate-entry", mem, offset, copy_size,
+                                false, VK_SUCCESS);
 
    struct vn_device_proc_table *vk = &mem->device->proc_table;
    const VkMappedMemoryRange range = {
@@ -2320,6 +2502,8 @@ vkr_device_memory_invalidate_shadow_range(struct vkr_device_memory *mem,
               " size=%" PRIu64 " result=%d",
               count + 1, mem, (uint64_t)offset,
               (uint64_t)copy_size, result);
+   vkr_ohos_gate_c_trace_memory("invalidate-result", mem, offset, copy_size,
+                                true, result);
    return result;
 #else
    (void)mem;
