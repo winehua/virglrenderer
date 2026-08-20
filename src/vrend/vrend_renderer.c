@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include "pipe/p_shader_tokens.h"
 
@@ -544,6 +545,8 @@ struct vrend_surface {
    GLuint first_layer;
    GLuint last_layer;
    GLuint nr_samples;
+   bool winehua_own_view;
+   uint64_t scanout_generation;
    struct vrend_resource *texture;
 };
 
@@ -2385,6 +2388,7 @@ int vrend_create_surface(struct vrend_context *ctx,
          glTextureView(surf->gl_id, target, res->gl_id, internalformat,
                        0, res->base.last_level + 1,
                        first_layer, num_layers);
+         surf->winehua_own_view = true;
       }
    }
 
@@ -2971,15 +2975,391 @@ void debug_texture(ASSERTED const char *f, const struct vrend_resource *gt)
 static GLuint winehua_scanout_src;
 static GLuint winehua_scanout_dst;
 
+enum winehua_fb_op {
+   WH_FB_NONE = 0,
+   WH_FB_DRAW,
+   WH_FB_CLEAR,
+   WH_FB_BLIT,
+   WH_FB_COPY,
+   WH_FB_SETFB,
+};
+
+struct winehua_fb_last {
+   uint8_t op;
+   uint32_t dst_handle;
+   uint32_t src_handle;
+   GLuint dst_gl;
+   GLuint src_gl;
+   uint32_t nr_cbufs;
+   GLuint color0_gl;
+   uint32_t color0_handle;
+   uint8_t full_cover;
+};
+
+#define WINEHUA_FB_RES_MAX 256
+
+static struct winehua_fb_last winehua_fb_by_res[WINEHUA_FB_RES_MAX];
+static struct winehua_fb_last winehua_fb_setfb;
+static uint32_t winehua_fb_present_seq;
+
+static int
+winehua_fbtrace_enabled(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("WINEHUA_FBTRACE");
+      cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+   }
+   return cached;
+}
+
+static const char *
+winehua_fb_op_name(uint8_t op)
+{
+   switch (op) {
+   case WH_FB_DRAW: return "DRAW";
+   case WH_FB_CLEAR: return "CLEAR";
+   case WH_FB_BLIT: return "BLIT";
+   case WH_FB_COPY: return "COPY";
+   case WH_FB_SETFB: return "SET_FB";
+   default: return "NONE";
+   }
+}
+
+static void
+winehua_fbtrace_note(uint8_t op, uint32_t dst_handle, uint32_t src_handle,
+                     GLuint dst_gl, GLuint src_gl, uint32_t nr_cbufs,
+                     GLuint color0_gl, uint32_t color0_handle)
+{
+   struct winehua_fb_last ev;
+
+   ev.op = op;
+   ev.dst_handle = dst_handle;
+   ev.src_handle = src_handle;
+   ev.dst_gl = dst_gl;
+   ev.src_gl = src_gl;
+   ev.nr_cbufs = nr_cbufs;
+   ev.color0_gl = color0_gl;
+   ev.color0_handle = color0_handle;
+   ev.full_cover = 1;
+
+   if (op == WH_FB_SETFB)
+      winehua_fb_setfb = ev;
+   else if (dst_handle && dst_handle < WINEHUA_FB_RES_MAX)
+      winehua_fb_by_res[dst_handle] = ev;
+}
+
+static void
+winehua_fbtrace_color0(struct vrend_sub_context *sub, uint8_t op)
+{
+   uint32_t handle = 0;
+   GLuint gl = 0;
+   GLint attached = 0;
+   GLint fb = 0;
+
+   if (sub->nr_cbufs && sub->surf[0] && sub->surf[0]->texture)
+      handle = sub->surf[0]->texture->winehua_res_id;
+   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fb);
+   if (fb && sub->nr_cbufs) {
+      glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                            &attached);
+      if (attached > 0)
+         gl = (GLuint)attached;
+   }
+   winehua_fbtrace_note(op, handle, 0, gl, 0, sub->nr_cbufs, gl, handle);
+}
+
+void
+vrend_winehua_fbtrace_present(uint32_t flush_res, GLuint tex_id)
+{
+   struct winehua_fb_last ev;
+   uint32_t seq;
+
+   if (!winehua_fbtrace_enabled())
+      return;
+
+   seq = ++winehua_fb_present_seq;
+   ev.op = WH_FB_NONE;
+   ev.dst_handle = 0;
+   ev.src_handle = 0;
+   ev.dst_gl = 0;
+   ev.src_gl = 0;
+   ev.nr_cbufs = 0;
+   ev.color0_gl = 0;
+   ev.color0_handle = 0;
+   ev.full_cover = 0;
+   if (flush_res && flush_res < WINEHUA_FB_RES_MAX)
+      ev = winehua_fb_by_res[flush_res];
+
+   {
+      GLint live_fb = 0;
+      GLint live_color0 = 0;
+      GLint prev_fb = 0;
+      struct vrend_context *ctx = vrend_state.current_ctx;
+
+      glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fb);
+      live_fb = prev_fb;
+      if (!live_fb && ctx && ctx->sub)
+         live_fb = (GLint)ctx->sub->fb_id;
+      if (live_fb) {
+         if (live_fb != prev_fb)
+            glBindFramebuffer(GL_FRAMEBUFFER, live_fb);
+         glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                               GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                               &live_color0);
+         if (live_fb != prev_fb)
+            glBindFramebuffer(GL_FRAMEBUFFER, prev_fb);
+      }
+      virgl_info("[FBTRACE] frame=%u flush_res=%u tex=%u last_writer=%s "
+                 "src_res=%u dst_res=%u src_gl=%u dst_gl=%u full_cover=%u "
+                 "setfb_nr_cbufs=%u setfb_color0_res=%u setfb_color0_gl=%u "
+                 "live_fb=%d live_color0=%d\n",
+                 seq, flush_res, tex_id, winehua_fb_op_name(ev.op),
+                 ev.src_handle, ev.dst_handle, ev.src_gl, ev.dst_gl, ev.full_cover,
+                 winehua_fb_setfb.nr_cbufs, winehua_fb_setfb.color0_handle,
+                 winehua_fb_setfb.color0_gl, live_fb, live_color0);
+   }
+}
+
+static void vrend_hw_set_color_surface(struct vrend_sub_context *sub_ctx, GLuint index);
+
+static void
+winehua_attach_scanout_color(GLuint fb)
+{
+   GLint attached = 0;
+   static const GLenum buf = GL_COLOR_ATTACHMENT0;
+   if (!fb || !winehua_scanout_dst)
+      return;
+   glBindFramebuffer(GL_FRAMEBUFFER, fb);
+   glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                         GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                         &attached);
+   if (!attached || (GLuint)attached == winehua_scanout_src)
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                             winehua_scanout_dst, 0);
+   glDrawBuffers(1, &buf);
+}
+
+static void
+winehua_rebind_scanout_color(void)
+{
+   struct vrend_context *ctx = vrend_state.current_ctx;
+   GLint prevFb = 0;
+   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFb);
+
+   /* Present often runs with nr_cbufs==0. Still pin COLOR0 to the NativeBuffer
+    * so the next guest draws iterate instead of flashing the first blit. */
+   winehua_attach_scanout_color(prevFb);
+   if (ctx && ctx->sub && ctx->sub->fb_id) {
+      if (ctx->sub->nr_cbufs > 0) {
+         glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->fb_id);
+         for (uint32_t i = 0; i < ctx->sub->nr_cbufs; i++)
+            vrend_hw_set_color_surface(ctx->sub, i);
+      } else {
+         winehua_attach_scanout_color(ctx->sub->fb_id);
+      }
+   }
+   glBindFramebuffer(GL_FRAMEBUFFER, prevFb);
+}
+
 void vrend_winehua_set_color_remap(GLuint src_tex, GLuint dst_tex)
 {
+   struct vrend_context *ctx = vrend_state.current_ctx;
+   GLint prevFb = 0;
+   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFb);
+
    if (!src_tex || !dst_tex) {
+      /* Restore original COLOR0 on the virgl context only. */
       winehua_scanout_src = 0;
       winehua_scanout_dst = 0;
+      if (ctx && ctx->sub && ctx->sub->fb_id) {
+         glBindFramebuffer(GL_FRAMEBUFFER, ctx->sub->fb_id);
+         if (ctx->sub->nr_cbufs > 0) {
+            for (uint32_t i = 0; i < ctx->sub->nr_cbufs; i++)
+               vrend_hw_set_color_surface(ctx->sub, i);
+         } else {
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, 0, 0);
+         }
+         glBindFramebuffer(GL_FRAMEBUFFER, prevFb);
+      }
       return;
    }
    winehua_scanout_src = src_tex;
    winehua_scanout_dst = dst_tex;
+   /* Caller must have the virgl EGL context current. Do not invert viewport. */
+   winehua_rebind_scanout_color();
+}
+
+static bool
+winehua_rebind_scanout_on_sub(struct vrend_sub_context *sub,
+                              struct vrend_resource *res, GLuint gl_id)
+{
+   GLint prevFb = 0;
+   GLint attached = 0;
+   GLenum status = 0;
+   uint32_t i;
+   bool color0_is_res = false;
+   bool ok = true;
+
+   if (!sub || !sub->fb_id || !res || !gl_id)
+      return true;
+
+   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFb);
+   glBindFramebuffer(GL_FRAMEBUFFER, sub->fb_id);
+   for (i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
+      struct vrend_surface *surf = sub->surf[i];
+      if (!surf || surf->texture != res)
+         continue;
+      if (surf->winehua_own_view && surf->gl_id &&
+          surf->gl_id != res->winehua_private_gl_id &&
+          surf->gl_id != gl_id) {
+         glDeleteTextures(1, &surf->gl_id);
+         surf->winehua_own_view = false;
+      }
+      surf->gl_id = gl_id;
+      surf->scanout_generation = res->scanout_generation;
+      vrend_hw_set_color_surface(sub, i);
+      if (i == 0)
+         color0_is_res = true;
+   }
+   if (color0_is_res) {
+      glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                            &attached);
+      status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+      if ((GLuint)attached != gl_id)
+         ok = false;
+      virgl_info("[SCANOUT] event=BACKING_SWITCH res=%u gl=%u gen_req=%llu "
+                 "gen_app=%llu fb=%u attached=%d status=0x%x nr_cbufs=%u ok=%d\n",
+                 res->winehua_res_id, gl_id,
+                 (unsigned long long)res->scanout_generation_requested,
+                 (unsigned long long)res->scanout_generation_applied,
+                 sub->fb_id, attached, status, sub->nr_cbufs, ok ? 1 : 0);
+   }
+   glBindFramebuffer(GL_FRAMEBUFFER, prevFb);
+   return ok;
+}
+
+int
+vrend_resource_set_scanout_backing(struct vrend_resource *res,
+                                   GLuint gl_id, void *egl_image)
+{
+   struct vrend_context *ctx;
+   bool applied = true;
+
+   if (!res || !gl_id)
+      return -EINVAL;
+
+   if (!res->winehua_private_gl_id)
+      res->winehua_private_gl_id = res->gl_id;
+
+   if (res->gl_id == gl_id && res->egl_image == egl_image &&
+       res->scanout_generation_applied == res->scanout_generation_requested &&
+       res->scanout_generation_requested)
+      return 0;
+
+   res->scanout_generation_requested++;
+   res->gl_id = gl_id;
+   res->egl_image = egl_image;
+   res->storage_bits |= VREND_STORAGE_EGL_IMAGE;
+   res->scanout_generation = res->scanout_generation_requested;
+
+   ctx = vrend_state.current_ctx;
+   if (ctx) {
+      list_for_each_entry(struct vrend_sub_context, sub, &ctx->sub_ctxs, head) {
+         if (!winehua_rebind_scanout_on_sub(sub, res, gl_id))
+            applied = false;
+      }
+   } else {
+      virgl_info("[SCANOUT] event=BACKING_SWITCH res=%u gl=%u gen_req=%llu "
+                 "fb=0 attached=0 nr_cbufs=0\n",
+                 res->winehua_res_id, gl_id,
+                 (unsigned long long)res->scanout_generation_requested);
+   }
+
+   if (applied)
+      res->scanout_generation_applied = res->scanout_generation_requested;
+   virgl_info("[SCANOUT] event=BACKING_APPLY res=%u gl=%u gen_req=%llu "
+              "gen_app=%llu applied=%d\n",
+              res->winehua_res_id, gl_id,
+              (unsigned long long)res->scanout_generation_requested,
+              (unsigned long long)res->scanout_generation_applied,
+              applied ? 1 : 0);
+   return applied ? 0 : -EIO;
+}
+
+int
+vrend_resource_scanout_generation(struct vrend_resource *res,
+                                  uint64_t *requested, uint64_t *applied,
+                                  uint32_t *draw_gl)
+{
+   GLint prevFb = 0;
+   GLint fb = 0;
+   GLint attached = 0;
+
+   if (requested)
+      *requested = res ? res->scanout_generation_requested : 0;
+   if (applied)
+      *applied = res ? res->scanout_generation_applied : 0;
+   if (draw_gl)
+      *draw_gl = 0;
+   if (!res)
+      return -EINVAL;
+   if (!draw_gl)
+      return 0;
+
+   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFb);
+   fb = prevFb;
+   if (!fb && vrend_state.current_ctx && vrend_state.current_ctx->sub)
+      fb = (GLint)vrend_state.current_ctx->sub->fb_id;
+   if (fb) {
+      if (fb != prevFb)
+         glBindFramebuffer(GL_FRAMEBUFFER, fb);
+      glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                            &attached);
+      if (fb != prevFb)
+         glBindFramebuffer(GL_FRAMEBUFFER, prevFb);
+      if (attached > 0)
+         *draw_gl = (uint32_t)attached;
+   }
+   return 0;
+}
+
+int
+vrend_resource_clear_scanout_backing(struct vrend_resource *res)
+{
+   if (!res || !res->winehua_private_gl_id)
+      return 0;
+   if (res->gl_id == res->winehua_private_gl_id && !res->egl_image)
+      return 0;
+   return vrend_resource_set_scanout_backing(res, res->winehua_private_gl_id, NULL);
+}
+
+int
+vrend_winehua_scanout_last_write(uint32_t res_handle, uint32_t *dst_gl,
+                                 uint32_t *full_cover, const char **op)
+{
+   struct winehua_fb_last ev;
+
+   if (op)
+      *op = "NONE";
+   if (dst_gl)
+      *dst_gl = 0;
+   if (full_cover)
+      *full_cover = 0;
+   if (!res_handle || res_handle >= WINEHUA_FB_RES_MAX)
+      return -EINVAL;
+   ev = winehua_fb_by_res[res_handle];
+   if (op)
+      *op = winehua_fb_op_name(ev.op);
+   if (dst_gl)
+      *dst_gl = ev.dst_gl;
+   if (full_cover)
+      *full_cover = ev.full_cover;
+   return ev.op != WH_FB_NONE ? 0 : -ENOENT;
 }
 
 void vrend_fb_bind_texture_id(struct vrend_resource *res,
@@ -2989,8 +3369,12 @@ void vrend_fb_bind_texture_id(struct vrend_resource *res,
    const struct util_format_description *desc = util_format_description(res->base.format);
    GLenum attachment = GL_COLOR_ATTACHMENT0 + idx;
 
-   if (!vrend_format_is_ds(res->base.format) &&
-       winehua_scanout_src && (GLuint)id == winehua_scanout_src && winehua_scanout_dst)
+   if (!vrend_format_is_ds(res->base.format) && res->scanout_generation &&
+       res->gl_id)
+      id = (int)res->gl_id;
+   else if (!vrend_format_is_ds(res->base.format) && winehua_scanout_src &&
+       winehua_scanout_dst &&
+       ((GLuint)id == winehua_scanout_src || res->gl_id == winehua_scanout_src))
       id = (int)winehua_scanout_dst;
 
    debug_texture(__func__, res);
@@ -3099,11 +3483,149 @@ static void vrend_hw_set_color_surface(struct vrend_sub_context *sub_ctx, GLuint
    } else {
       uint32_t first_layer = sub_ctx->surf[index]->first_layer;
       uint32_t last_layer = sub_ctx->surf[index]->last_layer;
+      GLuint id = surf->gl_id;
 
-      vrend_fb_bind_texture_id(surf->texture, surf->gl_id, index, surf->level,
+      if (surf->texture && surf->texture->scanout_generation)
+         id = surf->texture->gl_id;
+      if (surf->texture)
+         surf->scanout_generation = surf->texture->scanout_generation;
+
+      vrend_fb_bind_texture_id(surf->texture, id, index, surf->level,
                                first_layer != last_layer ? -1 : (GLint)first_layer,
                                surf->nr_samples);
    }
+}
+
+static void
+winehua_validate_scanout_color(struct vrend_sub_context *sub)
+{
+   GLint prevFb = 0;
+   uint32_t i;
+   bool need = false;
+
+   if (!sub || !sub->fb_id || !sub->nr_cbufs)
+      return;
+   for (i = 0; i < sub->nr_cbufs; i++) {
+      struct vrend_surface *surf = sub->surf[i];
+      if (surf && surf->texture && surf->texture->scanout_generation &&
+          surf->texture->gl_id) {
+         need = true;
+         break;
+      }
+   }
+   if (!need)
+      return;
+
+   glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFb);
+   if ((GLuint)prevFb != sub->fb_id)
+      glBindFramebuffer(GL_FRAMEBUFFER, sub->fb_id);
+
+   for (i = 0; i < sub->nr_cbufs; i++) {
+      struct vrend_surface *surf = sub->surf[i];
+      GLint attached = 0;
+      GLenum attachment;
+
+      if (!surf || !surf->texture || !surf->texture->scanout_generation ||
+          !surf->texture->gl_id)
+         continue;
+      attachment = GL_COLOR_ATTACHMENT0 + i;
+      glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, attachment,
+                                            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                            &attached);
+      if ((GLuint)attached == surf->texture->gl_id &&
+          surf->scanout_generation == surf->texture->scanout_generation)
+         continue;
+      {
+         static int logged;
+         if (logged < 16) {
+            virgl_info("[SCANOUT] event=REBIND_DRAW fb=%u idx=%u attached=%d "
+                       "want=%u surf_gl=%u gen=%llu\n",
+                       sub->fb_id, i, attached, surf->texture->gl_id, surf->gl_id,
+                       (unsigned long long)surf->texture->scanout_generation);
+            logged++;
+         }
+      }
+      vrend_hw_set_color_surface(sub, i);
+   }
+
+   if ((GLuint)prevFb != sub->fb_id)
+      glBindFramebuffer(GL_FRAMEBUFFER, prevFb);
+}
+
+static bool
+winehua_resource_is_scanout(const struct vrend_resource *res)
+{
+   return res && res->scanout_generation && res->gl_id;
+}
+
+static bool
+winehua_scanout_color_active(const struct vrend_sub_context *sub)
+{
+   return sub && sub->nr_cbufs && sub->surf[0] &&
+          winehua_resource_is_scanout(sub->surf[0]->texture);
+}
+
+static void
+winehua_check_scanout_draw_attachment(struct vrend_sub_context *sub)
+{
+   struct vrend_resource *res;
+   GLint attached = 0;
+
+   if (!winehua_scanout_color_active(sub))
+      return;
+   res = sub->surf[0]->texture;
+   glGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                         GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME,
+                                         &attached);
+   if ((GLuint)attached == res->gl_id &&
+       res->scanout_generation_applied == res->scanout_generation_requested)
+      return;
+   virgl_info("[SCANOUT] event=STALE_DRAW res=%u attached=%d want=%u "
+              "gen_req=%llu gen_app=%llu\n",
+              res->winehua_res_id, attached, res->gl_id,
+              (unsigned long long)res->scanout_generation_requested,
+              (unsigned long long)res->scanout_generation_applied);
+}
+
+static GLint
+winehua_flip_y(uint32_t fb_height, GLint y, GLint h)
+{
+   if (!fb_height)
+      return y;
+   return (GLint)fb_height - y - h;
+}
+
+static void
+winehua_apply_scanout_yflip(struct vrend_sub_context *sub)
+{
+   float base;
+   float want;
+   bool scanout;
+
+   if (!sub)
+      return;
+   /* Skip-copy has no present blit, so NativeBuffer keeps GL Y-up while the
+    * compositor expects the blit-shader 1.0-y layout. Invert clip-space Y and
+    * scissors only while COLOR0 is the NativeBuffer. Do not invert glViewport
+    * (cancels clip Y; fullscreen y is already 0). Do not use SET_TRANSFORM. */
+   scanout = winehua_scanout_color_active(sub);
+   base = sub->viewport_is_negative ? -1.f : 1.f;
+   want = scanout ? -base : base;
+   if (sub->sysvalue_data.winsys_adjust_y != want) {
+      sub->sysvalue_data.winsys_adjust_y = want;
+      sub->sysvalue_data_cookie++;
+      sub->scissor_state_dirty |= 1;
+      {
+         static int logged;
+         if (logged < 8) {
+            virgl_info("[SCANOUT] event=YFLIP winsys=%g scanout=%d fb_h=%u\n",
+                       want, scanout ? 1 : 0, sub->fb_height);
+            logged++;
+         }
+      }
+   }
+   if (scanout)
+      sub->scissor_state_dirty |= 1;
 }
 
 static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
@@ -3191,6 +3713,7 @@ void vrend_set_framebuffer_state(struct vrend_context *ctx,
    GLenum status;
    GLint new_height = -1;
    bool new_fbo_origin_upper_left = false;
+   bool changed;
 
    struct vrend_sub_context *sub_ctx = ctx->sub;
 
@@ -3223,10 +3746,16 @@ void vrend_set_framebuffer_state(struct vrend_context *ctx,
       } else
          surf = NULL;
 
-      if (sub_ctx->surf[i] != surf) {
+      changed = sub_ctx->surf[i] != surf;
+      if (changed)
          vrend_surface_reference(&sub_ctx->surf[i], surf);
+      if (surf && surf->texture && surf->texture->scanout_generation)
          vrend_hw_set_color_surface(sub_ctx, i);
-      }
+      else if (changed)
+         vrend_hw_set_color_surface(sub_ctx, i);
+      else if (surf && surf->texture &&
+               surf->scanout_generation != surf->texture->scanout_generation)
+         vrend_hw_set_color_surface(sub_ctx, i);
    }
 
    if (old_num > sub_ctx->nr_cbufs) {
@@ -3304,6 +3833,7 @@ void vrend_set_framebuffer_state(struct vrend_context *ctx,
 
    sub_ctx->shader_dirty = true;
    sub_ctx->blend_state_dirty = true;
+   winehua_fbtrace_color0(sub_ctx, WH_FB_SETFB);
 }
 
 void vrend_set_framebuffer_state_no_attach(UNUSED struct vrend_context *ctx,
@@ -4867,6 +5397,9 @@ void vrend_clear(struct vrend_context *ctx, unsigned buffers,
    if (ctx->ctx_switch_pending)
       vrend_finish_context_switch(ctx);
 
+   winehua_validate_scanout_color(sub_ctx);
+   winehua_apply_scanout_yflip(sub_ctx);
+
    vrend_update_frontface_state(sub_ctx);
    if (sub_ctx->stencil_state_dirty)
       vrend_update_stencil_state(sub_ctx);
@@ -4884,6 +5417,11 @@ void vrend_clear(struct vrend_context *ctx, unsigned buffers,
 
    vrend_clear_prepare(sub_ctx, sub_ctx->nr_cbufs ? sub_ctx->surf[0] : NULL,
                        buffers, colorf, depth, stencil);
+   if (buffers & PIPE_CLEAR_COLOR) {
+   winehua_validate_scanout_color(sub_ctx);
+   winehua_check_scanout_draw_attachment(sub_ctx);
+   winehua_fbtrace_color0(sub_ctx, WH_FB_CLEAR);
+   }
 
    if (buffers & PIPE_CLEAR_COLOR) {
       uint32_t mask = 0;
@@ -4930,6 +5468,7 @@ int vrend_clear_texture(struct vrend_context* ctx,
    enum virgl_formats fmt = res->base.format;
    format = tex_conv_table[fmt].glformat;
    type = tex_conv_table[fmt].gltype;
+   winehua_fbtrace_note(WH_FB_CLEAR, res->winehua_res_id, 0, res->gl_id, 0, 0, 0, 0);
 
    /* 32-bit BGRA resources are always reordered to RGBA ordering before
     * submission to the host driver. Reorder red/blue color bytes in
@@ -4971,6 +5510,10 @@ void vrend_clear_surface(struct vrend_context *ctx, uint32_t surf_handle,
                                  surf_handle);
       return;
    }
+   if (surf->texture)
+      winehua_fbtrace_note(WH_FB_CLEAR, surf->texture->winehua_res_id, 0,
+                           surf->texture->gl_id, 0, 1, surf->texture->gl_id,
+                           surf->texture->winehua_res_id);
 
    if (!vrend_format_can_render(surf->format) &&
        !vrend_format_is_ds(surf->format)) {
@@ -4982,7 +5525,14 @@ void vrend_clear_surface(struct vrend_context *ctx, uint32_t surf_handle,
    if (render_condition_enabled == false)
       vrend_pause_render_condition(ctx, true);
 
-   glScissor(dstx, dsty, width, height);
+   {
+      GLint sy = (GLint)dsty;
+      if (winehua_resource_is_scanout(surf->texture)) {
+         uint32_t fh = u_minify(surf->texture->base.height0, surf->level);
+         sy = winehua_flip_y(fh, (GLint)dsty, (GLint)height);
+      }
+      glScissor(dstx, sy, width, height);
+   }
    glEnable(GL_SCISSOR_TEST);
    ctx->sub->scissor_state_dirty = (1 << 0);
 
@@ -5040,6 +5590,9 @@ static void vrend_update_scissor_state(struct vrend_sub_context *sub_ctx)
       }
       ss = &sub_ctx->ss[idx];
       y = ss->miny;
+      if (winehua_scanout_color_active(sub_ctx) && sub_ctx->fb_height)
+         y = winehua_flip_y(sub_ctx->fb_height, ss->miny,
+                            (GLint)ss->maxy - (GLint)ss->miny);
 
       if (idx > 0 && has_feature(feat_viewport_array))
          glScissorIndexed(idx, ss->minx, y, ss->maxx - ss->minx, ss->maxy - ss->miny);
@@ -5993,6 +6546,9 @@ int vrend_draw_vbo(struct vrend_context *ctx,
    if (ctx->ctx_switch_pending)
       vrend_finish_context_switch(ctx);
 
+   winehua_validate_scanout_color(sub_ctx);
+   winehua_apply_scanout_yflip(sub_ctx);
+
    vrend_update_frontface_state(sub_ctx);
    if (ctx->sub->stencil_state_dirty)
       vrend_update_stencil_state(sub_ctx);
@@ -6025,6 +6581,9 @@ int vrend_draw_vbo(struct vrend_context *ctx,
    }
 
    vrend_use_program(sub_ctx->prog);
+   winehua_validate_scanout_color(sub_ctx);
+   winehua_check_scanout_draw_attachment(sub_ctx);
+   winehua_fbtrace_color0(sub_ctx, WH_FB_DRAW);
 
    if (has_feature(feat_draw_parameters) &&
        sub_ctx->prog->reads_drawid &&
@@ -6736,6 +7295,8 @@ static void vrend_update_frontface_state(struct vrend_sub_context *sub_ctx)
    int front_ccw = state->front_ccw;
 
    front_ccw ^= (sub_ctx->fbo_origin_upper_left ? 0 : 1);
+   if (winehua_scanout_color_active(sub_ctx))
+      front_ccw ^= 1;
    if (front_ccw)
       glFrontFace(GL_CCW);
    else
@@ -10768,6 +11329,9 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
       return;
    }
 
+   winehua_fbtrace_note(WH_FB_COPY, dst_handle, src_handle,
+                        dst_res->gl_id, src_res->gl_id, 0, 0, 0);
+
    if (!resource_contains_box(src_res, src_box, src_level)) {
       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_CMD_BUFFER, src_handle);
       return;
@@ -10853,6 +11417,11 @@ void vrend_renderer_resource_copy_region(struct vrend_context *ctx,
    } else {
       dy1 = dst_res->base.height0 - dsty - src_box->height;
       dy2 = dst_res->base.height0 - dsty;
+   }
+   if (winehua_resource_is_scanout(dst_res)) {
+      GLint tmp = dy1;
+      dy1 = dy2;
+      dy2 = tmp;
    }
 
    glBlitFramebuffer(src_box->x, sy1,
@@ -10961,6 +11530,12 @@ static void vrend_renderer_prepare_blit_extra_info(struct vrend_context *ctx,
    } else {
       info->src_y1 = src_res->base.height0 - info->b.src.box.y - info->b.src.box.height;
       info->src_y2 = src_res->base.height0 - info->b.src.box.y;
+   }
+
+   if (winehua_resource_is_scanout(dst_res)) {
+      GLint tmp = info->dst_y1;
+      info->dst_y1 = info->dst_y2;
+      info->dst_y2 = tmp;
    }
 
    if (vrend_blit_needs_swizzle(info->b.dst.format, info->b.src.format)) {
@@ -11093,9 +11668,12 @@ static void vrend_renderer_blit_fbo(struct vrend_context *ctx,
 
 
    if (info->b.scissor_enable) {
-      glScissor(info->b.scissor.minx, info->b.scissor.miny,
-                info->b.scissor.maxx - info->b.scissor.minx,
-                info->b.scissor.maxy - info->b.scissor.miny);
+      GLint sy = info->b.scissor.miny;
+      GLint sh = info->b.scissor.maxy - info->b.scissor.miny;
+      if (winehua_resource_is_scanout(dst_res))
+         sy = winehua_flip_y(dst_res->base.height0, info->b.scissor.miny, sh);
+      glScissor(info->b.scissor.minx, sy,
+                info->b.scissor.maxx - info->b.scissor.minx, sh);
       ctx->sub->scissor_state_dirty = (1 << 0);
       glEnable(GL_SCISSOR_TEST);
    } else
@@ -11305,6 +11883,16 @@ void vrend_renderer_blit(struct vrend_context *ctx,
    if (!dst_res) {
       vrend_report_context_error(ctx, VIRGL_ERROR_CTX_ILLEGAL_RESOURCE, dst_handle);
       return;
+   }
+
+   winehua_fbtrace_note(WH_FB_BLIT, dst_handle, src_handle,
+                        dst_res->gl_id, src_res->gl_id, 0, 0, 0);
+   if (dst_handle && dst_handle < WINEHUA_FB_RES_MAX) {
+      uint32_t bw = (uint32_t)MAX2(info->dst.box.width, -info->dst.box.width);
+      uint32_t bh = (uint32_t)MAX2(info->dst.box.height, -info->dst.box.height);
+      winehua_fb_by_res[dst_handle].full_cover =
+         (info->dst.box.x == 0 && info->dst.box.y == 0 &&
+          bw >= dst_res->base.width0 && bh >= dst_res->base.height0) ? 1 : 0;
    }
 
    if (ctx->in_error)
@@ -13157,6 +13745,7 @@ void vrend_renderer_attach_res_ctx(struct vrend_context *ctx,
    vrend_ctx_resource_insert(ctx->res_hash,
                              res->res_id,
                              (struct vrend_resource *)res->pipe_resource);
+   ((struct vrend_resource *)res->pipe_resource)->winehua_res_id = res->res_id;
 }
 
 void vrend_renderer_detach_res_ctx(struct vrend_context *ctx,
@@ -13592,6 +14181,7 @@ vrend_renderer_pipe_resource_set_type(struct vrend_context *ctx,
    vrend_ctx_resource_insert(ctx->res_hash,
                              res->res_id,
                              (struct vrend_resource *)res->pipe_resource);
+   ((struct vrend_resource *)res->pipe_resource)->winehua_res_id = res->res_id;
 
    return 0;
 }

@@ -5,7 +5,12 @@
 
 #include "vkr_common.h"
 
+#include <errno.h>
 #include <stdio.h>
+#ifdef __OHOS__
+#include <dlfcn.h>
+#include <stdarg.h>
+#endif
 
 #include "venus-protocol/vn_protocol_renderer_info.h"
 #include "virtgpu_drm.h"
@@ -62,6 +67,33 @@ vkr_winehua_present_prewait_enabled(void)
    return value && value[0] == '1' && !value[1];
 }
 
+#ifdef __OHOS__
+static void
+vkr_winehua_provenance_log(const char *fmt, ...)
+{
+   char line[768];
+   va_list ap;
+   typedef int (*oh_log_print_fn)(unsigned int, unsigned int, unsigned int,
+                                  const char *, const char *, ...);
+   static oh_log_print_fn print_fn;
+   static int initialized;
+
+   va_start(ap, fmt);
+   vsnprintf(line, sizeof(line), fmt, ap);
+   va_end(ap);
+   vkr_log("%s", line);
+
+   if (!initialized) {
+      void *handle = dlopen("libhilog_ndk.z.so", RTLD_NOW | RTLD_GLOBAL);
+      if (handle)
+         print_fn = (oh_log_print_fn)dlsym(handle, "OH_LOG_Print");
+      initialized = 1;
+   }
+   if (print_fn)
+      print_fn(0u, 4u, 0u, "vkr", "%{public}s", line);
+}
+#endif
+
 static void
 vkr_winehua_stage(const char *stage, uint32_t serial)
 {
@@ -104,6 +136,10 @@ static void *vkr_winehua_present_callback_data;
 static vkr_renderer_winehua_device_release_callback_type
    vkr_winehua_device_release_callback;
 static void *vkr_winehua_device_release_callback_data;
+#ifdef __OHOS__
+static uint32_t vkr_winehua_present_ctx;
+static struct vkr_image *vkr_winehua_present_image;
+#endif
 
 struct vkr_winehua_queue_guard {
    mtx_t *mutex;
@@ -220,6 +256,64 @@ vkr_renderer_set_winehua_device_release_callback(
 {
    vkr_winehua_device_release_callback = callback;
    vkr_winehua_device_release_callback_data = user_data;
+}
+
+static struct vkr_context *vkr_renderer_lookup_context(uint32_t ctx_id);
+
+int
+vkr_renderer_winehua_set_scanout_backing(uint32_t ctx_id, uint64_t scanout_image)
+{
+#ifdef __OHOS__
+   if (!ctx_id || !scanout_image)
+      return -EINVAL;
+   if (!vkr_winehua_trylock(&vkr_state.context_mutex, "scanout-context-busy", 0))
+      return -EAGAIN;
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx || ctx_id != vkr_winehua_present_ctx || !vkr_winehua_present_image) {
+      mtx_unlock(&vkr_state.context_mutex);
+      return -ESRCH;
+   }
+   if (!vkr_winehua_trylock(&ctx->object_mutex, "scanout-object-busy", 0)) {
+      mtx_unlock(&vkr_state.context_mutex);
+      return -EAGAIN;
+   }
+   const int ret = vkr_image_set_scanout_backing(
+      vkr_winehua_present_image, (VkImage)(uintptr_t)scanout_image);
+   mtx_unlock(&ctx->object_mutex);
+   mtx_unlock(&vkr_state.context_mutex);
+   return ret;
+#else
+   (void)ctx_id;
+   (void)scanout_image;
+   return -ENOSYS;
+#endif
+}
+
+int
+vkr_renderer_winehua_clear_scanout_backing(uint32_t ctx_id)
+{
+#ifdef __OHOS__
+   if (!ctx_id)
+      return -EINVAL;
+   if (!vkr_winehua_trylock(&vkr_state.context_mutex, "scanout-clear-context-busy", 0))
+      return -EAGAIN;
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx || ctx_id != vkr_winehua_present_ctx || !vkr_winehua_present_image) {
+      mtx_unlock(&vkr_state.context_mutex);
+      return -ESRCH;
+   }
+   if (!vkr_winehua_trylock(&ctx->object_mutex, "scanout-clear-object-busy", 0)) {
+      mtx_unlock(&vkr_state.context_mutex);
+      return -EAGAIN;
+   }
+   const int ret = vkr_image_clear_scanout_backing(vkr_winehua_present_image);
+   mtx_unlock(&ctx->object_mutex);
+   mtx_unlock(&vkr_state.context_mutex);
+   return ret;
+#else
+   (void)ctx_id;
+   return -ENOSYS;
+#endif
 }
 
 int
@@ -439,7 +533,16 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
       (uintptr_t)physical_dev->base.handle.physical_device;
    const uintptr_t device_handle = (uintptr_t)dev->base.handle.device;
    const uintptr_t queue_handle = (uintptr_t)queue->base.handle.queue;
+#ifdef __OHOS__
+   vkr_winehua_present_ctx = ctx_id;
+   vkr_winehua_present_image = image;
+   const VkImage last_write = image->winehua_last_write_image;
+   const VkImage current_host = image->base.handle.image;
+   const uint64_t image_handle = (uint64_t)(uintptr_t)(
+      last_write && last_write != current_host ? last_write : current_host);
+#else
    const uint64_t image_handle = (uint64_t)(uintptr_t)image->base.handle.image;
+#endif
    const uint32_t queue_family = queue->family;
    vkr_winehua_stage("handles-ready", serial);
    if (vkr_winehua_frame_assoc_trace_enabled()) {
@@ -472,6 +575,16 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
       .locked = true,
       .serial = serial,
    };
+#ifdef __OHOS__
+   const uint64_t src_epoch = image->winehua_write_epoch;
+   const uint64_t last_epoch = image->winehua_last_present_epoch;
+   const uint32_t last_serial = image->winehua_last_present_serial;
+   const uint64_t submit_gen = vkr_winehua_queue_submit_generation();
+   const char *write_op =
+      image->winehua_last_write_op ? image->winehua_last_write_op : "none";
+   const uint32_t full_cover = image->winehua_last_write_full_cover;
+   struct vkr_image *present_image = image;
+#endif
    const int ret = vkr_winehua_present_callback(
       ctx_id, instance_handle, physical_device_handle, device_handle,
       queue_handle, image_handle, queue_family, width, height, format, layout,
@@ -480,6 +593,33 @@ vkr_renderer_winehua_present(uint32_t ctx_id,
       vkr_winehua_present_callback_data);
    vkr_winehua_release_queue(&queue_guard);
    vkr_winehua_stage("queue-unlocked", serial);
+#ifdef __OHOS__
+   {
+      static uint64_t provenance_count;
+      static uint64_t stale_count;
+      const uint64_t n = ++provenance_count;
+      const bool stale = src_epoch > 0 && src_epoch == last_epoch &&
+                         serial != last_serial;
+      if (stale)
+         stale_count++;
+      const char *klass = stale ? "STALE_SOURCE" : "OK";
+      if (stale || n <= 8 || (n % 120) == 0)
+         vkr_winehua_provenance_log(
+            "[DX11-PROVENANCE] present_serial=%u imageId=%" PRIu64
+            " src_handle=0x%" PRIx64 " src_epoch=%" PRIu64
+            " last_present_epoch=%" PRIu64 " last_present_serial=%u "
+            "submit_gen=%" PRIu64 " last_write_op=%s full_cover=%u "
+            "present_ret=%d CLASS=%s stale_count=%" PRIu64
+            " presents=%" PRIu64,
+            serial, image_id, image_handle, src_epoch, last_epoch,
+            last_serial, submit_gen, write_op, full_cover, ret, klass,
+            stale_count, n);
+      if (ret == 0 && present_image) {
+         present_image->winehua_last_present_epoch = src_epoch;
+         present_image->winehua_last_present_serial = serial;
+      }
+   }
+#endif
    return ret;
 }
 

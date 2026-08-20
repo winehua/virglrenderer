@@ -11,6 +11,7 @@
 #include "vkr_context.h"
 #include "vkr_descriptor_set.h"
 #include "vkr_device_memory.h"
+#include "vkr_image.h"
 #include "vkr_metal_helpers.h"
 #include "vkr_physical_device.h"
 #include "vkr_queue.h"
@@ -250,6 +251,9 @@ vkr_device_object_destroy(struct vkr_context *ctx,
          vk->DestroyBuffer(device, obj->handle.buffer, NULL);
          break;
       case VK_OBJECT_TYPE_IMAGE:
+#ifdef __OHOS__
+         vkr_image_prepare_destroy((struct vkr_image *)obj);
+#endif
          vk->DestroyImage(device, obj->handle.image, NULL);
          break;
       case VK_OBJECT_TYPE_EVENT:
@@ -262,6 +266,9 @@ vkr_device_object_destroy(struct vkr_context *ctx,
          vk->DestroyBufferView(device, obj->handle.buffer_view, NULL);
          break;
       case VK_OBJECT_TYPE_IMAGE_VIEW:
+#ifdef __OHOS__
+         vkr_image_view_prepare_destroy((struct vkr_image_view *)obj);
+#endif
          vk->DestroyImageView(device, obj->handle.image_view, NULL);
          break;
       case VK_OBJECT_TYPE_SHADER_MODULE:

@@ -8,7 +8,9 @@
 #include "vkr_device.h"
 #include "vkr_image_gen.h"
 #include "vkr_physical_device.h"
+#include "vkr_render_pass.h"
 
+#include <errno.h>
 #include <string.h>
 
 static bool
@@ -35,6 +37,291 @@ vkr_winehua_remap_bgra_array_to_rgba(const struct vkr_image *image,
    return false;
 #endif
 }
+
+#ifdef __OHOS__
+static void
+vkr_image_bind_host(struct vkr_image *image, VkImage host)
+{
+   image->base.handle.image = host;
+}
+
+static VkImageView
+vkr_image_view_for_image(struct vkr_image_view *view,
+                         VkImage host_image)
+{
+   if (!view || !view->image || !host_image || !view->winehua_create_info_valid) {
+      vkr_log("WineHuaScanout: view recreate skipped viewId=%" PRIu64
+              " valid=%d host=0x%" PRIxPTR,
+              view ? view->base.id : 0,
+              view ? (int)view->winehua_create_info_valid : 0,
+              (uintptr_t)host_image);
+      return VK_NULL_HANDLE;
+   }
+   struct vkr_device *dev = view->image->device;
+   if (!dev)
+      return VK_NULL_HANDLE;
+
+   if (!view->winehua_private_view)
+      view->winehua_private_view = view->base.handle.image_view;
+   if (view->image->winehua_private_image &&
+       host_image == view->image->winehua_private_image)
+      return view->winehua_private_view;
+   if (host_image == view->winehua_bound_image && view->base.handle.image_view)
+      return view->base.handle.image_view;
+
+   for (uint32_t i = 0; i < view->winehua_scanout_view_count; i++) {
+      if (view->winehua_scanout_views[i].image == host_image)
+         return view->winehua_scanout_views[i].view;
+   }
+   if (view->winehua_scanout_view_count >= VKR_WINEHUA_SCANOUT_CACHE) {
+      vkr_log("WineHuaScanout: view cache full viewId=%" PRIu64, view->base.id);
+      return VK_NULL_HANDLE;
+   }
+
+   VkImageViewCreateInfo info = view->winehua_create_info;
+   info.pNext = NULL;
+   info.image = host_image;
+   VkImageView created = VK_NULL_HANDLE;
+   const VkResult view_result =
+      dev->proc_table.CreateImageView(dev->base.handle.device, &info, NULL, &created);
+   if (view_result != VK_SUCCESS || !created) {
+      vkr_log("WineHuaScanout: CreateImageView failed result=%d format=%u "
+              "viewType=%u image=0x%" PRIxPTR,
+              (int)view_result, info.format, info.viewType, (uintptr_t)host_image);
+      return VK_NULL_HANDLE;
+   }
+
+   uint32_t slot = view->winehua_scanout_view_count++;
+   view->winehua_scanout_views[slot].image = host_image;
+   view->winehua_scanout_views[slot].view = created;
+   return created;
+}
+
+static VkFramebuffer
+vkr_framebuffer_for_views(struct vkr_framebuffer *fb, struct vkr_device *dev)
+{
+   if (!fb || !dev || !fb->winehua_create_info_valid)
+      return VK_NULL_HANDLE;
+
+   VkImageView views[8];
+   for (uint32_t i = 0; i < fb->winehua_attachment_count; i++) {
+      struct vkr_image_view *view = fb->winehua_attachments[i];
+      views[i] = view ? view->base.handle.image_view : VK_NULL_HANDLE;
+      if (!views[i])
+         return VK_NULL_HANDLE;
+   }
+   for (uint32_t i = 0; i < fb->winehua_scanout_fb_count; i++) {
+      if (!memcmp(fb->winehua_scanout_fbs[i].views, views,
+                  fb->winehua_attachment_count * sizeof(views[0])))
+         return fb->winehua_scanout_fbs[i].fb;
+   }
+   if (fb->winehua_scanout_fb_count >= 8)
+      return VK_NULL_HANDLE;
+
+   VkFramebufferCreateInfo info = {
+      .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+      .renderPass = fb->winehua_render_pass,
+      .attachmentCount = fb->winehua_attachment_count,
+      .pAttachments = views,
+      .width = fb->winehua_width,
+      .height = fb->winehua_height,
+      .layers = fb->winehua_layers,
+   };
+   VkFramebuffer created = VK_NULL_HANDLE;
+   const VkResult fb_result =
+      dev->proc_table.CreateFramebuffer(dev->base.handle.device, &info, NULL, &created);
+   if (fb_result != VK_SUCCESS || !created) {
+      vkr_log("WineHuaScanout: CreateFramebuffer failed result=%d attachments=%u "
+              "size=%ux%u",
+              (int)fb_result, fb->winehua_attachment_count, fb->winehua_width,
+              fb->winehua_height);
+      return VK_NULL_HANDLE;
+   }
+
+   uint32_t slot = fb->winehua_scanout_fb_count++;
+   memcpy(fb->winehua_scanout_fbs[slot].views, views, sizeof(views));
+   fb->winehua_scanout_fbs[slot].fb = created;
+   return created;
+}
+
+static int
+vkr_image_recreate_views_and_framebuffers(struct vkr_image *image, VkImage host_image)
+{
+   struct vkr_device *dev = image->device;
+   if (!dev)
+      return -ENODEV;
+
+   mtx_lock(&dev->object_mutex);
+   list_for_each_entry (struct vkr_object, obj, &dev->objects, track_head) {
+      if (obj->type != VK_OBJECT_TYPE_IMAGE_VIEW)
+         continue;
+      struct vkr_image_view *view = (struct vkr_image_view *)obj;
+      if (view->image != image)
+         continue;
+      VkImageView next = vkr_image_view_for_image(view, host_image);
+      if (!next) {
+         mtx_unlock(&dev->object_mutex);
+         return -EIO;
+      }
+      view->base.handle.image_view = next;
+      view->winehua_bound_image = host_image;
+   }
+   list_for_each_entry (struct vkr_object, obj, &dev->objects, track_head) {
+      if (obj->type != VK_OBJECT_TYPE_FRAMEBUFFER)
+         continue;
+      struct vkr_framebuffer *fb = (struct vkr_framebuffer *)obj;
+      if (!fb->winehua_create_info_valid)
+         continue;
+      bool uses_image = false;
+      for (uint32_t i = 0; i < fb->winehua_attachment_count; i++) {
+         struct vkr_image_view *view = fb->winehua_attachments[i];
+         if (view && view->image == image) {
+            uses_image = true;
+            break;
+         }
+      }
+      if (!uses_image)
+         continue;
+      VkFramebuffer next = vkr_framebuffer_for_views(fb, dev);
+      if (!next) {
+         mtx_unlock(&dev->object_mutex);
+         return -EIO;
+      }
+      fb->base.handle.framebuffer = next;
+   }
+   mtx_unlock(&dev->object_mutex);
+   return 0;
+}
+
+int
+vkr_image_set_scanout_backing(struct vkr_image *image, VkImage scanout)
+{
+   if (!image || !scanout)
+      return -EINVAL;
+   if (image->samples != VK_SAMPLE_COUNT_1_BIT)
+      return -ENOTSUP;
+   if (!image->winehua_private_image)
+      image->winehua_private_image = image->base.handle.image;
+   if (!image->winehua_private_image)
+      return -EINVAL;
+   if (image->base.handle.image == scanout) {
+      image->winehua_scanout_generation++;
+      return vkr_image_recreate_views_and_framebuffers(image, scanout);
+   }
+
+   const VkImage previous = image->base.handle.image;
+   vkr_image_bind_host(image, scanout);
+   const int ret = vkr_image_recreate_views_and_framebuffers(image, scanout);
+   if (ret) {
+      vkr_image_bind_host(image, previous);
+      vkr_image_recreate_views_and_framebuffers(image, previous);
+      vkr_log("WineHuaScanout: apply failed imageId=%" PRIu64
+              " scanout=0x%" PRIxPTR " ret=%d",
+              image->base.id, (uintptr_t)scanout, ret);
+      return ret;
+   }
+   image->winehua_scanout_generation++;
+   if (image->winehua_scanout_generation <= 8 ||
+       image->winehua_scanout_generation % 120 == 0) {
+      vkr_log("WineHuaScanout: apply imageId=%" PRIu64 " private=0x%" PRIxPTR
+              " scanout=0x%" PRIxPTR " gen=%" PRIu64,
+              image->base.id, (uintptr_t)image->winehua_private_image,
+              (uintptr_t)scanout, image->winehua_scanout_generation);
+   }
+   return 0;
+}
+
+int
+vkr_image_clear_scanout_backing(struct vkr_image *image)
+{
+   if (!image)
+      return -EINVAL;
+   if (!image->winehua_private_image ||
+       image->base.handle.image == image->winehua_private_image)
+      return 0;
+
+   struct vkr_device *dev = image->device;
+   const VkImage private_image = image->winehua_private_image;
+   vkr_image_bind_host(image, private_image);
+   if (!dev)
+      return 0;
+
+   mtx_lock(&dev->object_mutex);
+   list_for_each_entry (struct vkr_object, obj, &dev->objects, track_head) {
+      if (obj->type != VK_OBJECT_TYPE_IMAGE_VIEW)
+         continue;
+      struct vkr_image_view *view = (struct vkr_image_view *)obj;
+      if (view->image != image)
+         continue;
+      if (view->winehua_private_view)
+         view->base.handle.image_view = view->winehua_private_view;
+      view->winehua_bound_image = private_image;
+      for (uint32_t i = 0; i < view->winehua_scanout_view_count; i++) {
+         VkImageView extra = view->winehua_scanout_views[i].view;
+         if (extra && extra != view->winehua_private_view)
+            dev->proc_table.DestroyImageView(dev->base.handle.device, extra, NULL);
+         view->winehua_scanout_views[i].image = VK_NULL_HANDLE;
+         view->winehua_scanout_views[i].view = VK_NULL_HANDLE;
+      }
+      view->winehua_scanout_view_count = 0;
+   }
+   list_for_each_entry (struct vkr_object, obj, &dev->objects, track_head) {
+      if (obj->type != VK_OBJECT_TYPE_FRAMEBUFFER)
+         continue;
+      struct vkr_framebuffer *fb = (struct vkr_framebuffer *)obj;
+      if (!fb->winehua_create_info_valid)
+         continue;
+      bool uses_image = false;
+      for (uint32_t i = 0; i < fb->winehua_attachment_count; i++) {
+         struct vkr_image_view *view = fb->winehua_attachments[i];
+         if (view && view->image == image) {
+            uses_image = true;
+            break;
+         }
+      }
+      if (!uses_image)
+         continue;
+      if (fb->winehua_private_fb)
+         fb->base.handle.framebuffer = fb->winehua_private_fb;
+      for (uint32_t i = 0; i < fb->winehua_scanout_fb_count; i++) {
+         VkFramebuffer extra = fb->winehua_scanout_fbs[i].fb;
+         if (extra && extra != fb->winehua_private_fb)
+            dev->proc_table.DestroyFramebuffer(dev->base.handle.device, extra, NULL);
+         memset(&fb->winehua_scanout_fbs[i], 0, sizeof(fb->winehua_scanout_fbs[i]));
+      }
+      fb->winehua_scanout_fb_count = 0;
+   }
+   mtx_unlock(&dev->object_mutex);
+   vkr_log("WineHuaScanout: clear imageId=%" PRIu64 " private=0x%" PRIxPTR,
+           image->base.id, (uintptr_t)private_image);
+   return 0;
+}
+
+void
+vkr_image_prepare_destroy(struct vkr_image *image)
+{
+   if (!image)
+      return;
+   vkr_image_clear_scanout_backing(image);
+}
+
+void
+vkr_image_view_prepare_destroy(struct vkr_image_view *view)
+{
+   if (!view || !view->image || !view->image->device)
+      return;
+   struct vkr_device *dev = view->image->device;
+   if (view->winehua_private_view)
+      view->base.handle.image_view = view->winehua_private_view;
+   for (uint32_t i = 0; i < view->winehua_scanout_view_count; i++) {
+      VkImageView extra = view->winehua_scanout_views[i].view;
+      if (extra && extra != view->winehua_private_view)
+         dev->proc_table.DestroyImageView(dev->base.handle.device, extra, NULL);
+      view->winehua_scanout_views[i].view = VK_NULL_HANDLE;
+   }
+   view->winehua_scanout_view_count = 0;
+}
+#endif
 
 static void
 vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
@@ -63,6 +350,15 @@ vkr_dispatch_vkCreateImage(struct vn_dispatch_context *dispatch,
    const VkImageCreateInfo *guest_info = args->pCreateInfo;
    const VkImageCreateInfo create_info = *args->pCreateInfo;
    VkImageCreateInfo host_info = create_info;
+#ifdef __OHOS__
+   if (create_info.samples == VK_SAMPLE_COUNT_2_BIT) {
+      /* Legal CreateImage error; FORMAT_NOT_SUPPORTED is not. */
+      args->ret = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      if (args->pImage)
+         *args->pImage = VK_NULL_HANDLE;
+      return;
+   }
+#endif
 #ifdef __OHOS__
    const bool remap_bgra_array =
       vkr_winehua_option_enabled("VKR_WINEHUA_BGRA_ARRAY_RGBA") &&
@@ -106,6 +402,10 @@ static void
 vkr_dispatch_vkDestroyImage(struct vn_dispatch_context *dispatch,
                             struct vn_command_vkDestroyImage *args)
 {
+#ifdef __OHOS__
+   struct vkr_image *image = vkr_image_from_handle(args->image);
+   vkr_image_prepare_destroy(image);
+#endif
    vkr_image_destroy_and_remove(dispatch->data, args);
 }
 
@@ -260,6 +560,13 @@ vkr_dispatch_vkCreateImageView(struct vn_dispatch_context *dispatch,
       return;
 
    view->image = image;
+#ifdef __OHOS__
+   view->winehua_create_info = host_info;
+   view->winehua_create_info.pNext = NULL;
+   view->winehua_create_info_valid = true;
+   view->winehua_bound_image = image ? image->base.handle.image : VK_NULL_HANDLE;
+   view->winehua_private_view = view->base.handle.image_view;
+#endif
    {
       if (vkr_winehua_option_enabled("WINEHUA_VKR_TRACE_SAMPLED")) {
          vkr_log("WineHuaSampled: host-image-view guestView=%" PRIu64 " "
@@ -286,6 +593,10 @@ static void
 vkr_dispatch_vkDestroyImageView(struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkDestroyImageView *args)
 {
+#ifdef __OHOS__
+   struct vkr_image_view *view = vkr_image_view_from_handle(args->imageView);
+   vkr_image_view_prepare_destroy(view);
+#endif
    vkr_image_view_destroy_and_remove(dispatch->data, args);
 }
 

@@ -11,6 +11,34 @@
 #include "vkr_device.h"
 #include "vkr_instance.h"
 
+#ifdef __OHOS__
+/* Maleoon advertises 2x color MSAA; Heaven/DX11 2x render targets crash.
+ * Keep 1x and 4x (the D3D11 smoke resolve path). */
+static void
+vkr_winehua_mask_msaa2(VkImageFormatProperties *props)
+{
+   if (props)
+      props->sampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+}
+
+static void
+vkr_winehua_mask_msaa2_limits(VkPhysicalDeviceLimits *limits)
+{
+   if (!limits)
+      return;
+   limits->framebufferColorSampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+   limits->framebufferDepthSampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+   limits->framebufferStencilSampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+   limits->framebufferNoAttachmentsSampleCounts &=
+      ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+   limits->sampledImageColorSampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+   limits->sampledImageIntegerSampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+   limits->sampledImageDepthSampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+   limits->sampledImageStencilSampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+   limits->storageImageSampleCounts &= ~(VkSampleCountFlags)VK_SAMPLE_COUNT_2_BIT;
+}
+#endif
+
 #ifdef HAVE_LINUX_UDMABUF_H
 #include <fcntl.h>
 
@@ -368,6 +396,7 @@ vkr_physical_device_init_properties(struct vkr_physical_device *physical_dev)
    VkPhysicalDeviceProperties *props = &physical_dev->properties;
    props->apiVersion = vkr_api_version_cap_minor(props->apiVersion, VKR_MAX_API_VERSION);
 #ifdef __OHOS__
+   vkr_winehua_mask_msaa2_limits(&props->limits);
    /* Host-visible shadow allocations are not an ordinary Vulkan buffer
     * upload path.  A vendor/name match cannot prove that GPU-side shadow
     * uploads preserve dynamic mapped-memory visibility.  Keep CPU mapped
@@ -678,6 +707,10 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties(
    args->ret = vk->GetPhysicalDeviceImageFormatProperties(
       args->physicalDevice, args->format, args->type, args->tiling, args->usage,
       args->flags, args->pImageFormatProperties);
+#ifdef __OHOS__
+   if (args->ret == VK_SUCCESS)
+      vkr_winehua_mask_msaa2(args->pImageFormatProperties);
+#endif
 }
 
 static void
@@ -719,6 +752,10 @@ vkr_dispatch_vkGetPhysicalDeviceProperties2(
 
    vn_replace_vkGetPhysicalDeviceProperties2_args_handle(args);
    vk->GetPhysicalDeviceProperties2(args->physicalDevice, args->pProperties);
+#ifdef __OHOS__
+   if (args->pProperties)
+      vkr_winehua_mask_msaa2_limits(&args->pProperties->properties.limits);
+#endif
 }
 
 static void
@@ -783,6 +820,10 @@ vkr_dispatch_vkGetPhysicalDeviceImageFormatProperties2(
    vn_replace_vkGetPhysicalDeviceImageFormatProperties2_args_handle(args);
    args->ret = vk->GetPhysicalDeviceImageFormatProperties2(
       args->physicalDevice, args->pImageFormatInfo, args->pImageFormatProperties);
+#ifdef __OHOS__
+   if (args->ret == VK_SUCCESS && args->pImageFormatProperties)
+      vkr_winehua_mask_msaa2(&args->pImageFormatProperties->imageFormatProperties);
+#endif
 }
 
 static void

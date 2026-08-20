@@ -119,6 +119,71 @@ vkr_winehua_ubo_bound_trace_allow(void)
 }
 
 static void
+vkr_winehua_note_image_write(struct vkr_image *image, bool full, const char *op)
+{
+   if (!image)
+      return;
+   image->winehua_last_write_image = image->base.handle.image;
+   image->winehua_last_write_full_cover = full ? 1u : 0u;
+   image->winehua_last_write_op = op;
+   image->winehua_write_epoch++;
+}
+
+static void
+vkr_winehua_note_view_write(struct vkr_image_view *view, bool full, const char *op)
+{
+   if (!view || !view->image)
+      return;
+   view->image->winehua_last_write_image =
+      view->winehua_bound_image ? view->winehua_bound_image
+                                : view->image->base.handle.image;
+   view->image->winehua_last_write_full_cover = full ? 1u : 0u;
+   view->image->winehua_last_write_op = op;
+   view->image->winehua_write_epoch++;
+}
+
+static bool
+vkr_winehua_render_area_full(const struct vkr_image *image, const VkRect2D *area)
+{
+   if (!image || !area)
+      return false;
+   return area->offset.x == 0 && area->offset.y == 0 &&
+      area->extent.width >= image->extent.width &&
+      area->extent.height >= image->extent.height;
+}
+
+static bool
+vkr_winehua_copy_full(const struct vkr_image *image,
+                      VkOffset3D offset,
+                      VkExtent3D extent,
+                      const VkImageSubresourceLayers *sub)
+{
+   if (!image || !sub)
+      return false;
+   return offset.x == 0 && offset.y == 0 && offset.z == 0 &&
+      extent.width == image->extent.width &&
+      extent.height == image->extent.height &&
+      sub->mipLevel == 0 && sub->baseArrayLayer == 0 &&
+      sub->layerCount >= 1;
+}
+
+static void
+vkr_winehua_note_framebuffer_writes(struct vkr_framebuffer *fb,
+                                    const VkRect2D *area,
+                                    const char *op)
+{
+   if (!fb || !fb->winehua_create_info_valid)
+      return;
+   for (uint32_t i = 0; i < fb->winehua_attachment_count; i++) {
+      struct vkr_image_view *view = fb->winehua_attachments[i];
+      if (!view || !view->image)
+         continue;
+      vkr_winehua_note_view_write(
+         view, vkr_winehua_render_area_full(view->image, area), op);
+   }
+}
+
+static void
 vkr_winehua_log_bound_ubo(struct vkr_command_buffer *cmd,
                           struct vkr_descriptor_set *set)
 {
@@ -820,6 +885,16 @@ static void
 vkr_dispatch_vkCmdCopyImage(UNUSED struct vn_dispatch_context *dispatch,
                             struct vn_command_vkCmdCopyImage *args)
 {
+#ifdef __OHOS__
+   struct vkr_image *dst = vkr_image_from_handle(args->dstImage);
+   bool full = false;
+   if (dst && args->regionCount && args->pRegions)
+      full = vkr_winehua_copy_full(dst, args->pRegions[0].dstOffset,
+                                   args->pRegions[0].extent,
+                                   &args->pRegions[0].dstSubresource) &&
+             args->regionCount == 1;
+   vkr_winehua_note_image_write(dst, full, "COPY");
+#endif
    VKR_CMD_CALL(CmdCopyImage, args, args->srcImage, args->srcImageLayout, args->dstImage,
                 args->dstImageLayout, args->regionCount, args->pRegions);
 }
@@ -828,6 +903,19 @@ static void
 vkr_dispatch_vkCmdCopyImage2(UNUSED struct vn_dispatch_context *dispatch,
                              struct vn_command_vkCmdCopyImage2 *args)
 {
+#ifdef __OHOS__
+   const VkCopyImageInfo2 *info = args->pCopyImageInfo;
+   if (info) {
+      struct vkr_image *dst = vkr_image_from_handle(info->dstImage);
+      bool full = false;
+      if (dst && info->regionCount && info->pRegions)
+         full = vkr_winehua_copy_full(dst, info->pRegions[0].dstOffset,
+                                      info->pRegions[0].extent,
+                                      &info->pRegions[0].dstSubresource) &&
+                info->regionCount == 1;
+      vkr_winehua_note_image_write(dst, full, "COPY2");
+   }
+#endif
    VKR_CMD_CALL(CmdCopyImage2, args, args->pCopyImageInfo);
 }
 
@@ -835,6 +923,18 @@ static void
 vkr_dispatch_vkCmdBlitImage(UNUSED struct vn_dispatch_context *dispatch,
                             struct vn_command_vkCmdBlitImage *args)
 {
+#ifdef __OHOS__
+   struct vkr_image *dst = vkr_image_from_handle(args->dstImage);
+   bool full = false;
+   if (dst && args->regionCount == 1 && args->pRegions) {
+      const VkImageBlit *r = &args->pRegions[0];
+      full = r->dstOffsets[0].x == 0 && r->dstOffsets[0].y == 0 &&
+         r->dstOffsets[1].x == (int32_t)dst->extent.width &&
+         r->dstOffsets[1].y == (int32_t)dst->extent.height &&
+         r->dstSubresource.mipLevel == 0;
+   }
+   vkr_winehua_note_image_write(dst, full, "BLIT");
+#endif
    VKR_CMD_CALL(CmdBlitImage, args, args->srcImage, args->srcImageLayout, args->dstImage,
                 args->dstImageLayout, args->regionCount, args->pRegions, args->filter);
 }
@@ -843,6 +943,20 @@ static void
 vkr_dispatch_vkCmdBlitImage2(UNUSED struct vn_dispatch_context *dispatch,
                              struct vn_command_vkCmdBlitImage2 *args)
 {
+#ifdef __OHOS__
+   const VkBlitImageInfo2 *info = args->pBlitImageInfo;
+   if (info) {
+      struct vkr_image *dst = vkr_image_from_handle(info->dstImage);
+      bool full = false;
+      if (dst && info->regionCount == 1 && info->pRegions) {
+         const VkImageBlit2 *r = &info->pRegions[0];
+         full = r->dstOffsets[0].x == 0 && r->dstOffsets[0].y == 0 &&
+            r->dstOffsets[1].x == (int32_t)dst->extent.width &&
+            r->dstOffsets[1].y == (int32_t)dst->extent.height;
+      }
+      vkr_winehua_note_image_write(dst, full, "BLIT2");
+   }
+#endif
    VKR_CMD_CALL(CmdBlitImage2, args, args->pBlitImageInfo);
 }
 
@@ -856,6 +970,9 @@ vkr_dispatch_vkCmdCopyBufferToImage(UNUSED struct vn_dispatch_context *dispatch,
       vkr_buffer_from_handle(args->srcBuffer),
       vkr_image_from_handle(args->dstImage), args->dstImageLayout,
       args->regionCount, args->pRegions);
+#ifdef __OHOS__
+   vkr_winehua_note_image_write(vkr_image_from_handle(args->dstImage), false, "UPLOAD");
+#endif
    VKR_CMD_CALL(CmdCopyBufferToImage, args, args->srcBuffer, args->dstImage,
                 args->dstImageLayout, args->regionCount, args->pRegions);
 }
@@ -888,6 +1005,11 @@ vkr_dispatch_vkCmdCopyBufferToImage2(UNUSED struct vn_dispatch_context *dispatch
             "copy-buffer-to-image2", cmd, buffer, image,
             info->dstImageLayout, 1, &region);
       }
+   }
+   if (args->pCopyBufferToImageInfo) {
+      vkr_winehua_note_image_write(
+         vkr_image_from_handle(args->pCopyBufferToImageInfo->dstImage),
+         false, "UPLOAD2");
    }
 #endif
    VKR_CMD_CALL(CmdCopyBufferToImage2, args, args->pCopyBufferToImageInfo);
@@ -934,6 +1056,9 @@ static void
 vkr_dispatch_vkCmdClearColorImage(UNUSED struct vn_dispatch_context *dispatch,
                                   struct vn_command_vkCmdClearColorImage *args)
 {
+#ifdef __OHOS__
+   vkr_winehua_note_image_write(vkr_image_from_handle(args->image), true, "CLEAR");
+#endif
    VKR_CMD_CALL(CmdClearColorImage, args, args->image, args->imageLayout, args->pColor,
                 args->rangeCount, args->pRanges);
 }
@@ -959,6 +1084,15 @@ static void
 vkr_dispatch_vkCmdResolveImage(UNUSED struct vn_dispatch_context *dispatch,
                                struct vn_command_vkCmdResolveImage *args)
 {
+#ifdef __OHOS__
+   struct vkr_image *dst = vkr_image_from_handle(args->dstImage);
+   bool full = false;
+   if (dst && args->regionCount == 1 && args->pRegions)
+      full = vkr_winehua_copy_full(dst, args->pRegions[0].dstOffset,
+                                   args->pRegions[0].extent,
+                                   &args->pRegions[0].dstSubresource);
+   vkr_winehua_note_image_write(dst, full, "RESOLVE");
+#endif
    VKR_CMD_CALL(CmdResolveImage, args, args->srcImage, args->srcImageLayout,
                 args->dstImage, args->dstImageLayout, args->regionCount, args->pRegions);
 }
@@ -967,6 +1101,18 @@ static void
 vkr_dispatch_vkCmdResolveImage2(UNUSED struct vn_dispatch_context *dispatch,
                                 struct vn_command_vkCmdResolveImage2 *args)
 {
+#ifdef __OHOS__
+   const VkResolveImageInfo2 *info = args->pResolveImageInfo;
+   if (info) {
+      struct vkr_image *dst = vkr_image_from_handle(info->dstImage);
+      bool full = false;
+      if (dst && info->regionCount == 1 && info->pRegions)
+         full = vkr_winehua_copy_full(dst, info->pRegions[0].dstOffset,
+                                      info->pRegions[0].extent,
+                                      &info->pRegions[0].dstSubresource);
+      vkr_winehua_note_image_write(dst, full, "RESOLVE2");
+   }
+#endif
    VKR_CMD_CALL(CmdResolveImage2, args, args->pResolveImageInfo);
 }
 
@@ -1131,6 +1277,14 @@ vkr_dispatch_vkCmdBeginRenderPass(UNUSED struct vn_dispatch_context *dispatch,
               begin ? begin->renderArea.extent.height : 0,
               begin ? begin->clearValueCount : 0, args->contents);
    }
+#ifdef __OHOS__
+   if (args->pRenderPassBegin) {
+      struct vkr_framebuffer *fb =
+         vkr_framebuffer_from_handle(args->pRenderPassBegin->framebuffer);
+      vkr_winehua_note_framebuffer_writes(
+         fb, &args->pRenderPassBegin->renderArea, "RP");
+   }
+#endif
    VKR_CMD_CALL(CmdBeginRenderPass, args, args->pRenderPassBegin, args->contents);
 }
 
@@ -1205,6 +1359,14 @@ vkr_dispatch_vkCmdBeginRenderPass2(UNUSED struct vn_dispatch_context *dispatch,
               begin ? begin->renderArea.extent.height : 0,
               begin ? begin->clearValueCount : 0);
    }
+#ifdef __OHOS__
+   if (args->pRenderPassBegin) {
+      struct vkr_framebuffer *fb =
+         vkr_framebuffer_from_handle(args->pRenderPassBegin->framebuffer);
+      vkr_winehua_note_framebuffer_writes(
+         fb, &args->pRenderPassBegin->renderArea, "RP2");
+   }
+#endif
    VKR_CMD_CALL(CmdBeginRenderPass2, args, args->pRenderPassBegin,
                 args->pSubpassBeginInfo);
 }
@@ -1541,6 +1703,27 @@ vkr_dispatch_vkCmdBeginRendering(UNUSED struct vn_dispatch_context *ctx,
          }
       }
    }
+#ifdef __OHOS__
+   if (args->pRenderingInfo) {
+      const VkRenderingInfo *info = args->pRenderingInfo;
+      for (uint32_t i = 0; i < info->colorAttachmentCount; i++) {
+         const VkRenderingAttachmentInfo *attachment = &info->pColorAttachments[i];
+         struct vkr_image_view *view = attachment->imageView
+            ? vkr_image_view_from_handle(attachment->imageView) : NULL;
+         struct vkr_image_view *resolve = attachment->resolveImageView
+            ? vkr_image_view_from_handle(attachment->resolveImageView) : NULL;
+         const bool full = view && view->image &&
+            vkr_winehua_render_area_full(view->image, &info->renderArea);
+         vkr_winehua_note_view_write(view, full, "DYN");
+         if (resolve)
+            vkr_winehua_note_view_write(
+               resolve,
+               resolve->image &&
+                  vkr_winehua_render_area_full(resolve->image, &info->renderArea),
+               "RESOLVE");
+      }
+   }
+#endif
    VKR_CMD_CALL(CmdBeginRendering, args, args->pRenderingInfo);
 }
 

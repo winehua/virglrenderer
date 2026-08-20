@@ -63,6 +63,16 @@
 
 VIRGL_EXPORT void
 virgl_renderer_winehua_set_color_remap(uint32_t src_tex, uint32_t dst_tex);
+VIRGL_EXPORT void
+virgl_renderer_winehua_fbtrace_present(uint32_t flush_res, uint32_t tex_id);
+VIRGL_EXPORT int
+virgl_renderer_winehua_set_scanout_backing(uint32_t res_handle, uint32_t gl_id,
+                                           void *egl_image);
+VIRGL_EXPORT int
+virgl_renderer_winehua_clear_scanout_backing(uint32_t res_handle);
+VIRGL_EXPORT int
+virgl_renderer_winehua_scanout_last_write(uint32_t res_handle, uint32_t *dst_gl,
+                                          uint32_t *full_cover, const char **op);
 
 #ifdef ENABLE_VENUS
 /* Exported wrappers are called from the vtest shared library. Keep the
@@ -91,6 +101,13 @@ virgl_renderer_winehua_vk_present(uint32_t ctx_id,
                                   uint32_t serial,
                                   uint32_t flags,
                                   uint64_t *next_present_deadline_ns);
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_vk_set_scanout_backing(uint32_t ctx_id,
+                                              uint64_t scanout_image);
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_vk_clear_scanout_backing(uint32_t ctx_id);
 #endif
 
 struct global_state {
@@ -1669,6 +1686,52 @@ virgl_renderer_winehua_set_color_remap(uint32_t src_tex, uint32_t dst_tex)
    vrend_winehua_set_color_remap(src_tex, dst_tex);
 }
 
+VIRGL_EXPORT void
+virgl_renderer_winehua_fbtrace_present(uint32_t flush_res, uint32_t tex_id)
+{
+   vrend_winehua_fbtrace_present(flush_res, tex_id);
+}
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_set_scanout_backing(uint32_t res_handle, uint32_t gl_id,
+                                           void *egl_image)
+{
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res || !res->pipe_resource)
+      return -EINVAL;
+   return vrend_resource_set_scanout_backing(
+      (struct vrend_resource *)res->pipe_resource, gl_id, egl_image);
+}
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_clear_scanout_backing(uint32_t res_handle)
+{
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res || !res->pipe_resource)
+      return -EINVAL;
+   return vrend_resource_clear_scanout_backing(
+      (struct vrend_resource *)res->pipe_resource);
+}
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_scanout_last_write(uint32_t res_handle, uint32_t *dst_gl,
+                                          uint32_t *full_cover, const char **op)
+{
+   return vrend_winehua_scanout_last_write(res_handle, dst_gl, full_cover, op);
+}
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_scanout_generation(uint32_t res_handle,
+                                          uint64_t *requested, uint64_t *applied,
+                                          uint32_t *draw_gl)
+{
+   struct virgl_resource *res = virgl_resource_lookup(res_handle);
+   if (!res || !res->pipe_resource)
+      return -EINVAL;
+   return vrend_resource_scanout_generation(
+      (struct vrend_resource *)res->pipe_resource, requested, applied, draw_gl);
+}
+
 
 #ifdef ENABLE_VENUS
 VIRGL_EXPORT void
@@ -1704,5 +1767,17 @@ virgl_renderer_winehua_vk_present(uint32_t ctx_id,
    return vkr_renderer_winehua_present(
       ctx_id, queue_id, image_id, width, height, format, layout, client_pid,
       surface_id, serial, flags, next_present_deadline_ns);
+}
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_vk_set_scanout_backing(uint32_t ctx_id, uint64_t scanout_image)
+{
+   return vkr_renderer_winehua_set_scanout_backing(ctx_id, scanout_image);
+}
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_vk_clear_scanout_backing(uint32_t ctx_id)
+{
+   return vkr_renderer_winehua_clear_scanout_backing(ctx_id);
 }
 #endif

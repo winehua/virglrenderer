@@ -520,6 +520,22 @@ VIRGL_EXPORT int virgl_renderer_get_dev_fd(int ctx_id);
 extern "C" {
 #endif
 VIRGL_EXPORT void virgl_renderer_winehua_set_color_remap(uint32_t src_tex, uint32_t dst_tex);
+VIRGL_EXPORT void virgl_renderer_winehua_fbtrace_present(uint32_t flush_res, uint32_t tex_id);
+VIRGL_EXPORT int virgl_renderer_winehua_set_scanout_backing(uint32_t res_handle,
+                                                            uint32_t gl_id,
+                                                            void *egl_image);
+VIRGL_EXPORT int virgl_renderer_winehua_clear_scanout_backing(uint32_t res_handle);
+VIRGL_EXPORT int virgl_renderer_winehua_scanout_last_write(uint32_t res_handle,
+                                                           uint32_t *dst_gl,
+                                                           uint32_t *full_cover,
+                                                           const char **op);
+VIRGL_EXPORT int virgl_renderer_winehua_scanout_generation(uint32_t res_handle,
+                                                           uint64_t *requested,
+                                                           uint64_t *applied,
+                                                           uint32_t *draw_gl);
+VIRGL_EXPORT int virgl_renderer_winehua_vk_set_scanout_backing(uint32_t ctx_id,
+                                                               uint64_t scanout_image);
+VIRGL_EXPORT int virgl_renderer_winehua_vk_clear_scanout_backing(uint32_t ctx_id);
 #ifdef __cplusplus
 }
 #endif

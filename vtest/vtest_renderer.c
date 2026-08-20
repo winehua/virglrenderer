@@ -64,6 +64,7 @@ extern int virgl_renderer_winehua_vk_present(
    uint32_t client_pid, uint32_t surface_id, uint32_t serial,
    uint32_t flags, uint64_t *next_present_deadline_ns);
 #endif
+void virgl_renderer_winehua_fbtrace_present(uint32_t flush_res, uint32_t tex_id);
 #include "vtest_shm.h"
 #include "vtest_protocol.h"
 #include "threadpool.h"
@@ -1106,8 +1107,9 @@ int vtest_winehua_present(uint32_t length_dw)
       info.height == command[VCMD_WINEHUA_PRESENT_HEIGHT] &&
       info.tex_id != 0;
    if (payload_matches && winehua_present_callback) {
+      virgl_renderer_winehua_fbtrace_present(res->res_id, info.tex_id);
       callback_ret = winehua_present_callback(
-         info.tex_id, info.width, info.height, info.virgl_format, info.flags,
+         info.tex_id, res->res_id, info.width, info.height, info.virgl_format, info.flags,
          drawable, command[VCMD_WINEHUA_PRESENT_SERIAL],
          command[VCMD_WINEHUA_PRESENT_CLIENT_PID],
          command[VCMD_WINEHUA_PRESENT_SURFACE_ID],

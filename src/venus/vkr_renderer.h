@@ -88,6 +88,12 @@ vkr_renderer_winehua_release_device(uint32_t ctx_id,
                                     int32_t wait_result);
 
 int
+vkr_renderer_winehua_set_scanout_backing(uint32_t ctx_id, uint64_t scanout_image);
+
+int
+vkr_renderer_winehua_clear_scanout_backing(uint32_t ctx_id);
+
+int
 vkr_renderer_winehua_present(uint32_t ctx_id,
                              uint64_t queue_id,
                              uint64_t image_id,

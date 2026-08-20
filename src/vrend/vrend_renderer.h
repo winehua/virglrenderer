@@ -113,6 +113,14 @@ struct vrend_resource {
    GLuint memobj;
 
    uint32_t blob_id;
+   /* Guest/virgl resource handle. Stamped when the resource is attached to a
+    * vrend context. Used as the stable identity for scanout tracing; gl_id is
+    * only a host GL name and can change when backing is replaced. */
+   uint32_t winehua_res_id;
+   GLuint winehua_private_gl_id;
+   uint64_t scanout_generation;
+   uint64_t scanout_generation_requested;
+   uint64_t scanout_generation_applied;
    struct list_head head;
 };
 
@@ -448,6 +456,15 @@ void vrend_fb_bind_texture_id(struct vrend_resource *res,
                               GLint layer, uint32_t samples);
 
 void vrend_winehua_set_color_remap(GLuint src_tex, GLuint dst_tex);
+void vrend_winehua_fbtrace_present(uint32_t flush_res, GLuint tex_id);
+int vrend_resource_set_scanout_backing(struct vrend_resource *res,
+                                       GLuint gl_id, void *egl_image);
+int vrend_resource_clear_scanout_backing(struct vrend_resource *res);
+int vrend_winehua_scanout_last_write(uint32_t res_handle, uint32_t *dst_gl,
+                                     uint32_t *full_cover, const char **op);
+int vrend_resource_scanout_generation(struct vrend_resource *res,
+                                      uint64_t *requested, uint64_t *applied,
+                                      uint32_t *draw_gl);
 
 void vrend_set_tess_state(struct vrend_context *ctx, const float tess_factors[6]);
 

@@ -205,12 +205,43 @@ static void
 vkr_dispatch_vkCreateFramebuffer(struct vn_dispatch_context *dispatch,
                                  struct vn_command_vkCreateFramebuffer *args)
 {
+   const VkFramebufferCreateInfo *info = args->pCreateInfo;
+#ifdef __OHOS__
+   struct vkr_image_view *views[8] = { 0 };
+   const bool store =
+      info &&
+      !(info->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT) &&
+      info->attachmentCount <= 8;
+   uint32_t stored = 0;
+   VkRenderPass host_pass = VK_NULL_HANDLE;
+   if (store) {
+      const struct vkr_render_pass *pass =
+         vkr_render_pass_from_handle(info->renderPass);
+      host_pass = pass ? pass->base.handle.render_pass : VK_NULL_HANDLE;
+      stored = info->attachmentCount;
+      for (uint32_t i = 0; i < stored; i++)
+         views[i] = vkr_image_view_from_handle(info->pAttachments[i]);
+   }
+#endif
    if (!vkr_winehua_render_trace_enabled()) {
-      vkr_framebuffer_create_and_add(dispatch->data, args);
+      struct vkr_framebuffer *framebuffer =
+         vkr_framebuffer_create_and_add(dispatch->data, args);
+#ifdef __OHOS__
+      if (framebuffer && store) {
+         framebuffer->winehua_create_info_valid = true;
+         framebuffer->winehua_attachment_count = stored;
+         memcpy(framebuffer->winehua_attachments, views,
+                sizeof(framebuffer->winehua_attachments));
+         framebuffer->winehua_render_pass = host_pass;
+         framebuffer->winehua_width = info->width;
+         framebuffer->winehua_height = info->height;
+         framebuffer->winehua_layers = info->layers;
+         framebuffer->winehua_private_fb = framebuffer->base.handle.framebuffer;
+      }
+#endif
       return;
    }
 
-   const VkFramebufferCreateInfo *info = args->pCreateInfo;
    const struct vkr_render_pass *pass = vkr_render_pass_from_handle(info->renderPass);
    const uint64_t render_pass_id = pass ? pass->base.id : 0;
    const uintptr_t host_render_pass =
@@ -238,8 +269,21 @@ vkr_dispatch_vkCreateFramebuffer(struct vn_dispatch_context *dispatch,
    const uint32_t width = info->width;
    const uint32_t height = info->height;
    const uint32_t layers = info->layers;
-   const struct vkr_framebuffer *framebuffer =
+   struct vkr_framebuffer *framebuffer =
       vkr_framebuffer_create_and_add(dispatch->data, args);
+#ifdef __OHOS__
+   if (framebuffer && store) {
+      framebuffer->winehua_create_info_valid = true;
+      framebuffer->winehua_attachment_count = stored;
+      memcpy(framebuffer->winehua_attachments, views,
+             sizeof(framebuffer->winehua_attachments));
+      framebuffer->winehua_render_pass = host_pass;
+      framebuffer->winehua_width = info->width;
+      framebuffer->winehua_height = info->height;
+      framebuffer->winehua_layers = info->layers;
+      framebuffer->winehua_private_fb = framebuffer->base.handle.framebuffer;
+   }
+#endif
    vkr_winehua_log_framebuffer_create(framebuffer, render_pass_id,
                                       host_render_pass, attachment_count,
                                       width, height, layers, attachments);
