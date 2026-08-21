@@ -254,7 +254,8 @@ vkr_winehua_track_ubo_mappings(struct vkr_context *ctx,
    mtx_lock(&ctx->object_mutex);
    for (uint32_t i = 0; i < write_count; i++) {
       const VkWriteDescriptorSet *write = &writes[i];
-      if ((write->dstBinding != 3 && write->dstBinding != 4) ||
+      if ((write->dstBinding != 0 && write->dstBinding != 3 &&
+           write->dstBinding != 4) ||
           !write->pBufferInfo ||
           (write->descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
            write->descriptorType != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC))
@@ -268,10 +269,11 @@ vkr_winehua_track_ubo_mappings(struct vkr_context *ctx,
             ? vkr_buffer_from_handle(info->buffer) : NULL;
          struct vkr_device_memory *mem = buffer ? buffer->bound_memory : NULL;
          if (!set || !buffer || !mem ||
-             (info->range != 48 && info->range != 1536))
+             (info->range != 48 && info->range != 64 &&
+              info->range != 1536))
             continue;
 
-         const uint32_t binding_index = write->dstBinding - 3;
+         const uint32_t binding_index = write->dstBinding == 4 ? 1 : 0;
          const uint32_t array_element = write->dstArrayElement + j;
          struct vkr_winehua_ubo_binding *state =
             &set->winehua_ubo_bindings[binding_index];
@@ -302,6 +304,7 @@ vkr_winehua_track_ubo_mappings(struct vkr_context *ctx,
          state->buffer_id = buffer->base.id;
          state->offset = info->offset;
          state->size = info->range;
+         state->binding = write->dstBinding;
          state->array_element = array_element;
          state->descriptor_type = write->descriptorType;
          state->valid = true;
@@ -527,7 +530,25 @@ vkr_dispatch_vkCreateDescriptorSetLayout(
    struct vn_dispatch_context *dispatch,
    struct vn_command_vkCreateDescriptorSetLayout *args)
 {
+#ifdef __OHOS__
+   const char *gate_c_trace = os_get_option("WINEHUA_VKD3D_GATE_C_TRACE");
+   const bool trace = gate_c_trace && gate_c_trace[0] == '1' && !gate_c_trace[1];
+   const VkDescriptorSetLayout requested =
+      args->pSetLayout ? *args->pSetLayout : VK_NULL_HANDLE;
+   const VkDescriptorSetLayoutCreateInfo *info = args->pCreateInfo;
+
+   if (trace)
+      vkr_log("WineHuaDescriptorSetLayout: create requested object=%" PRIu64
+              " flags=0x%x bindings=%u",
+              (uint64_t)(uintptr_t)requested, info ? info->flags : 0,
+              info ? info->bindingCount : 0);
+#endif
    vkr_descriptor_set_layout_create_and_add(dispatch->data, args);
+#ifdef __OHOS__
+   if (trace)
+      vkr_log("WineHuaDescriptorSetLayout: create result=%d object=%" PRIu64,
+              args->ret, (uint64_t)(uintptr_t)requested);
+#endif
 }
 
 static void

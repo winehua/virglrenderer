@@ -26,6 +26,7 @@
 #define VTEST_SERVER_H
 
 int vtest_main(int argc, char **argv);
+void vtest_server_reset_stop_request(void);
+int vtest_server_request_stop(void);
 
 #endif
-

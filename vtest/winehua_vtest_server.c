@@ -16,6 +16,8 @@ extern void virgl_renderer_set_winehua_vk_device_release_callback(
 #endif
 
 __attribute__((visibility("default"))) int winehua_vtest_main(int argc, char **argv);
+__attribute__((visibility("default"))) void winehua_vtest_reset_stop_request(void);
+__attribute__((visibility("default"))) int winehua_vtest_request_stop(void);
 __attribute__((visibility("default"))) void winehua_vtest_set_present_callback(
    vtest_winehua_present_callback callback, void *user_data);
 #ifdef ENABLE_VENUS
@@ -28,6 +30,16 @@ __attribute__((visibility("default"))) void winehua_vtest_set_vulkan_device_rele
 int winehua_vtest_main(int argc, char **argv)
 {
    return vtest_main(argc, argv);
+}
+
+void winehua_vtest_reset_stop_request(void)
+{
+   vtest_server_reset_stop_request();
+}
+
+int winehua_vtest_request_stop(void)
+{
+   return vtest_server_request_stop();
 }
 
 void winehua_vtest_set_present_callback(

@@ -420,7 +420,7 @@ static inline void vn_encode_vkCreateDescriptorSetLayout_reply(struct vn_cs_enco
 static inline void vn_decode_vkDestroyDescriptorSetLayout_args_temp(struct vn_cs_decoder *dec, struct vn_command_vkDestroyDescriptorSetLayout *args)
 {
     vn_decode_VkDevice_lookup(dec, &args->device);
-    vn_decode_VkDescriptorSetLayout_lookup(dec, &args->descriptorSetLayout);
+    vn_decode_VkDescriptorSetLayout_destroy_lookup(dec, &args->descriptorSetLayout);
     if (vn_decode_simple_pointer(dec)) {
         vn_cs_decoder_set_fatal(dec);
     } else {

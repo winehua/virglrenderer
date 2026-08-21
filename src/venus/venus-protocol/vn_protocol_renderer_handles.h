@@ -433,6 +433,14 @@ vn_decode_VkPipeline_lookup(struct vn_cs_decoder *dec, VkPipeline *val)
 }
 
 static inline void
+vn_decode_VkPipeline_destroy_lookup(struct vn_cs_decoder *dec, VkPipeline *val)
+{
+    uint64_t id;
+    vn_decode_uint64_t(dec, &id);
+    *val = (VkPipeline)(uintptr_t)vn_cs_decoder_lookup_destroy_pipeline_object(dec, id);
+}
+
+static inline void
 vn_replace_VkPipeline_handle(VkPipeline *val)
 {
     *val = (VkPipeline)vn_cs_get_object_handle((const void **)val, VK_OBJECT_TYPE_PIPELINE);
@@ -554,6 +562,16 @@ vn_decode_VkDescriptorSetLayout_lookup(struct vn_cs_decoder *dec, VkDescriptorSe
     uint64_t id;
     vn_decode_uint64_t(dec, &id);
     *val = (VkDescriptorSetLayout)(uintptr_t)vn_cs_decoder_lookup_object(dec, id, VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT);
+}
+
+static inline void
+vn_decode_VkDescriptorSetLayout_destroy_lookup(struct vn_cs_decoder *dec,
+                                               VkDescriptorSetLayout *val)
+{
+    uint64_t id;
+    vn_decode_uint64_t(dec, &id);
+    *val = (VkDescriptorSetLayout)(uintptr_t)
+        vn_cs_decoder_lookup_destroy_descriptor_set_layout_object(dec, id);
 }
 
 static inline void

@@ -8,6 +8,12 @@
 
 #include "vkr_common.h"
 
+#ifdef __OHOS__
+struct vkr_context;
+bool vkr_context_take_winehua_gate_c_failed_compute_pipeline(
+   struct vkr_context *ctx, vkr_object_id id);
+#endif
+
 /* This is to avoid integer overflows and to catch bogus allocations (e.g.,
  * the guest driver encodes an uninitialized value).  In practice, the largest
  * allocations we've seen are from vkGetPipelineCacheData and are dozens of
@@ -61,6 +67,7 @@ struct vkr_cs_decoder_temp_pool {
 };
 
 struct vkr_cs_decoder {
+   struct vkr_context *ctx;
    const struct hash_table *object_table;
    mtx_t *object_mutex;
 
@@ -319,6 +326,79 @@ vkr_cs_decoder_lookup_object(const struct vkr_cs_decoder *dec,
       else
          vkr_log("failed to look up object %" PRIu64 " of type %d", id, type);
       vkr_cs_decoder_set_fatal(dec);
+   }
+
+   return obj;
+}
+
+static inline struct vkr_object *
+vkr_cs_decoder_lookup_destroy_pipeline_object(const struct vkr_cs_decoder *dec,
+                                              vkr_object_id id)
+{
+   struct vkr_object *obj;
+
+   if (!id)
+      return NULL;
+
+   mtx_lock(dec->object_mutex);
+   const struct hash_entry *entry =
+      _mesa_hash_table_search((struct hash_table *)dec->object_table, &id);
+   obj = likely(entry) ? entry->data : NULL;
+   mtx_unlock(dec->object_mutex);
+   if (!obj) {
+#ifdef __OHOS__
+      if (vkr_context_take_winehua_gate_c_failed_compute_pipeline(dec->ctx, id))
+         return NULL;
+#endif
+      vkr_log("failed to look up object %" PRIu64 " of type %d", id,
+              VK_OBJECT_TYPE_PIPELINE);
+      vkr_cs_decoder_set_fatal(dec);
+      return NULL;
+   }
+
+   if (unlikely(obj->type != VK_OBJECT_TYPE_PIPELINE)) {
+      vkr_log("object %" PRIu64 " has type %d, not %d", id, obj->type,
+              VK_OBJECT_TYPE_PIPELINE);
+      vkr_cs_decoder_set_fatal(dec);
+      return NULL;
+   }
+
+   return obj;
+}
+
+/* This records a Gate C decoder failure without weakening the normal object
+ * lookup.  A later probe can safely decide whether a matching, failed create
+ * needs a narrowly scoped cleanup exception. */
+static inline struct vkr_object *
+vkr_cs_decoder_lookup_destroy_descriptor_set_layout_object(
+   const struct vkr_cs_decoder *dec,
+   vkr_object_id id)
+{
+   struct vkr_object *obj;
+
+   if (!id)
+      return NULL;
+
+   mtx_lock(dec->object_mutex);
+   const struct hash_entry *entry =
+      _mesa_hash_table_search((struct hash_table *)dec->object_table, &id);
+   obj = likely(entry) ? entry->data : NULL;
+   mtx_unlock(dec->object_mutex);
+   if (unlikely(!obj || obj->type != VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT)) {
+#ifdef __OHOS__
+      const char *value = os_get_option("WINEHUA_VKD3D_GATE_C_TRACE");
+      if (value && value[0] == '1' && !value[1])
+         vkr_log("WineHuaDescriptorSetLayout: destroy lookup failed object=%"
+                 PRIu64 " actual_type=%d", id, obj ? obj->type : -1);
+#endif
+      if (obj)
+         vkr_log("object %" PRIu64 " has type %d, not %d", id, obj->type,
+                 VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT);
+      else
+         vkr_log("failed to look up object %" PRIu64 " of type %d", id,
+                 VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT);
+      vkr_cs_decoder_set_fatal(dec);
+      return NULL;
    }
 
    return obj;

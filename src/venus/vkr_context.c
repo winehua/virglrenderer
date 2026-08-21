@@ -42,6 +42,40 @@ vkr_winehua_resource_trace_enabled(void)
    return value && value[0] == '1';
 }
 
+#ifdef __OHOS__
+bool
+vkr_context_take_winehua_gate_c_failed_compute_pipeline(
+   struct vkr_context *ctx,
+   vkr_object_id id)
+{
+   const char *value = os_get_option("WINEHUA_VKD3D_GATE_C_TRACE");
+   struct vkr_winehua_failed_compute_pipelines *failed;
+   bool found = false;
+
+   if (!ctx || !id || !value || value[0] != '1' || value[1])
+      return false;
+
+   failed = &ctx->winehua_gate_c_failed_compute_pipelines;
+   mtx_lock(&ctx->object_mutex);
+   if (!_mesa_hash_table_search(ctx->object_table, &id)) {
+      for (uint32_t i = 0; i < failed->count; i++) {
+         if (failed->ids[i] != id)
+            continue;
+
+         failed->ids[i] = failed->ids[--failed->count];
+         found = true;
+         break;
+      }
+   }
+   mtx_unlock(&ctx->object_mutex);
+
+   if (found)
+      vkr_log("WineHuaPipeline: gate-c ignored destroy for failed compute "
+              "pipeline object=%" PRIu64, id);
+   return found;
+}
+#endif
+
 void
 vkr_context_add_instance(struct vkr_context *ctx,
                          struct vkr_instance *instance,
@@ -676,6 +710,7 @@ vkr_context_destroy(struct vkr_context *ctx)
    mtx_destroy(&ctx->resource_mutex);
 
 #ifdef __OHOS__
+   free(ctx->winehua_gate_c_failed_compute_pipelines.ids);
    mtx_destroy(&ctx->shadow_generation_mutex);
 #endif
 

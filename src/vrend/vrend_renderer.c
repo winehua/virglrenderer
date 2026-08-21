@@ -401,6 +401,7 @@ struct global_renderer_state {
 #ifdef HAVE_EPOXY_EGL_H
    bool use_egl_fence : 1;
 #endif
+   bool egl_image_srgb_import : 1;
    bool d3d_share_texture : 1;
    bool gbm_layout_feat : 1;
 };
@@ -2349,6 +2350,14 @@ int vrend_create_surface(struct vrend_context *ctx,
          GLenum target = res->target;
          GLenum internalformat = tex_conv_table[format].internalformat;
 
+         /* Mesa's dest_surface_srgb_control intentionally permits a UNORM
+          * surface view over an SRGB resource. Keep the attachment SRGB so
+          * GL_FRAMEBUFFER_SRGB performs the required linear->sRGB encoding. */
+         if (has_feature(feat_srgb_write_control) &&
+             !util_format_is_srgb(surf->format) &&
+             util_format_is_srgb(res->base.format))
+            internalformat = tex_conv_table[res->base.format].internalformat;
+
          if (target == GL_TEXTURE_CUBE_MAP && first_layer == last_layer) {
             first_layer = 0;
             last_layer = 5;
@@ -3104,7 +3113,9 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
       for (uint32_t i = 0; i < sub_ctx->nr_cbufs; i++) {
          if (sub_ctx->surf[i]) {
             surf = sub_ctx->surf[i];
-            if (util_format_is_srgb(surf->format)) {
+            if (util_format_is_srgb(surf->format) ||
+                (!util_format_is_srgb(surf->format) &&
+                 util_format_is_srgb(surf->texture->base.format))) {
                use_srgb = true;
                break;
             }
@@ -3138,7 +3149,9 @@ static void vrend_hw_emit_framebuffer_state(struct vrend_sub_context *sub_ctx)
        * To work around this for colorspace conversion, views are avoided
        * manual colorspace conversion is instead injected in the fragment
        * shader writing to such surfaces and during glClearColor(). */
-      if (util_format_is_srgb(surf->format) &&
+      if (!(vrend_state.egl_image_srgb_import &&
+            has_feature(feat_srgb_write_control)) &&
+          util_format_is_srgb(surf->format) &&
           !vrend_resource_supports_view(surf->texture, surf->format)) {
          VREND_DEBUG(dbg_tex, sub_ctx->parent,
                      "manually converting linear->srgb for EGL-backed framebuffer color attachment 0x%x"
@@ -4717,7 +4730,9 @@ vrend_color_encode_as_srgb(float color) {
 static void vrend_clear_prepare(struct vrend_sub_context *sub_ctx,
                                 struct vrend_surface *surf, unsigned buffers,
                                 float *colorf, double depth, unsigned stencil) {
-   if (surf && util_format_is_srgb(surf->format) &&
+   if (!(vrend_state.egl_image_srgb_import &&
+         has_feature(feat_srgb_write_control)) &&
+       surf && util_format_is_srgb(surf->format) &&
        !vrend_resource_supports_view(surf->texture, surf->format)) {
       VREND_DEBUG(dbg_tex, sub_ctx->parent,
                   "manually converting glClearColor from linear->srgb colorspace for EGL-backed framebuffer color attachment"
@@ -7688,8 +7703,10 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
    init_features(gles ? 0 : gl_ver,
                  gles ? gl_ver : 0);
 
-   if (!vrend_winsys_has_gl_colorspace())
-      clear_feature(feat_srgb_write_control) ;
+   vrend_state.egl_image_srgb_import =
+      vrend_winsys_has_egl_image_gl_colorspace();
+   if (!vrend_state.egl_image_srgb_import)
+      clear_feature(feat_srgb_write_control);
 
    glGetIntegerv(GL_MAX_DRAW_BUFFERS, (GLint *) &vrend_state.max_draw_buffers);
 
@@ -8669,7 +8686,8 @@ static void vrend_resource_gbm_init(struct vrend_resource *gr, uint32_t format)
    if (!virgl_gbm_gpu_import_required(gr->base.bind))
       return;
 
-   gr->egl_image = virgl_egl_image_from_gbm_bo(egl, bo);
+   gr->egl_image = virgl_egl_image_from_gbm_bo(
+      egl, bo, vrend_state.egl_image_srgb_import && util_format_is_srgb(format));
    if (!gr->egl_image) {
       gr->gbm_bo = NULL;
       gbm_bo_destroy(bo);
