@@ -6,7 +6,108 @@
 #include "vkr_buffer.h"
 
 #include "vkr_buffer_gen.h"
+#include "vkr_context.h"
+#include "vkr_device_memory.h"
 #include "vkr_physical_device.h"
+
+#ifdef __OHOS__
+struct vkr_winehua_buffer_binding {
+   struct vkr_buffer *buffer;
+   struct vkr_device_memory *memory;
+   VkDeviceSize offset;
+};
+
+static void
+vkr_winehua_set_buffer_memory(struct vkr_context *ctx,
+                              struct vkr_buffer *buffer,
+                              struct vkr_device_memory *memory,
+                              VkDeviceSize offset)
+{
+   if (!buffer)
+      return;
+
+   mtx_lock(&ctx->object_mutex);
+   struct vkr_device_memory *old_memory = buffer->bound_memory;
+   if (old_memory)
+      vkr_device_memory_invalidate_shadow_coverage(old_memory);
+   if (buffer->memory_listed) {
+      list_del(&buffer->memory_head);
+      list_inithead(&buffer->memory_head);
+      buffer->memory_listed = false;
+   }
+   buffer->bound_memory = memory;
+   buffer->bound_memory_offset = offset;
+   if (memory) {
+      list_addtail(&buffer->memory_head, &memory->bound_buffers);
+      buffer->memory_listed = true;
+      vkr_device_memory_invalidate_shadow_coverage(memory);
+   }
+   mtx_unlock(&ctx->object_mutex);
+}
+
+bool
+vkr_winehua_buffer_add_ubo_watch_locked(struct vkr_buffer *buffer,
+                                        uint32_t binding,
+                                        VkDeviceSize offset,
+                                        VkDeviceSize size)
+{
+   if (!buffer)
+      return false;
+
+   if (!buffer->winehua_ubo_watches) {
+      buffer->winehua_ubo_watches = calloc(
+         VKR_WINEHUA_UBO_WATCH_COUNT,
+         sizeof(*buffer->winehua_ubo_watches));
+      if (!buffer->winehua_ubo_watches) {
+         if (!buffer->winehua_ubo_watch_overflow) {
+            buffer->winehua_ubo_watch_overflow = true;
+            vkr_log("WineHuaUboHost: phase=watch-allocation-failed "
+                    "bufferId=%" PRIu64,
+                    (uint64_t)buffer->base.id);
+         }
+         return false;
+      }
+   }
+
+   uint32_t watch_count = atomic_load_explicit(
+      &buffer->winehua_ubo_watch_count, memory_order_relaxed);
+   for (uint32_t i = 0; i < watch_count; i++) {
+      const struct vkr_winehua_ubo_watch *watch =
+         &buffer->winehua_ubo_watches[i];
+      if (watch->offset == offset && watch->size == size &&
+          watch->binding == binding)
+         return true;
+   }
+
+   if (watch_count == VKR_WINEHUA_UBO_WATCH_COUNT) {
+      if (!buffer->winehua_ubo_watch_overflow) {
+         buffer->winehua_ubo_watch_overflow = true;
+         vkr_log("WineHuaUboHost: phase=watch-overflow bufferId=%" PRIu64
+                 " capacity=%u",
+                 (uint64_t)buffer->base.id,
+                 VKR_WINEHUA_UBO_WATCH_COUNT);
+      }
+      return false;
+   }
+
+   struct vkr_winehua_ubo_watch *watch =
+      &buffer->winehua_ubo_watches[watch_count];
+   watch->offset = offset;
+   watch->size = size;
+   watch->binding = binding;
+   atomic_init(&watch->last_update_hash, 0);
+   atomic_init(&watch->last_update_hash_valid, false);
+   atomic_store_explicit(&buffer->winehua_ubo_watch_count,
+                         watch_count + 1, memory_order_release);
+   vkr_log("WineHuaUboHost: phase=watch binding=%u bufferId=%" PRIu64
+           " hostBuffer=0x%" PRIxPTR " descriptorOffset=%" PRIu64
+           " descriptorRange=%" PRIu64,
+           binding, (uint64_t)buffer->base.id,
+           (uintptr_t)buffer->base.handle.buffer,
+           (uint64_t)offset, (uint64_t)size);
+   return true;
+}
+#endif
 
 static void
 vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
@@ -37,13 +138,47 @@ vkr_dispatch_vkCreateBuffer(struct vn_dispatch_context *dispatch,
     * vkr_physical_device_init_memory_properties as well.
     */
 
+#ifdef __OHOS__
+   const VkBufferCreateInfo *guest_info = args->pCreateInfo;
+   VkBufferCreateInfo host_info = *guest_info;
+   struct vkr_device *dev = vkr_device_from_handle(args->device);
+   if (vkr_device_memory_gpu_upload_enabled(dev))
+      host_info.usage |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+   args->pCreateInfo = &host_info;
+
+   struct vkr_buffer *buffer = vkr_buffer_create_and_add(dispatch->data, args);
+   if (buffer) {
+      buffer->winehua_ubo_watches = NULL;
+      atomic_init(&buffer->winehua_ubo_watch_count, 0);
+      buffer->winehua_ubo_watch_overflow = false;
+      buffer->bound_memory = NULL;
+      buffer->bound_memory_offset = 0;
+      buffer->size = guest_info->size;
+      buffer->guest_usage = guest_info->usage;
+      buffer->host_usage = host_info.usage;
+      buffer->winehua_shadow_record_submit_id = 0;
+      list_inithead(&buffer->memory_head);
+      buffer->memory_listed = false;
+   }
+#else
    vkr_buffer_create_and_add(dispatch->data, args);
+#endif
 }
 
 static void
 vkr_dispatch_vkDestroyBuffer(struct vn_dispatch_context *dispatch,
                              struct vn_command_vkDestroyBuffer *args)
 {
+#ifdef __OHOS__
+   struct vkr_buffer *buffer = vkr_buffer_from_handle(args->buffer);
+   vkr_winehua_set_buffer_memory(dispatch->data, buffer, NULL, 0);
+   if (buffer) {
+      free(buffer->winehua_ubo_watches);
+      buffer->winehua_ubo_watches = NULL;
+      atomic_store_explicit(&buffer->winehua_ubo_watch_count, 0,
+                            memory_order_release);
+   }
+#endif
    vkr_buffer_destroy_and_remove(dispatch->data, args);
 }
 
@@ -72,26 +207,60 @@ vkr_dispatch_vkGetBufferMemoryRequirements2(
 }
 
 static void
-vkr_dispatch_vkBindBufferMemory(UNUSED struct vn_dispatch_context *dispatch,
-                                struct vn_command_vkBindBufferMemory *args)
+vkr_dispatch_vkBindBufferMemory(struct vn_dispatch_context *dispatch,
+                                 struct vn_command_vkBindBufferMemory *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+#ifdef __OHOS__
+   struct vkr_buffer *buffer = vkr_buffer_from_handle(args->buffer);
+   struct vkr_device_memory *memory = vkr_device_memory_from_handle(args->memory);
+   const VkDeviceSize memory_offset = args->memoryOffset;
+#endif
 
    vn_replace_vkBindBufferMemory_args_handle(args);
    args->ret =
       vk->BindBufferMemory(args->device, args->buffer, args->memory, args->memoryOffset);
+#ifdef __OHOS__
+   if (args->ret == VK_SUCCESS && buffer) {
+      vkr_winehua_set_buffer_memory(
+         dispatch->data, buffer, memory, memory_offset);
+   }
+#endif
 }
 
 static void
-vkr_dispatch_vkBindBufferMemory2(UNUSED struct vn_dispatch_context *dispatch,
+vkr_dispatch_vkBindBufferMemory2(struct vn_dispatch_context *dispatch,
                                  struct vn_command_vkBindBufferMemory2 *args)
 {
    struct vkr_device *dev = vkr_device_from_handle(args->device);
    struct vn_device_proc_table *vk = &dev->proc_table;
+#ifdef __OHOS__
+   STACK_ARRAY(struct vkr_winehua_buffer_binding, bindings, args->bindInfoCount);
+   if (bindings) {
+      for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+         const VkBindBufferMemoryInfo *info = &args->pBindInfos[i];
+         bindings[i].buffer = vkr_buffer_from_handle(info->buffer);
+         bindings[i].memory = vkr_device_memory_from_handle(info->memory);
+         bindings[i].offset = info->memoryOffset;
+      }
+   }
+#endif
 
    vn_replace_vkBindBufferMemory2_args_handle(args);
    args->ret = vk->BindBufferMemory2(args->device, args->bindInfoCount, args->pBindInfos);
+#ifdef __OHOS__
+   if (args->ret == VK_SUCCESS && bindings) {
+      for (uint32_t i = 0; i < args->bindInfoCount; i++) {
+         if (bindings[i].buffer) {
+            vkr_winehua_set_buffer_memory(
+               dispatch->data, bindings[i].buffer, bindings[i].memory,
+               bindings[i].offset);
+         }
+      }
+   }
+   STACK_ARRAY_FINISH(bindings);
+#endif
 }
 
 static void

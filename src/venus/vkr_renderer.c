@@ -5,20 +5,116 @@
 
 #include "vkr_common.h"
 
+#include <stdio.h>
+
 #include "venus-protocol/vn_protocol_renderer_info.h"
 #include "virtgpu_drm.h"
 #include "venus_hw.h"
 
 #include "vkr_context.h"
+#include "vkr_device.h"
+#include "vkr_image.h"
+#include "vkr_instance.h"
+#include "vkr_physical_device.h"
+#include "vkr_queue.h"
+
+#include <sched.h>
+#include <time.h>
 
 struct vkr_renderer_state {
    const struct vkr_renderer_callbacks *cbs;
 
    /* track the vkr_context */
+   mtx_t context_mutex;
    struct list_head contexts;
 };
 
 struct vkr_renderer_state vkr_state;
+static struct vkr_context *vkr_context_cache[64];
+
+static uint64_t
+vkr_winehua_now_us(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (uint64_t)ts.tv_sec * 1000000ull +
+          (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+static bool
+vkr_winehua_frame_assoc_trace_enabled(void)
+{
+   const char *trace = getenv("WINEHUA_VKR_TRACE_CAPTURE");
+   return trace && trace[0] == '1' && !trace[1];
+}
+
+static bool
+vkr_winehua_present_image_trace_enabled(void)
+{
+   const char *trace = getenv("WINEHUA_VKR_TRACE_PRESENT_IMAGE");
+   return trace && trace[0] == '1' && !trace[1];
+}
+
+static void
+vkr_winehua_stage(const char *stage, uint32_t serial)
+{
+   const char *trace = getenv("WINEHUA_VKR_PRESENT_STAGE_TRACE");
+   if (!trace || trace[0] != '1')
+      return;
+   const char *path = getenv("WINEHUA_VIRGL_LOG_PATH");
+   if (!path || !path[0])
+      return;
+   FILE *file = fopen(path, "a");
+   if (!file)
+      return;
+   fprintf(file, "[%llu] [vkr-present] serial=%u stage=%s\n",
+           (unsigned long long)vkr_winehua_now_us(), serial, stage);
+   fflush(file);
+   fclose(file);
+}
+
+static bool
+vkr_winehua_trylock(mtx_t *mutex, const char *busy_stage, uint32_t serial)
+{
+   /* Queue submit and the present command are serviced by different Venus
+    * workers.  Returning EAGAIN on the first object-mutex collision drops the
+    * frame before it ever reaches the OHNativeWindow and leaves a white
+    * swapchain.  Wait briefly for the in-flight command to retire, but keep a
+    * hard bound so a genuinely dead context cannot hang the render server. */
+   for (unsigned i = 0; i < 200; i++) {
+      if (mtx_trylock(mutex) == thrd_success)
+         return true;
+      const struct timespec delay = {0, 1000000};
+      nanosleep(&delay, NULL);
+   }
+   vkr_winehua_stage(busy_stage, serial);
+   return false;
+}
+
+static vkr_renderer_winehua_present_callback_type
+   vkr_winehua_present_callback;
+static void *vkr_winehua_present_callback_data;
+static vkr_renderer_winehua_device_release_callback_type
+   vkr_winehua_device_release_callback;
+static void *vkr_winehua_device_release_callback_data;
+
+struct vkr_winehua_queue_guard {
+   mtx_t *mutex;
+   bool locked;
+   uint32_t serial;
+};
+
+static void
+vkr_winehua_release_queue(void *data)
+{
+   struct vkr_winehua_queue_guard *guard = data;
+   if (!guard || !guard->locked)
+      return;
+
+   guard->locked = false;
+   mtx_unlock(guard->mutex);
+   vkr_winehua_stage("queue-released-by-present", guard->serial);
+}
 
 size_t
 vkr_get_capset(void *capset, uint32_t flags)
@@ -70,10 +166,18 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs)
 
    vkr_debug_init();
 
+   /* Keep the pipeline diagnostic self-describing.  The render server is a
+    * separate native child, so a guest-process environment record alone does
+    * not prove that this process received the option. */
+   if (getenv("WINEHUA_VKR_TRACE_PIPELINE"))
+      vkr_log("WineHuaPipeline: renderer trace enabled value=%s",
+              getenv("WINEHUA_VKR_TRACE_PIPELINE"));
+
    if (cbs->debug_logger)
       virgl_log_set_handler(cbs->debug_logger, NULL, NULL);
 
    vkr_state.cbs = cbs;
+   mtx_init(&vkr_state.context_mutex, mtx_plain);
    list_inithead(&vkr_state.contexts);
 
    return true;
@@ -82,22 +186,57 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs)
 void
 vkr_renderer_fini(void)
 {
+   mtx_lock(&vkr_state.context_mutex);
    list_for_each_entry_safe (struct vkr_context, ctx, &vkr_state.contexts, head)
       vkr_context_destroy(ctx);
 
    list_inithead(&vkr_state.contexts);
+   mtx_unlock(&vkr_state.context_mutex);
+   mtx_destroy(&vkr_state.context_mutex);
 
    vkr_state.cbs = NULL;
+}
+
+void
+vkr_renderer_set_winehua_present_callback(
+   vkr_renderer_winehua_present_callback_type callback,
+   void *user_data)
+{
+   vkr_winehua_present_callback = callback;
+   vkr_winehua_present_callback_data = user_data;
+}
+
+void
+vkr_renderer_set_winehua_device_release_callback(
+   vkr_renderer_winehua_device_release_callback_type callback,
+   void *user_data)
+{
+   vkr_winehua_device_release_callback = callback;
+   vkr_winehua_device_release_callback_data = user_data;
+}
+
+int
+vkr_renderer_winehua_release_device(uint32_t ctx_id,
+                                    uintptr_t device,
+                                    uint32_t phase,
+                                    int32_t wait_result)
+{
+   if (!vkr_winehua_device_release_callback)
+      return 0;
+
+   return vkr_winehua_device_release_callback(
+      ctx_id, device, phase, wait_result,
+      vkr_winehua_device_release_callback_data);
 }
 
 static struct vkr_context *
 vkr_renderer_lookup_context(uint32_t ctx_id)
 {
-   list_for_each_entry (struct vkr_context, ctx, &vkr_state.contexts, head) {
-      if (ctx->ctx_id == ctx_id)
+   for (unsigned i = 0; i < 64; i++) {
+      struct vkr_context *ctx = vkr_context_cache[i];
+      if (ctx && ctx->ctx_id == ctx_id)
          return ctx;
    }
-
    return NULL;
 }
 
@@ -117,15 +256,27 @@ vkr_renderer_create_context(uint32_t ctx_id,
       return false;
 
    /* duplicate ctx creation between server and vkr is invalid */
+   mtx_lock(&vkr_state.context_mutex);
    struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
-   if (ctx)
+   if (ctx) {
+      mtx_unlock(&vkr_state.context_mutex);
       return false;
+   }
 
    ctx = vkr_context_create(ctx_id, vkr_state.cbs->retire_fence, nlen, name);
-   if (!ctx)
+   if (!ctx) {
+      mtx_unlock(&vkr_state.context_mutex);
       return false;
+   }
 
    list_addtail(&ctx->head, &vkr_state.contexts);
+   for (unsigned i = 0; i < 64; i++) {
+      if (!vkr_context_cache[i]) {
+         vkr_context_cache[i] = ctx;
+         break;
+      }
+   }
+   mtx_unlock(&vkr_state.context_mutex);
 
    return true;
 }
@@ -135,12 +286,180 @@ vkr_renderer_destroy_context(uint32_t ctx_id)
 {
    TRACE_FUNC();
 
+   mtx_lock(&vkr_state.context_mutex);
    struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
-   if (!ctx)
+   if (!ctx) {
+      mtx_unlock(&vkr_state.context_mutex);
       return;
+   }
 
    list_del(&ctx->head);
+   for (unsigned i = 0; i < 64; i++) {
+      if (vkr_context_cache[i] == ctx)
+         vkr_context_cache[i] = NULL;
+   }
    vkr_context_destroy(ctx);
+   mtx_unlock(&vkr_state.context_mutex);
+}
+
+int
+vkr_renderer_winehua_present(uint32_t ctx_id,
+                             uint64_t queue_id,
+                             uint64_t image_id,
+                             uint32_t width,
+                             uint32_t height,
+                             uint32_t format,
+                             uint32_t layout,
+                             uint32_t client_pid,
+                             uint32_t surface_id,
+                             uint32_t serial,
+                             uint32_t flags,
+                             uint64_t *next_present_deadline_ns)
+{
+   vkr_winehua_stage("enter", serial);
+   if (next_present_deadline_ns)
+      *next_present_deadline_ns = 0;
+   if (!ctx_id || !queue_id || !image_id || !width || !height ||
+       !client_pid || !surface_id || flags)
+      return -EINVAL;
+
+   switch ((VkImageLayout)layout) {
+   case VK_IMAGE_LAYOUT_GENERAL:
+   case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+   case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+   case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR:
+      break;
+   default:
+      return -EINVAL;
+   }
+
+   vkr_winehua_stage("context-lock", serial);
+   if (!vkr_winehua_trylock(&vkr_state.context_mutex, "context-busy", serial)) {
+      vkr_winehua_stage("context-busy", serial);
+      return -EAGAIN;
+   }
+   vkr_winehua_stage("context-locked", serial);
+   struct vkr_context *ctx = vkr_renderer_lookup_context(ctx_id);
+   if (!ctx) {
+      vkr_winehua_stage("context-missing", serial);
+      mtx_unlock(&vkr_state.context_mutex);
+      return -ESRCH;
+   }
+
+   vkr_winehua_stage("object-lock", serial);
+   if (!vkr_winehua_trylock(&ctx->object_mutex, "object-busy", serial)) {
+      vkr_winehua_stage("object-busy", serial);
+      mtx_unlock(&vkr_state.context_mutex);
+      return -EAGAIN;
+   }
+   vkr_winehua_stage("object-locked", serial);
+   const struct hash_entry *queue_entry =
+      _mesa_hash_table_search(ctx->object_table, &queue_id);
+   const struct hash_entry *image_entry =
+      _mesa_hash_table_search(ctx->object_table, &image_id);
+   struct vkr_object *queue_obj = queue_entry ? queue_entry->data : NULL;
+   struct vkr_object *image_obj = image_entry ? image_entry->data : NULL;
+   if (!queue_obj || queue_obj->type != VK_OBJECT_TYPE_QUEUE ||
+       !image_obj || image_obj->type != VK_OBJECT_TYPE_IMAGE) {
+      vkr_winehua_stage(!queue_obj ? "queue-missing" :
+                        !image_obj ? "image-missing" : "object-type-mismatch",
+                        serial);
+      mtx_unlock(&ctx->object_mutex);
+      mtx_unlock(&vkr_state.context_mutex);
+      /* Object commands and the private socket command are asynchronous.  A
+       * transient miss must request retry/suboptimal handling, never poison
+       * the DXVK device as a permanent object lookup failure. */
+      return -EAGAIN;
+   }
+
+   struct vkr_queue *queue = (struct vkr_queue *)queue_obj;
+   struct vkr_image *image = (struct vkr_image *)image_obj;
+   struct vkr_device *dev = queue->device;
+   struct vkr_physical_device *physical_dev =
+      dev ? dev->physical_device : NULL;
+   struct vkr_instance *instance =
+      physical_dev ? physical_dev->instance : NULL;
+   const bool image_matches =
+      image->device == dev && image->image_type == VK_IMAGE_TYPE_2D &&
+      image->extent.width == width && image->extent.height == height &&
+      image->extent.depth == 1 && image->format == (VkFormat)format &&
+      image->mip_levels >= 1 && image->array_layers >= 1 &&
+      image->samples == VK_SAMPLE_COUNT_1_BIT &&
+      (image->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+   if (!dev || !physical_dev || !instance || !image_matches) {
+      mtx_unlock(&ctx->object_mutex);
+      mtx_unlock(&vkr_state.context_mutex);
+      return -EINVAL;
+   }
+
+   if (!vkr_winehua_present_callback) {
+      mtx_unlock(&ctx->object_mutex);
+      mtx_unlock(&vkr_state.context_mutex);
+      return -ENOSYS;
+   }
+
+   vkr_winehua_stage("queue-lock", serial);
+   if (!vkr_winehua_trylock(&queue->vk_mutex, "queue-busy", serial)) {
+      mtx_unlock(&ctx->object_mutex);
+      mtx_unlock(&vkr_state.context_mutex);
+      return -EAGAIN;
+   }
+   vkr_winehua_stage("queue-locked", serial);
+
+#ifdef __OHOS__
+   /* A sampled timeline is armed for the interval after a present.  Reading
+    * it here, under the same queue mutex as QueueSubmit, gives one complete
+    * rendered interval without changing upload or present ordering. */
+   vkr_winehua_queue_frame_timeline_present(queue, serial);
+#endif
+
+   const uintptr_t instance_handle = (uintptr_t)instance->base.handle.instance;
+   const uintptr_t physical_device_handle =
+      (uintptr_t)physical_dev->base.handle.physical_device;
+   const uintptr_t device_handle = (uintptr_t)dev->base.handle.device;
+   const uintptr_t queue_handle = (uintptr_t)queue->base.handle.queue;
+   const uint64_t image_handle = (uint64_t)(uintptr_t)image->base.handle.image;
+   const uint32_t queue_family = queue->family;
+   vkr_winehua_stage("handles-ready", serial);
+   if (vkr_winehua_frame_assoc_trace_enabled()) {
+      vkr_log("WineHuaFrameAssoc: present serial=%u ctx=%u queueId=%" PRIu64
+              " hostQueue=0x%" PRIxPTR " imageId=%" PRIu64
+              " hostImage=0x%" PRIx64 " size=%ux%u format=%u layout=%u",
+              serial, ctx_id, queue_id, queue_handle, image_id, image_handle,
+              width, height, format, layout);
+   }
+   if (vkr_winehua_present_image_trace_enabled()) {
+      vkr_log("WineHuaPresentImage: layer=host event=present serial=%u "
+              "ctx=%u queueId=%" PRIu64 " hostQueue=0x%" PRIxPTR
+              " imageId=%" PRIu64 " hostImage=0x%" PRIx64
+              " size=%ux%u format=%u layout=%u",
+              serial, ctx_id, queue_id, queue_handle, image_id, image_handle,
+              width, height, format, layout);
+   }
+
+   /* Keep the queue externally synchronized with renderer QueueSubmit,
+    * QueueSubmit2, QueueBindSparse and sync submissions. The callback calls
+    * the host Vulkan driver directly and does not re-enter Venus. Object and
+    * context locks are released first so unrelated renderer work can proceed
+    * while the platform compositor blocks in vkQueuePresentKHR. */
+   mtx_unlock(&ctx->object_mutex);
+   mtx_unlock(&vkr_state.context_mutex);
+   vkr_winehua_stage("object-locks-released", serial);
+
+   struct vkr_winehua_queue_guard queue_guard = {
+      .mutex = &queue->vk_mutex,
+      .locked = true,
+      .serial = serial,
+   };
+   const int ret = vkr_winehua_present_callback(
+      ctx_id, instance_handle, physical_device_handle, device_handle,
+      queue_handle, image_handle, queue_family, width, height, format, layout,
+      client_pid, surface_id, serial, flags, next_present_deadline_ns,
+      vkr_winehua_release_queue, &queue_guard,
+      vkr_winehua_present_callback_data);
+   vkr_winehua_release_queue(&queue_guard);
+   vkr_winehua_stage("queue-unlocked", serial);
+   return ret;
 }
 
 bool

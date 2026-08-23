@@ -10,6 +10,10 @@
 
 struct vkr_shader_module {
    struct vkr_object base;
+   uint32_t winehua_code_hash;
+   uint32_t winehua_code_size;
+   uint32_t winehua_first_word;
+   uint32_t winehua_last_word;
 };
 VKR_DEFINE_OBJECT_CAST(shader_module, VK_OBJECT_TYPE_SHADER_MODULE, VkShaderModule)
 

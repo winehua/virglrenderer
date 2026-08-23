@@ -85,6 +85,11 @@ struct vkr_context {
    mtx_t object_mutex;
    struct hash_table *object_table;
 
+#ifdef __OHOS__
+   mtx_t shadow_generation_mutex;
+   struct list_head shadow_dirty_memories;
+#endif
+
    mtx_t resource_mutex;
    struct hash_table *resource_table;
 

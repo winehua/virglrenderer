@@ -122,6 +122,7 @@ int vtest_drm_sync_transfer(uint32_t length_dw);
 int vtest_resource_export_fd(uint32_t length_dw);
 
 int vtest_winehua_present(uint32_t length_dw);
+int vtest_winehua_vk_present(uint32_t length_dw);
 void vtest_set_winehua_present_callback(
    vtest_winehua_present_callback callback, void *user_data);
 

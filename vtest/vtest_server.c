@@ -763,6 +763,10 @@ static const struct vtest_command winehua_present_command = {
    "WINEHUA_PRESENT", vtest_winehua_present, true
 };
 
+static const struct vtest_command winehua_vk_present_command = {
+   "WINEHUA_VK_PRESENT", vtest_winehua_vk_present, true
+};
+
 static int vtest_client_dispatch_commands(struct vtest_client *client)
 {
    TRACE_FUNC();
@@ -796,6 +800,8 @@ static int vtest_client_dispatch_commands(struct vtest_client *client)
    vtest_poll_resource_busy_wait();
    if (header[1] == VCMD_WINEHUA_PRESENT) {
       cmd = &winehua_present_command;
+   } else if (header[1] == VCMD_WINEHUA_VK_PRESENT) {
+      cmd = &winehua_vk_present_command;
    } else {
       if (header[1] <= 0 || header[1] >= ARRAY_SIZE(vtest_commands))
          return VTEST_CLIENT_ERROR_COMMAND_ID;

@@ -13,6 +13,8 @@
 struct vkr_physical_device {
    struct vkr_object base;
 
+   struct vkr_instance *instance;
+
    struct vn_physical_device_proc_table proc_table;
 
    VkPhysicalDeviceProperties properties;
@@ -33,6 +35,9 @@ struct vkr_physical_device {
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    VkPhysicalDeviceIDProperties id_properties;
+#ifdef __OHOS__
+   bool winehua_shadow_gpu_upload_quirk;
+#endif
    bool is_dma_buf_fd_export_supported;
    bool is_opaque_fd_export_supported;
    void *gbm_device;

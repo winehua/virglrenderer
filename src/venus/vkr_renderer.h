@@ -21,6 +21,42 @@ typedef void (*vkr_renderer_retire_fence_callback_type)(uint32_t ctx_id,
                                                         uint32_t ring_idx,
                                                         uint64_t fence_id);
 
+typedef void (*vkr_renderer_winehua_release_queue_callback_type)(
+   void *queue_sync_data);
+
+typedef int (*vkr_renderer_winehua_present_callback_type)(
+   uint32_t ctx_id,
+   uintptr_t instance,
+   uintptr_t physical_device,
+   uintptr_t device,
+   uintptr_t queue,
+   uint64_t image,
+   uint32_t queue_family,
+   uint32_t width,
+   uint32_t height,
+   uint32_t format,
+   uint32_t layout,
+   uint32_t client_pid,
+   uint32_t surface_id,
+   uint32_t serial,
+   uint32_t flags,
+   uint64_t *next_present_deadline_ns,
+   vkr_renderer_winehua_release_queue_callback_type release_queue,
+   void *queue_sync_data,
+   void *user_data);
+
+enum vkr_renderer_winehua_device_release_phase {
+   VKR_RENDERER_WINEHUA_DEVICE_RELEASE_PREPARE = 0,
+   VKR_RENDERER_WINEHUA_DEVICE_RELEASE_AFTER_WAIT = 1,
+};
+
+typedef int (*vkr_renderer_winehua_device_release_callback_type)(
+   uint32_t ctx_id,
+   uintptr_t device,
+   uint32_t phase,
+   int32_t wait_result,
+   void *user_data);
+
 struct vkr_renderer_callbacks {
    virgl_log_callback_type debug_logger;
    vkr_renderer_retire_fence_callback_type retire_fence;
@@ -34,6 +70,36 @@ vkr_renderer_init(uint32_t flags, const struct vkr_renderer_callbacks *cbs);
 
 void
 vkr_renderer_fini(void);
+
+void
+vkr_renderer_set_winehua_present_callback(
+   vkr_renderer_winehua_present_callback_type callback,
+   void *user_data);
+
+void
+vkr_renderer_set_winehua_device_release_callback(
+   vkr_renderer_winehua_device_release_callback_type callback,
+   void *user_data);
+
+int
+vkr_renderer_winehua_release_device(uint32_t ctx_id,
+                                    uintptr_t device,
+                                    uint32_t phase,
+                                    int32_t wait_result);
+
+int
+vkr_renderer_winehua_present(uint32_t ctx_id,
+                             uint64_t queue_id,
+                             uint64_t image_id,
+                             uint32_t width,
+                             uint32_t height,
+                             uint32_t format,
+                             uint32_t layout,
+                             uint32_t client_pid,
+                             uint32_t surface_id,
+                             uint32_t serial,
+                             uint32_t flags,
+                             uint64_t *next_present_deadline_ns);
 
 bool
 vkr_renderer_create_context(uint32_t ctx_id,

@@ -10,11 +10,26 @@
 
 struct vkr_image {
    struct vkr_object base;
+
+   struct vkr_device *device;
+   VkFormat format;
+   VkExtent3D extent;
+   VkImageUsageFlags usage;
+   VkImageType image_type;
+   uint32_t mip_levels;
+   uint32_t array_layers;
+   VkSampleCountFlagBits samples;
+   VkImageTiling tiling;
 };
 VKR_DEFINE_OBJECT_CAST(image, VK_OBJECT_TYPE_IMAGE, VkImage)
 
 struct vkr_image_view {
    struct vkr_object base;
+
+   /* Retain the source object identity for opt-in Guest->Host descriptor
+    * tracing. The Vulkan driver handle alone cannot prove which Guest image
+    * supplied a view after handle replacement. */
+   struct vkr_image *image;
 };
 VKR_DEFINE_OBJECT_CAST(image_view, VK_OBJECT_TYPE_IMAGE_VIEW, VkImageView)
 

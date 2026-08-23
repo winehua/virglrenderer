@@ -41,6 +41,9 @@
 #include "util/u_format.h"
 #include "util/u_math.h"
 #include "vkr_allocator.h"
+#ifdef ENABLE_VENUS
+#include "venus/vkr_renderer.h"
+#endif
 #include "drm_renderer.h"
 #include "proxy/proxy_renderer.h"
 #include "vrend/vrend_renderer.h"
@@ -57,6 +60,35 @@
 #include "virgl_fence.h"
 #include "virgl_resource.h"
 #include "virgl_util.h"
+
+#ifdef ENABLE_VENUS
+/* Exported wrappers are called from the vtest shared library. Keep the
+ * declarations visible before their definitions so -Wmissing-prototypes
+ * remains enabled for the virglrenderer build. */
+VIRGL_EXPORT void
+virgl_renderer_set_winehua_vk_present_callback(
+   vkr_renderer_winehua_present_callback_type callback,
+   void *user_data);
+
+VIRGL_EXPORT void
+virgl_renderer_set_winehua_vk_device_release_callback(
+   vkr_renderer_winehua_device_release_callback_type callback,
+   void *user_data);
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_vk_present(uint32_t ctx_id,
+                                  uint64_t queue_id,
+                                  uint64_t image_id,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  uint32_t format,
+                                  uint32_t layout,
+                                  uint32_t client_pid,
+                                  uint32_t surface_id,
+                                  uint32_t serial,
+                                  uint32_t flags,
+                                  uint64_t *next_present_deadline_ns);
+#endif
 
 struct global_state {
    bool client_initialized;
@@ -1626,3 +1658,41 @@ int virgl_renderer_get_dev_fd(int ctx_id)
 
    return ctx->get_device_fd(ctx);
 }
+
+
+#ifdef ENABLE_VENUS
+VIRGL_EXPORT void
+virgl_renderer_set_winehua_vk_present_callback(
+   vkr_renderer_winehua_present_callback_type callback,
+   void *user_data)
+{
+   vkr_renderer_set_winehua_present_callback(callback, user_data);
+}
+
+VIRGL_EXPORT void
+virgl_renderer_set_winehua_vk_device_release_callback(
+   vkr_renderer_winehua_device_release_callback_type callback,
+   void *user_data)
+{
+   vkr_renderer_set_winehua_device_release_callback(callback, user_data);
+}
+
+VIRGL_EXPORT int
+virgl_renderer_winehua_vk_present(uint32_t ctx_id,
+                                  uint64_t queue_id,
+                                  uint64_t image_id,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  uint32_t format,
+                                  uint32_t layout,
+                                  uint32_t client_pid,
+                                  uint32_t surface_id,
+                                  uint32_t serial,
+                                  uint32_t flags,
+                                  uint64_t *next_present_deadline_ns)
+{
+   return vkr_renderer_winehua_present(
+      ctx_id, queue_id, image_id, width, height, format, layout, client_pid,
+      surface_id, serial, flags, next_present_deadline_ns);
+}
+#endif

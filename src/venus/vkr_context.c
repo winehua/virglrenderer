@@ -35,6 +35,13 @@
 #include "vkr_ring.h"
 #include "vkr_transport.h"
 
+static bool
+vkr_winehua_resource_trace_enabled(void)
+{
+   const char *value = getenv("WINEHUA_RESOURCE_TRACE");
+   return value && value[0] == '1';
+}
+
 void
 vkr_context_add_instance(struct vkr_context *ctx,
                          struct vkr_instance *instance,
@@ -332,6 +339,20 @@ vkr_context_create_resource_from_device_memory(struct vkr_context *ctx,
    if (!vkr_device_memory_export_blob(mem, blob_size, blob_flags, &blob))
       return false;
 
+   if (blob.type == VIRGL_RESOURCE_FD_SHM) {
+      int map_fd = os_dupfd_cloexec(blob.u.fd);
+      if (map_fd < 0 ||
+          !vkr_context_import_resource_from_shm(ctx, res_id, blob_size, map_fd)) {
+         if (map_fd >= 0)
+            close(map_fd);
+         close(blob.u.fd);
+         return false;
+      }
+      close(map_fd);
+      *out_blob = blob;
+      return true;
+   }
+
    /* If memory might get exported, store a dup'ed fd in vkr_resource for:
     * - vkAllocateMemory for dma_buf import
     * - vkGetMemoryFdPropertiesKHR for dma_buf fd properties query
@@ -396,14 +417,25 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
    if (!res)
       return;
 
-   if (!vkr_cs_encoder_check_stream(&ctx->encoder, res))
+   const bool encoder_busy = !vkr_cs_encoder_check_stream(&ctx->encoder, res);
+   uint32_t ring_count = 0;
+   uint32_t ring_conflicts = 0;
+
+   if (encoder_busy)
       vkr_context_set_fatal(ctx);
 
    mtx_lock(&ctx->ring_mutex);
    list_for_each_entry_safe (struct vkr_ring, ring, &ctx->rings, head) {
-      if (ring->resource == res ||
-          !vkr_cs_decoder_check_stream(&ring->decoder, res) ||
-          !vkr_cs_encoder_check_stream(&ring->encoder, res)) {
+      ring_count++;
+      const bool ring_resource = ring->resource == res;
+      const bool decoder_busy = !vkr_cs_decoder_check_stream(&ring->decoder, res);
+      const bool ring_encoder_busy = !vkr_cs_encoder_check_stream(&ring->encoder, res);
+      if (ring_resource || decoder_busy || ring_encoder_busy) {
+         ring_conflicts++;
+         vkr_log("WineHua resource destroy conflict ctx=%u res=%u ring=%" PRIu64
+                 " ring_resource=%d decoder_busy=%d encoder_busy=%d",
+                 ctx->ctx_id, res_id, ring->id, ring_resource, decoder_busy,
+                 ring_encoder_busy);
          vkr_context_set_fatal(ctx);
 
          mtx_unlock(&ctx->ring_mutex);
@@ -414,6 +446,10 @@ vkr_context_destroy_resource(struct vkr_context *ctx, uint32_t res_id)
       }
    }
    mtx_unlock(&ctx->ring_mutex);
+
+   if (vkr_winehua_resource_trace_enabled() || encoder_busy || ring_conflicts)
+      vkr_log("WineHua resource destroy ctx=%u res=%u encoder_busy=%d rings=%u conflicts=%u",
+              ctx->ctx_id, res_id, encoder_busy, ring_count, ring_conflicts);
 
    vkr_context_remove_resource(ctx, res_id);
 }
@@ -639,6 +675,10 @@ vkr_context_destroy(struct vkr_context *ctx)
    _mesa_hash_table_destroy(ctx->resource_table, vkr_context_free_resource);
    mtx_destroy(&ctx->resource_mutex);
 
+#ifdef __OHOS__
+   mtx_destroy(&ctx->shadow_generation_mutex);
+#endif
+
    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
    mtx_destroy(&ctx->object_mutex);
 
@@ -712,6 +752,12 @@ vkr_context_create(uint32_t ctx_id,
    if (mtx_init(&ctx->object_mutex, mtx_plain) != thrd_success)
       goto err_ctx_object_mutex;
 
+#ifdef __OHOS__
+   if (mtx_init(&ctx->shadow_generation_mutex, mtx_plain) != thrd_success)
+      goto err_ctx_shadow_generation_mutex;
+   list_inithead(&ctx->shadow_dirty_memories);
+#endif
+
    ctx->object_table = _mesa_hash_table_create(NULL, vkr_hash_u64, vkr_key_u64_equal);
    if (!ctx->object_table)
       goto err_ctx_object_table;
@@ -751,6 +797,10 @@ err_ctx_resource_table:
 err_ctx_resource_mutex:
    _mesa_hash_table_destroy(ctx->object_table, vkr_context_free_object);
 err_ctx_object_table:
+#ifdef __OHOS__
+   mtx_destroy(&ctx->shadow_generation_mutex);
+err_ctx_shadow_generation_mutex:
+#endif
    mtx_destroy(&ctx->object_mutex);
 err_ctx_object_mutex:
    vkr_context_wait_ring_fini(ctx);

@@ -11,6 +11,17 @@
 #include "vkr_context.h"
 #include "vkr_ring.h"
 
+#ifdef __OHOS__
+static atomic_uint_fast64_t vkr_ohos_ring_notify_trace_count;
+
+static bool
+vkr_ohos_ring_notify_trace_enabled(void)
+{
+   const char *value = os_get_option("VKR_WINEHUA_SHADOW_TRACE");
+   return value && value[0] == '1' && !value[1];
+}
+#endif
+
 static void
 vkr_dispatch_vkSetReplyCommandStreamMESA(
    struct vn_dispatch_context *dispatch,
@@ -218,6 +229,13 @@ vkr_dispatch_vkCreateRingMESA(struct vn_dispatch_context *dispatch,
 
    ring->id = args->ring;
 
+#ifdef __OHOS__
+   vkr_log("OHOS ring create id=%" PRIu64 " res=%u size=%u head=%u tail=%u",
+           ring->id, info->resourceId, info->bufferSize,
+           vkr_ring_load_head(ring),
+           atomic_load_explicit(ring->control.tail, memory_order_acquire));
+#endif
+
    mtx_lock(&ctx->ring_mutex);
    list_addtail(&ring->head, &ctx->rings);
    mtx_unlock(&ctx->ring_mutex);
@@ -304,6 +322,17 @@ vkr_dispatch_vkNotifyRingMESA(struct vn_dispatch_context *dispatch,
       return;
    }
 
+#ifdef __OHOS__
+   if (vkr_ohos_ring_notify_trace_enabled()) {
+      const uint64_t notify_count = atomic_fetch_add_explicit(
+         &vkr_ohos_ring_notify_trace_count, 1, memory_order_relaxed) + 1;
+      if (notify_count <= 8 || !(notify_count % 120))
+         vkr_log("OHOS ring notify id=%" PRIu64 " seqno=%u head=%u tail=%u",
+                 args->ring, args->seqno,
+                 atomic_load_explicit(ring->control.head, memory_order_acquire),
+                 atomic_load_explicit(ring->control.tail, memory_order_acquire));
+   }
+#endif
    vkr_ring_notify(ring);
 }
 
