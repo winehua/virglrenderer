@@ -99,6 +99,9 @@ struct egl_funcs {
    PFNEGLQUERYDEVICESTRINGEXTPROC eglQueryDeviceString;
    PFNEGLQUERYDISPLAYATTRIBEXTPROC eglQueryDisplayAttrib;
    PFNEGLQUERYDEVICEATTRIBEXTPROC eglQueryDeviceAttrib;
+   PFNEGLCREATESYNCKHRPROC eglCreateSyncKHR;
+   PFNEGLDESTROYSYNCKHRPROC eglDestroySyncKHR;
+   PFNEGLCLIENTWAITSYNCKHRPROC eglClientWaitSyncKHR;
 };
 
 struct virgl_egl {
@@ -176,6 +179,30 @@ static bool virgl_egl_get_funcs(struct virgl_egl *egl)
       egl->funcs.eglQueryDevices = (PFNEGLQUERYDEVICESEXTPROC)eglGetProcAddress ("eglQueryDevicesEXT");
       if (!egl->funcs.eglQueryDevices)
          return false;
+   }
+
+   /* fence 函数在此显式解析并缓存, 不经 libepoxy 的延迟 wrapper。
+    *
+    * libepoxy 解析扩展函数时用 eglGetCurrentDisplay() 查扩展字符串
+    * (dispatch_egl.c 的 epoxy_conservative_has_egl_extension), 而 virgl 的
+    * 销毁路径上 GL context 已先被销毁 (virgl_renderer_cleanup 里
+    * virgl_context_table_cleanup → virgl_egl_destroy_context →
+    * eglDestroyContext 使线程 current context 变 NO_CONTEXT), 于是扩展检查
+    * 必然失败 → libepoxy abort() → 整个进程 SIGABRT。
+    * 实测 (HOP-AL10): 手机虚拟桌面模式点"停止/重启引擎"必闪退, 栈为
+    * libepoxy ← virgl_renderer_cleanup ← WinehuaVirgl_RunConfiguredHost;
+    * 独立进程后端只死子进程, 故该缺陷此前未暴露。
+    *
+    * eglGetProcAddress 是 EGL 规范给出的扩展函数获取方式, 不依赖当前上下文。
+    * 解析缺失时不返回 false: fence 是可选能力, virgl_egl_supports_fences 会
+    * 据此降级为无 fence (仍可渲染), 而 abort 是致命的。 */
+   if (has_bit(egl->extension_bits, EGL_KHR_FENCE_SYNC_ANDROID)) {
+      egl->funcs.eglCreateSyncKHR =
+         (PFNEGLCREATESYNCKHRPROC) eglGetProcAddress("eglCreateSyncKHR");
+      egl->funcs.eglDestroySyncKHR =
+         (PFNEGLDESTROYSYNCKHRPROC) eglGetProcAddress("eglDestroySyncKHR");
+      egl->funcs.eglClientWaitSyncKHR =
+         (PFNEGLCLIENTWAITSYNCKHRPROC) eglGetProcAddress("eglClientWaitSyncKHR");
    }
 
    return true;
@@ -433,8 +460,8 @@ struct virgl_egl *virgl_egl_init(EGLNativeDisplayType display_id, bool surfacele
                   egl->egl_ctx);
 
    if (virgl_egl_supports_fences(egl)) {
-      egl->signaled_fence = eglCreateSyncKHR(egl->egl_display,
-                                             EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+      egl->signaled_fence = egl->funcs.eglCreateSyncKHR(egl->egl_display,
+                                                        EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
       if (!egl->signaled_fence) {
          virgl_error("Failed to create signaled fence\n");
          goto fail;
@@ -454,7 +481,7 @@ struct virgl_egl *virgl_egl_init(EGLNativeDisplayType display_id, bool surfacele
 void virgl_egl_destroy(struct virgl_egl *egl)
 {
    if (egl->signaled_fence) {
-      eglDestroySyncKHR(egl->egl_display, egl->signaled_fence);
+      egl->funcs.eglDestroySyncKHR(egl->egl_display, egl->signaled_fence);
    }
    eglMakeCurrent(egl->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                   EGL_NO_CONTEXT);
@@ -954,26 +981,28 @@ void *virgl_egl_aux_plane_image_from_gbm_bo(struct virgl_egl *egl, struct gbm_bo
 
 bool virgl_egl_supports_fences(struct virgl_egl *egl)
 {
-   return (egl && has_bit(egl->extension_bits, EGL_KHR_FENCE_SYNC_ANDROID));
+   return (egl && has_bit(egl->extension_bits, EGL_KHR_FENCE_SYNC_ANDROID) &&
+           egl->funcs.eglCreateSyncKHR && egl->funcs.eglDestroySyncKHR &&
+           egl->funcs.eglClientWaitSyncKHR);
 }
 
 EGLSyncKHR virgl_egl_fence_create(struct virgl_egl *egl)
 {
-   if (!egl || !has_bit(egl->extension_bits, EGL_KHR_FENCE_SYNC_ANDROID)) {
+   if (!virgl_egl_supports_fences(egl)) {
       return EGL_NO_SYNC_KHR;
    }
 
-   return eglCreateSyncKHR(egl->egl_display, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+   return egl->funcs.eglCreateSyncKHR(egl->egl_display, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
 }
 
 void virgl_egl_fence_destroy(struct virgl_egl *egl, EGLSyncKHR fence) {
-   eglDestroySyncKHR(egl->egl_display, fence);
+   egl->funcs.eglDestroySyncKHR(egl->egl_display, fence);
 }
 
 static bool client_wait_fence(struct virgl_egl *egl, EGLSyncKHR fence, bool blocking)
 {
-   EGLint egl_result = eglClientWaitSyncKHR(egl->egl_display, fence, 0,
-                                            blocking ? EGL_FOREVER_KHR : 0);
+   EGLint egl_result = egl->funcs.eglClientWaitSyncKHR(egl->egl_display, fence, 0,
+                                                       blocking ? EGL_FOREVER_KHR : 0);
    if (egl_result == EGL_FALSE)
       virgl_warn("Wait sync failed\n");
    return egl_result != EGL_TIMEOUT_EXPIRED_KHR;
