@@ -47,6 +47,7 @@
 
 #include "vrend_object.h"
 #include "vrend_shader.h"
+#include "winehua_gl_caps_log.h"
 
 #include "vrend_renderer.h"
 #include "vrend_blitter.h"
@@ -7659,6 +7660,11 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
       ctx_params.minor_ver = gl_versions[i].minor;
 
       gl_context = vrend_clicbs->create_gl_context(0, &ctx_params);
+      /* WineHua P0-GL-3: 记录版本试探序列 —— 上游是 {4,6}…{3,0} 依次降级,
+       * 真正成功的那一档才是后续 capset 的输入。 */
+      winehua_gl_caps_log("GL-CAP virgl layer=host-ctx try=%u.%u result=%s",
+                          gl_versions[i].major, gl_versions[i].minor,
+                          gl_context ? "OK" : "FAIL");
       if (gl_context)
          break;
    }
@@ -7685,6 +7691,13 @@ int vrend_renderer_init(const struct vrend_if_cbs *cbs, uint32_t flags)
 
    vrend_state.gl_major_ver = gl_ver / 10;
    vrend_state.gl_minor_ver = gl_ver % 10;
+
+   /* WineHua P0-GL-3: 这一行是 "Host 真实能力" 的唯一权威来源。 */
+   winehua_gl_caps_log("GL-CAP virgl layer=host-ctx active gl_version_str=%s gl_renderer=%s "
+                       "epoxy_gl_version=%d desktop_gl=%d use_gles=%d",
+                       (const char *)glGetString(GL_VERSION),
+                       (const char *)glGetString(GL_RENDERER),
+                       gl_ver, epoxy_is_desktop_gl() != 0, gles ? 1 : 0);
 
    if (gles) {
       virgl_info("gl_version %d - es profile enabled\n", gl_ver);
@@ -12289,9 +12302,23 @@ static void vrend_renderer_fill_caps_v1(int gl_ver, int gles_ver, union virgl_ca
 
    if (has_feature(feat_ubo)) {
       glGetIntegerv(GL_MAX_VERTEX_UNIFORM_BLOCKS, &max);
-      /* GL_MAX_VERTEX_UNIFORM_BLOCKS is omitting the ordinary uniform block, add it
-       * also reduce by 1 as we might generate a VirglBlock helper uniform block */
-      caps->v1.max_uniform_blocks = max + 1 - 1;
+      /* GL_MAX_VERTEX_UNIFORM_BLOCKS omits the ordinary (default) uniform block,
+       * and the guest state tracker subtracts one block for it
+       * (st_extensions.c: "The first one is for ordinary uniforms").  Advertise
+       * the total, otherwise the guest sees max-1 and trips Mesa's ES3 gate
+       * `pc->MaxUniformBlocks < 12 -> no ARB_uniform_buffer_object`, which drops
+       * the whole guest GL down to ES 2.0 / GL 2.1 (measured 2026-09-18:
+       * host 12 -> guest 11 -> ES3 disabled -> CEF/ANGLE "max supported 2.0").
+       * WineHua: keep the +1 that upstream cancels out. */
+      /* 默认关闭 (回到上游行为 max+1-1), 用 WINEHUA_VIRGL_UBO_FIX=1 显式打开。
+       *
+       * 为什么默认关: 打开后 guest GLES3 能力链是正确的 (实测 es3.0/3.1 context 可建),
+       * 但它同时让 CEF 走进 GL/GPU 初始化路径 —— 那条路径当前还有问题
+       * (2026-09-18 实测: 打开后在 "CreateBrowser → AfterCreated" 之后停在原地,
+       *  renderer 不再派生; 关闭时 browser 能继续推进到 SetName/renderer)。
+       * 能力修复保留在代码里, 等 CEF 侧那条路径修好后再默认打开。 */
+      const char *ubo_fix = getenv("WINEHUA_VIRGL_UBO_FIX");
+      caps->v1.max_uniform_blocks = (ubo_fix && ubo_fix[0] == '1') ? (max + 1) : (max + 1 - 1);
    }
 
    if (has_feature(feat_depth_clamp))
@@ -12984,12 +13011,34 @@ void vrend_renderer_fill_caps(uint32_t set, uint32_t version,
    vrend_fill_caps_glsl_version(gl_ver, gles_ver, caps);
    VREND_DEBUG(dbg_features, NULL, "GLSL support level: %d", caps->v1.glsl_level);
 
+   /* WineHua P0-GL-3: capset 是 guest Mesa 判断 "GLES 最高到几" 的唯一依据。
+    * 如果这里 gles_ver 已经是 30+, 而 guest 仍报 max 2.0, 问题就在 guest Mesa 侧;
+    * 如果这里是 0/20, 那就是 host context 或 use_gles 选错了。 */
+   winehua_gl_caps_log("GL-CAP virgl layer=capset set=%u version=%u max_version=%u "
+                       "gl_ver=%d gles_ver=%d glsl_level=%d use_gles=%d capset2=%d",
+                       set, version, caps->max_version, gl_ver, gles_ver,
+                       caps->v1.glsl_level, vrend_state.use_gles ? 1 : 0, fill_capset2 ? 1 : 0);
    vrend_renderer_fill_caps_v1(gl_ver, gles_ver, caps);
 
    if (!fill_capset2)
       return;
 
    vrend_renderer_fill_caps_v2(gl_ver, gles_ver, caps);
+
+   /* P0-GL: guest 侧 ES3 只被一个条件卡住 —— st_init_limits 的 can_ubo 要求
+    * screen->caps.max_constant_buffer_size >= 16384, 而 guest 该值来自
+    * caps.v2.max_uniform_block_size, host 只在 has_feature(feat_ubo) 时才填。
+    * 必须在 fill_caps_v2 之后打印 (之前还是 0)。 */
+   {
+      GLint gl_max_ubo = -1;
+      if (has_feature(feat_ubo))
+         glGetIntegerv(GL_MAX_UNIFORM_BLOCK_SIZE, &gl_max_ubo);
+      winehua_gl_caps_log("GL-CAP virgl layer=capset-ubo feat_ubo=%d max_uniform_block_size=%u "
+                          "gl_max_uniform_block_size=%d guest_es3_needs=%u max_uniform_blocks=%u",
+                          has_feature(feat_ubo) ? 1 : 0,
+                          caps->v2.max_uniform_block_size, gl_max_ubo, 16384u,
+                          caps->v1.max_uniform_blocks);
+   }
 }
 
 GLint64 vrend_renderer_get_timestamp(void)

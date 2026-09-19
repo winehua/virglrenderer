@@ -30,6 +30,8 @@
 #include "config.h"
 #endif
 
+#include "winehua_gl_caps_log.h"
+
 #define EGL_EGLEXT_PROTOTYPES
 #include <errno.h>
 #include <fcntl.h>
@@ -396,6 +398,14 @@ struct virgl_egl *virgl_egl_init(EGLNativeDisplayType display_id, bool surfacele
       goto fail;
 
    extensions = eglQueryString(egl->egl_display, EGL_EXTENSIONS);
+   /* WineHua P0-GL-2: VirGL host EGL 到底拿到什么能力 / 选了什么 config。 */
+   winehua_gl_caps_log("GL-CAP virgl layer=host-egl egl_init=%d.%d gles=%d "
+                       "egl_vendor=%s egl_version=%s client_apis=%s renderable=0x%x",
+                       major, minor, gles ? 1 : 0,
+                       eglQueryString(egl->egl_display, EGL_VENDOR),
+                       eglQueryString(egl->egl_display, EGL_VERSION),
+                       eglQueryString(egl->egl_display, EGL_CLIENT_APIS),
+                       (unsigned)conf_att[3]);
 #ifdef VIRGL_EGL_DEBUG
    virgl_debug("EGL major/minor: %d.%d\n", major, minor);
    virgl_debug("EGL version: %s\n",
@@ -431,6 +441,14 @@ struct virgl_egl *virgl_egl_init(EGLNativeDisplayType display_id, bool surfacele
 
    eglMakeCurrent(egl->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                   egl->egl_ctx);
+
+   /* WineHua P0-GL-2: 这个 probe context 的真实 GL 版本决定了稍后
+    * eglChooseConfig/扩展判定看到的能力面 (上游用 CLIENT_VERSION=2 建它)。 */
+   winehua_gl_caps_log("GL-CAP virgl layer=host-egl probe_ctx_gl_version=%s gl_renderer=%s "
+                       "desktop_gl=%d egl_version_report=%d",
+                       (const char *)glGetString(GL_VERSION),
+                       (const char *)glGetString(GL_RENDERER),
+                       epoxy_is_desktop_gl() != 0, epoxy_gl_version());
 
    if (virgl_egl_supports_fences(egl)) {
       egl->signaled_fence = eglCreateSyncKHR(egl->egl_display,
@@ -654,6 +672,16 @@ virgl_renderer_gl_context virgl_egl_create_context(struct virgl_egl *egl, struct
                              egl->egl_conf,
                              vparams->shared ? eglGetCurrentContext() : EGL_NO_CONTEXT,
                              ctx_att);
+   /* WineHua P0-GL-2: render server 真正使用的 context 是这一颗 ——
+    * 它的版本决定 vrend 的 gl_ver/gles_ver, 进而决定 capset 里给 guest 的 GLES 版本。 */
+   /* 此刻新 context 还没 make_current, glGetString 反映的是旧 context, 不在这里打版本;
+    * 真实版本由 vrend_renderer_init 在 make_current 之后记录。 */
+   winehua_gl_caps_log("GL-CAP virgl layer=host-egl create_ctx req=%u.%u compat=%d shared=%d "
+                       "result=%s egl_error=0x%x",
+                       (unsigned)vparams->major_ver, (unsigned)vparams->minor_ver,
+                       vparams->compat_ctx ? 1 : 0, vparams->shared ? 1 : 0,
+                       egl_ctx ? "OK" : "FAIL",
+                       egl_ctx ? 0 : (unsigned)eglGetError());
    return (virgl_renderer_gl_context)egl_ctx;
 }
 
